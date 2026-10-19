@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### 0.3.22-fix7 — 文档与发布
+
+- README 顶部明确使用场景：海外正规授权 SRC（HackerOne / Intigriti / Bugcrowd）。
+- 移除上游的「交流群」章节与微信二维码图片（`screenshots/wx.png`）。
+- 移除「参考」章节（第三方项目链接）。
+- 把上游的「使用限制 / 禁止事项」替换为本 fork 的「使用范围」：原条款在 AGPL-3.0 之外追加限制，与本 fork 的授权测试用途冲突；AGPL-3.0 许可声明与 `LICENSE` 文件按协议要求保留。
+- 发布包：linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64 与 `SHA256SUMS`。
+
 ### 本地安全修复（0.3.22-fix6）
 
 - 新增发请求前的授权闸：从 Bash/WebFetch/自定义工具参数提取 host，任何未命中 `task_scope` 的目标一律阻断（fail-closed）；聊天会话无任务 scope，不套用该闸。
