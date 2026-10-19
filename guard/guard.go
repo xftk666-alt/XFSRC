@@ -34,7 +34,12 @@ type Guard struct {
 	attrib      map[string]int // failure attribution counts (Observer / G5)
 	reg         *hook.Registry
 	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
+	scope       ScopeChecker           // optional; nil disables the authorization gate
 }
+
+// SetScopeCheck installs the pre-request authorization gate. It runs before the
+// intercept rules and blocks the call when any extracted target is out of scope.
+func (g *Guard) SetScopeCheck(fn ScopeChecker) { g.scope = fn }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
 // tasks where the Interceptor is not yet available).
@@ -75,6 +80,19 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 		cmd = in.Text
 	}
 	g.record(ev.ToolName, "allow", "", cmd)
+	// Authorization boundary first: it is the one gate that must never be
+	// bypassed by a rule/judge configuration change.
+	if g.scope != nil {
+		blocked, reason := g.scope(ctx, ev.ToolName, ev.Input)
+		// A reason without hosts is a fail-closed verdict (e.g. an unreadable
+		// target list), so it must block as well.
+		if len(blocked) > 0 || reason != "" {
+			if reason == "" {
+				reason = "目标不在任务授权范围内"
+			}
+			return g.block(ev.ToolName, systemBlockMessage(reason), cmd)
+		}
+	}
 	return g.applyIntercept(ctx, ev)
 }
 
@@ -88,7 +106,7 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 		return hook.Result{}
 	}
 	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
-	dec, matched := g.interceptor.Match(ev.ToolName, ev.Input)
+	dec, matched := g.interceptor.Match(ev.ToolName, ruleSubject(ev.ToolName, ev.Input))
 	if !matched {
 		// No rule matched. Ask the LLM fallback judge (if enabled); when it is off
 		// or unwired, keep current behavior and allow.
@@ -121,6 +139,40 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 		return hook.Result{}
 	}
 	return hook.Result{}
+}
+
+// ruleSubject narrows the text that intercept rules match against to the field
+// that actually drives execution. Without this, a Write/Edit whose *content*
+// merely quotes a destructive command (a vulnerability report, a test fixture,
+// a Python heredoc) is denied even though nothing is executed. Rules still see
+// the resolved path for Write/Edit, so path-based policies keep working.
+func ruleSubject(tool string, input []byte) []byte {
+	var key string
+	switch tool {
+	case "Bash", "shell_open":
+		key = "command"
+	case "shell_send":
+		key = "text"
+	case "Write", "Edit", "MultiEdit":
+		key = "file_path"
+	case "WebFetch":
+		key = "url"
+	default:
+		return input
+	}
+	var in map[string]any
+	if json.Unmarshal(input, &in) != nil {
+		return input
+	}
+	v, ok := in[key]
+	if !ok {
+		return []byte("{}")
+	}
+	out, err := json.Marshal(map[string]any{key: v})
+	if err != nil {
+		return input
+	}
+	return out
 }
 
 // systemBlockMessage frames an intercept block as an ARTEX platform-governance

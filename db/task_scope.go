@@ -80,20 +80,44 @@ func (s *AssetStore) upsertTaskScopeResult(ts TaskScope) (bool, error) {
 INSERT INTO task_scope(task_id, kind, company_id, domain, net, value, source, reason)
 VALUES ($1,$2,$3,$4,$5::cidr,$6,$7,NULLIF($8,''))
 ON CONFLICT DO NOTHING`
-	var (
-		result sql.Result
-		err    error
-	)
-	if s.tx != nil {
-		result, err = s.tx.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
-	} else {
-		result, err = s.db.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
+	type execer interface {
+		Exec(query string, args ...any) (sql.Result, error)
 	}
+	var ex execer = s.db
+	if s.tx != nil {
+		ex = s.tx
+	}
+	result, err := ex.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
 	if err != nil {
 		return false, err
 	}
 	rows, err := result.RowsAffected()
-	return rows > 0, err
+	if err != nil {
+		return false, err
+	}
+	if rows > 0 {
+		return true, nil
+	}
+	// The row already exists (same task+kind+value, regardless of source). A
+	// trusted source must be able to PROMOTE an auto/agent row: otherwise an
+	// operator re-adding a discovered host to the authorized scope is silently
+	// ignored and the gate keeps blocking it.
+	promote := `
+UPDATE task_scope
+SET source=$1, reason=COALESCE(NULLIF($2,''), reason)
+WHERE task_id=$3 AND kind=$4
+  AND COALESCE(domain,'')=COALESCE($5::text,'')
+  AND COALESCE(net::text,'')=COALESCE($6::text,'')
+  AND COALESCE(company_id,0)=COALESCE($7::bigint,0)
+  AND COALESCE(value,'')=COALESCE($8::text,'')
+  AND (CASE source WHEN 'manual' THEN 3 WHEN 'goals' THEN 2 WHEN 'agent' THEN 1 ELSE 0 END)
+    < (CASE $1 WHEN 'manual' THEN 3 WHEN 'goals' THEN 2 WHEN 'agent' THEN 1 ELSE 0 END)`
+	res, err := ex.Exec(promote, src, ts.Reason, ts.TaskID, ts.Kind, domainVal, netVal, companyVal, valueVal)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func (s *AssetStore) upsertTaskScope(ts TaskScope) error {

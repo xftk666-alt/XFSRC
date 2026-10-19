@@ -241,6 +241,24 @@ func runTaskRoutine(rt *taskRuntime, fn func(context.Context)) {
 	}()
 }
 
+// StopAll cancels and waits for every task goroutine. Called before the
+// database is closed on shutdown/test teardown so no planner or worker can
+// write after the connection pool is gone.
+func (e *Engine) StopAll() {
+	e.runtimeMu.Lock()
+	rts := make([]*taskRuntime, 0, len(e.runtimes))
+	for _, rt := range e.runtimes {
+		rts = append(rts, rt)
+	}
+	for _, rt := range rts {
+		rt.cancel()
+	}
+	e.runtimeMu.Unlock()
+	for _, rt := range rts {
+		rt.wg.Wait()
+	}
+}
+
 // StopTask permanently stops every long-lived goroutine and removes all Engine
 // state for a successfully deleted task. The delete barrier remains installed
 // until cleanup finishes, so no new task operation can race the teardown.

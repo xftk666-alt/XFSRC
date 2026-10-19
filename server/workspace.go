@@ -26,6 +26,21 @@ const (
 // wsResolve maps a user-supplied relative path to an absolute path INSIDE the work
 // dir. It returns ok=false if the path would escape the root. filepath.Clean on a
 // rooted copy collapses any ".." so nothing can climb above the root.
+// wsSensitiveNames are runtime secrets and internal stores that live under the
+// data dir. They must never be reachable through the workspace file manager,
+// which serves the same tree to any logged-in user.
+var wsSensitiveNames = map[string]bool{
+	"_ca":             true, // MITM CA private key
+	"evidence":        true, // HMAC key, recorder token, sealed evidence packs
+	"transcripts":     true, // raw LLM conversations
+	"sessions":        true, // raw tool input/output
+	"traffic":         true, // captured request/response bodies
+	"empty_guard":     true, // local LLM proxy config/logs
+	".delete-staging": true,
+	".tools":          true,
+	"jwt.key":         true,
+}
+
 func (s *Server) wsResolve(rel string) (string, bool) {
 	base := filepath.Clean(s.m.dir)
 	rel = strings.TrimPrefix(strings.TrimSpace(rel), "/")
@@ -33,6 +48,40 @@ func (s *Server) wsResolve(rel string) (string, bool) {
 	abs := filepath.Clean(filepath.Join(base, clean))
 	if abs != base && !strings.HasPrefix(abs, base+string(os.PathSeparator)) {
 		return "", false
+	}
+	// Deny the runtime-secret subtrees outright (checked on the cleaned relative
+	// path so neither "." nor a trailing slash can slip through).
+	if relClean, err := filepath.Rel(base, abs); err == nil && relClean != "." {
+		for _, seg := range strings.Split(filepath.ToSlash(relClean), "/") {
+			if wsSensitiveNames[seg] {
+				return "", false
+			}
+		}
+	}
+	// Lexical confinement is not enough: a symlink inside the work dir can point
+	// anywhere (an agent can create one with Bash). Resolve the real path of the
+	// deepest existing ancestor and require it to stay under the real root.
+	realBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		realBase = base
+	}
+	probe := abs
+	for {
+		if resolved, err := filepath.EvalSymlinks(probe); err == nil {
+			real := resolved
+			if rest, relErr := filepath.Rel(probe, abs); relErr == nil && rest != "." {
+				real = filepath.Join(resolved, rest)
+			}
+			if real != realBase && !strings.HasPrefix(real, realBase+string(os.PathSeparator)) {
+				return "", false
+			}
+			break
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe || len(parent) <= len(base) {
+			break
+		}
+		probe = parent
 	}
 	return abs, true
 }

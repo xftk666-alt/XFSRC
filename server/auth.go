@@ -264,6 +264,13 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
+	client := loginClientKey(r)
+	if s.loginLimit != nil {
+		if ok, wait := s.loginLimit.allow(client); !ok {
+			s.loginLimit.reject(w, wait)
+			return
+		}
+	}
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -288,6 +295,9 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
 		writeErr(w, 401, "用户名或密码错误")
 		return
+	}
+	if s.loginLimit != nil {
+		s.loginLimit.reset(client)
 	}
 	tok, err := signJWT(s.jwtKey)
 	if err != nil {

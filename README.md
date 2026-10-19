@@ -9,7 +9,15 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 </div>
 
-本仓库为独立维护的 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)，保留 https://github.com/Autumn-27/ARTEX 的原始提交历史与 AGPL-3.0 许可证。程序发布包从本仓库 Releases 下载，Docker 镜像 [ruoji6/artex](https://hub.docker.com/r/ruoji6/artex) 由本仓库 GitHub Actions 构建并发布。
+> **本仓库为个人私有 fork（XFSRC）**，用于**海外授权 SRC 漏洞挖掘**。
+>
+> - 上游：[RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)（原始历史见 [Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX)）
+> - 许可证：AGPL-3.0（见 [LICENSE](LICENSE)）
+> - 分支：`main` 跟随上游；`local` 为本人的加固与定制
+> - 版本号：`<上游版本>-fix<N>`，例如 `0.3.22-fix6` = 基于上游 0.3.22 的第 6 次本地修订
+> - 使用场景见 [docs/USAGE.md](docs/USAGE.md)
+>
+> 上游说明（原文）：本仓库为独立维护的 RuoJi6/ARTEX，保留 Autumn-27/ARTEX 的原始提交历史与 AGPL-3.0 许可证。程序发布包从上游 Releases 下载，Docker 镜像由上游 GitHub Actions 构建并发布。
 
 ---
 

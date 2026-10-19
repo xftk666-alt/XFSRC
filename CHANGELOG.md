@@ -4,6 +4,36 @@
 
 ## [Unreleased]
 
+### 本地安全修复（0.3.22-fix6）
+
+- 新增发请求前的授权闸：从 Bash/WebFetch/自定义工具参数提取 host，任何未命中 `task_scope` 的目标一律阻断（fail-closed）；聊天会话无任务 scope，不套用该闸。
+- `task_scope` 仅信任 `manual` / `goals` 来源；planner/worker 写入的 `agent` 与自动发现的 `auto` 只用于覆盖度，不再授权。授权范围可由人工在任务页确认后升格（同名条目自动提升来源）。
+- `add_task_scope` 仅允许目标拆解（goals）与人工主控（human）调用，探索侧无法自行扩大边界。
+- 工作区文件管理器拒绝 `evidence/`、`traffic/`、`sessions/`、`transcripts/`、`jwt.key` 等运行时敏感路径，并对符号链接做二次解析校验。
+- 拦截规则只匹配实际执行面：Write/Edit 只看 `file_path`，不再扫描报告正文中的 `rm -rf`、`DROP` 等字符串。
+- 删除类/DELETE 请求规则由 `deny` 改为 `ask`（300 秒，超时拒绝），授权测试可人工放行。
+- `traffic_capture=false` 时存储层不再写入流量（代理仍可监听，但不落盘）。
+- MITM CA 私钥启动时与按需生成后均收紧为 0600。
+- 日志写库前做 UTF-8 清洗，避免二进制内容导致整行丢失。
+- `Manager.Close` 先停止任务 goroutine 再关闭连接池，消除关闭期写入竞态。
+- 新增 `llm_usage` 到启动 schema，修复独立包测试依赖外部建表的问题。
+- 登录接口按来源 IP 限流（10 次/分钟，超限 429 + Retry-After），成功登录清零；消除无上限口令猜测。
+- OOB/interactsh 服务器与令牌改为读取 `/app/data/oob/config.env`，留空即禁用外部 OOB（Intigriti 等 program 常禁止）。
+- 扫描器出口代理：启动时把 `global_proxy` 同步为 proxychains 配置；nmap 经 `pc_run.sh`、naabu 走原生 SOCKS5、ffuf/katana/nuclei/dalfox/sqlmap/subfinder/gau/tlsx 走 `proxy_exec.sh` 注入原生代理参数。RFC1918/回环目标自动绕过代理。
+- ffuf/katana/nuclei 默认限速（`-rate 50` / `-rl 50` / `-t 20`），降低触发 program 限速的风险。
+- 支持 HTTP Basic Auth 访问门（默认关闭，凭据只存 bcrypt 哈希）；`/api/health` 保持公开。
+- 新增数据保留任务：`/app/data/retention.env` 配置；每 24 小时清理过期 sessions/transcripts（默认 30 天）、聊天活动与后端日志（默认 90 天），证据/任务/漏洞永不删除。
+- 升级时把既有任务的 `task_scope` 来源标记为 `manual`，避免 fail-closed 闸门把历史任务全部拦住。
+- 授权闸新增目标文件扫描：`nuclei/httpx/naabu/katana -l`、`nmap -iL`、`subfinder -dL`、`cat FILE |`、`xargs -a FILE`、`< FILE` 引用的目标列表会被读取并逐条校验；列表不可读时按 fail-closed 阻止。`-w`（字典）、`-o`（输出）与 URL 形式的值不当作目标文件。
+- 授权闸的 host 提取器忽略 base64/JWT 形态的串（`jwt_decode.py 'eyJ...'` 不再被误判为域名）。
+- 出口代理改走 `172.18.0.1:3066`（宿主机 `karing-docker-forward` 只暴露到 Docker 网桥，无凭据）；
+  本机 Karing 的 netshare 入站（原 `0.0.0.0:4066/4067`）已随 `host=127.0.0.1` 关闭，局域网不再能借用本机出口。
+- 新增 CI（PostgreSQL service + `go vet` + `go test` + 前端静态构建）。
+- 修复 4 个漂移测试；README 移除未接线的 `enrich` 声明。
+
+
+
+
 ## [0.3.18] - 2026-10-12
 
 ### 审批审查

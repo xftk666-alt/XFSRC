@@ -86,3 +86,13 @@ func BuildReviewInput(ctx context.Context, tool string, arguments json.RawMessag
 	in.Scripts, in.ScriptCaptureStatus = captureScripts(in.WorkingDir, tool, arguments)
 	return in, nil
 }
+
+// WorkingDir returns the per-run working directory bound to ctx, or "" when the
+// caller did not bind one. Used by the authorization gate to resolve relative
+// target-list paths the same way the shell will.
+func WorkingDir(ctx context.Context) string {
+	if env, ok := ctx.Value(reviewContextKey{}).(reviewEnvironment); ok {
+		return env.workingDir
+	}
+	return ""
+}

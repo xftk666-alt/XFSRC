@@ -744,12 +744,15 @@ CREATE TABLE IF NOT EXISTS task_scope (
     domain      TEXT,          -- root_domain / subdomain
     net         CIDR,          -- ip / cidr
     value       TEXT,          -- icp / keyword
-    source      TEXT NOT NULL DEFAULT 'auto' CHECK (source IN ('auto','agent','manual')),
+    source      TEXT NOT NULL DEFAULT 'auto' CHECK (source IN ('auto','agent','manual','goals')),
     reason      TEXT,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- 旧库升级：扩展任务范围，使其与企业范围的单文本框识别能力一致。
 ALTER TABLE task_scope ADD COLUMN IF NOT EXISTS value TEXT;
+ALTER TABLE task_scope DROP CONSTRAINT IF EXISTS task_scope_source_check;
+ALTER TABLE task_scope ADD CONSTRAINT task_scope_source_check
+    CHECK (source IN ('auto','agent','manual','goals'));
 ALTER TABLE task_scope DROP CONSTRAINT IF EXISTS task_scope_kind_check;
 ALTER TABLE task_scope ADD CONSTRAINT task_scope_kind_check
     CHECK (kind IN ('company','root_domain','subdomain','ip','cidr','icp','keyword'));
@@ -1547,3 +1550,27 @@ CREATE TABLE IF NOT EXISTS task_schedule_history (
  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_schedule_history ON task_schedule_history(schedule_id,id DESC);
+
+-- ---------------------------------------------------------------------------
+-- LLM usage metering (also created lazily by EnsureLLMUsageTable for upgrades).
+-- Kept here so a fresh database opened by any package has the ledger.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id             BIGSERIAL PRIMARY KEY,
+    ts             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    task_id        TEXT,
+    exploration_id BIGINT,
+    worker         TEXT,
+    model          TEXT,
+    profile_name   TEXT,
+    latency_ms     INTEGER,
+    input_tokens   INTEGER NOT NULL DEFAULT 0,
+    output_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_read     INTEGER NOT NULL DEFAULT 0,
+    cache_write    INTEGER NOT NULL DEFAULT 0,
+    status         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_task ON llm_usage(task_id);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_model ON llm_usage(model);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_exp ON llm_usage(exploration_id);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts DESC);

@@ -449,6 +449,14 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 			if t.taskID <= 0 {
 				return actool.Errorf("add_task_scope 需要任务上下文(当前无 task)"), nil
 			}
+			// Authorization is the operator's call, not the explorer's. Only the
+			// goal decomposer (working from the operator's own task description)
+			// and the human-facing main agent may widen task_scope; planner and
+			// worker discoveries are recorded as 'auto' for coverage but never
+			// authorize a request (see db.DefaultTrustedScopeSources).
+			if t.worker != "goals" && t.worker != "human" {
+				return actool.Errorf(fmt.Sprintf("add_task_scope 仅允许目标拆解与人工主控登记范围；当前角色 %q 不能扩大授权边界。如确需扩大，请在任务页手动添加 scope 或让操作员确认", t.worker)), nil
+			}
 			type scopeEntry struct {
 				Kind  string `json:"kind"`
 				Value string `json:"value"`
@@ -466,7 +474,13 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 			var added []map[string]any
 			errs := map[string]string{}
 			for i, e := range items {
-				ts, err := t.as.AddAgentScope(t.taskID, strings.TrimSpace(e.Kind), e.Value, a.Reason, "agent")
+				source := "agent"
+				if t.worker == "goals" {
+					source = "goals"
+				} else if t.worker == "human" {
+					source = "manual"
+				}
+				ts, err := t.as.AddAgentScope(t.taskID, strings.TrimSpace(e.Kind), e.Value, a.Reason, source)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue

@@ -135,6 +135,10 @@ const TrafficSearchDescription = "查询记录代理已抓取的目标流量（�
 
 // Traffic runs the recording proxy and owns the file tree + index.
 type Traffic struct {
+	// recordGate, when set, decides whether an exchange is persisted. The proxy
+	// keeps listening (it may still serve as the egress hop) but stores nothing
+	// while capture is disabled.
+	recordGate func() bool
 	dir   string
 	addr  string
 	db    *sql.DB
@@ -355,6 +359,20 @@ func (t *Traffic) CACertPath() string {
 	return filepath.Join(t.dir, "_ca", "mitmproxy-ca-cert.pem")
 }
 
+// HardenCAKeyFile restricts the MITM CA private key to the process owner. The
+// key file is written by go-mitmproxy with the default umask (0644 in the
+// official image), which makes every captured TLS session forgeable by any
+// local user or by the workspace file manager. Best-effort: a filesystem that
+// refuses chmod must not stop the proxy from starting.
+func (t *Traffic) HardenCAKeyFile() {
+	for _, name := range []string{"mitmproxy-ca.pem", "mitmproxy-ca.key"} {
+		p := filepath.Join(t.dir, "_ca", name)
+		if _, err := os.Stat(p); err == nil {
+			_ = os.Chmod(p, 0o600)
+		}
+	}
+}
+
 // Start runs the proxy (blocking); run in a goroutine.
 func (t *Traffic) Start() error { return t.proxy.Start() }
 
@@ -393,8 +411,15 @@ func (s *sink) Response(f *mproxy.Flow) {
 	if f.Request == nil || f.Response == nil {
 		return
 	}
+	if s.t.recordGate != nil && !s.t.recordGate() {
+		return
+	}
 	s.t.record(f)
 }
+
+// SetRecordingGate installs the capture toggle consulted before each write.
+// nil restores unconditional recording (used by tests and standalone proxies).
+func (t *Traffic) SetRecordingGate(fn func() bool) { t.recordGate = fn }
 
 // RequestError fires when a request through an established MITM tunnel fails. If
 // the failure looks proxy/protocol-caused (h2 quirks, HEAD-with-body, protocol

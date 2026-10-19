@@ -95,7 +95,7 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 					if !ok {
 						return
 					}
-					id, err := pg.InsertLog(req.ll.Level, req.ll.Tag, req.ll.Text)
+					id, err := pg.InsertLog(req.ll.Level, req.ll.Tag, db.SanitizeLogText(req.ll.Text))
 					if err != nil {
 						_, _ = os.Stderr.Write([]byte("[logsink] db write: " + err.Error() + "\n"))
 						continue

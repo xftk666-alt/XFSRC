@@ -45,6 +45,7 @@ type Server struct {
 	ctx        context.Context
 
 	skillDir  string // root directory for skill subdirectories
+	loginLimit *loginLimiter
 	jwtKey    []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
 	basicAuth basicAuthGate
 
@@ -152,12 +153,14 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key,
+		loginLimit: newLoginLimiter(10, time.Minute), chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+	m.stopTasks = func() { s.engine.StopAll() }
 	s.initSideQuestions()
 	if m.pg != nil {
 		if err := s.basicAuth.load(m.pg); err != nil {
@@ -3398,6 +3401,8 @@ func (s *Server) settingsPayload() map[string]any {
 	}
 	return map[string]any{
 		"traffic_capture":          s.m.TrafficEnabled(),
+		"scope_gate_enabled":       s.m.pg.GetBool(settingScopeGateEnabled, true),
+		"scope_trusted_sources":    parseTrustedSources(s.m.pg),
 		"agent_traffic_binding":    s.m.pg.GetBool(settingAgentTrafficBinding, false),
 		"llm_record":               s.m.LLMRecordEnabled(),
 		"web_search_enabled":       on,
@@ -3468,6 +3473,9 @@ func (s *Server) pgDetectPython(w http.ResponseWriter, r *http.Request) {
 func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		TrafficCapture      *bool `json:"traffic_capture"`
+		// Pre-request authorization gate. Defaults: enabled, sources=manual,goals.
+		ScopeGateEnabled    *bool   `json:"scope_gate_enabled"`
+		ScopeTrustedSources *string `json:"scope_trusted_sources"`
 		AgentTrafficBinding *bool `json:"agent_traffic_binding"`
 		LLMRecord           *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
 		// Web search. WebSearchEnabled/Backend toggle the tool + backend; BraveKey/TavilyKey
@@ -3548,6 +3556,30 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.m.pg.SetSetting(settingNotifyDigestMinutes, strconv.Itoa(*req.NotifyDigestMins)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.ScopeGateEnabled != nil {
+		if err := s.m.pg.SetBool(settingScopeGateEnabled, *req.ScopeGateEnabled); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.ScopeTrustedSources != nil {
+		raw := strings.TrimSpace(*req.ScopeTrustedSources)
+		if raw == "" {
+			raw = defaultScopeTrustedSources
+		}
+		for _, part := range strings.Split(raw, ",") {
+			switch strings.TrimSpace(part) {
+			case "manual", "goals", "agent", "auto":
+			default:
+				writeErr(w, 400, "scope_trusted_sources 仅支持 manual/goals/agent/auto")
+				return
+			}
+		}
+		if err := s.m.pg.SetSetting(settingScopeTrustedSources, raw); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}

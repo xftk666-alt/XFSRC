@@ -122,7 +122,13 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 				// intentionally omit the bulky replay context from the audit row.
 				wantUserMessage = ""
 			}
-			if detail.Status != tc.status || detail.DecisionSource != "model" || a == nil || a.ExecutionStatus != tc.execution || a.ToolUseID != "probe-call" || a.UserMessage != wantUserMessage || a.InitialAction != initialAction || a.ModelFallback != (tc.action == "invalid") || a.ProfileID != 7 {
+			wantSource := "model"
+			if tc.manual {
+				// A human decision is recorded with its own source; only the model
+				// verdict (allow/deny/fallback/timeout) stays "model".
+				wantSource = "manual"
+			}
+			if detail.Status != tc.status || detail.DecisionSource != wantSource || a == nil || a.ExecutionStatus != tc.execution || a.ToolUseID != "probe-call" || a.UserMessage != wantUserMessage || a.InitialAction != initialAction || a.ModelFallback != (tc.action == "invalid") || a.ProfileID != 7 {
 				t.Fatalf("unexpected review: row=%+v audit=%+v", detail.InterceptApprovalRow, a)
 			}
 			if initialAction == "allow" && (len(a.Context) != 0 || a.UserTruncated || a.ContextTruncated) {

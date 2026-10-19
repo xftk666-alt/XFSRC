@@ -2019,3 +2019,9 @@ func (s *ExplorationStore) ActivityByIDsForTerminalIntents(ids []int64) ([]Activ
 func (s *ExplorationStore) AddStandaloneFinding(taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64) (int64, error) {
 	return s.db.AddFinding(taskID, nodeID, vulnclass, name, severity, summary, evidence, worker, assetIDs)
 }
+
+// SanitizeLogText makes arbitrary process output safe for a UTF8 text column.
+// Captured tool output can contain raw binary (gzip magic 0x8b, NULs, invalid
+// sequences), which PostgreSQL rejects with SQLSTATE 22021 and the log line is
+// then silently lost.
+func SanitizeLogText(s string) string { return utf8Clean(s) }

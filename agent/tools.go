@@ -538,6 +538,44 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 					}
 				}
 			}
+			// scope: the task's authorization boundary, expanded one level for
+			// company rows so the planner can see which rules actually authorize
+			// its targets. Inherited rows are marked and are read-only.
+			if scopes, err := t.as.ListTaskScopeWithSources(t.taskID); err == nil && len(scopes) > 0 {
+				rows := make([]map[string]any, 0, len(scopes))
+				for _, sc := range scopes {
+					row := map[string]any{
+						"task_id": sc.TaskID, "kind": sc.Kind, "domain": sc.Domain,
+						"net": sc.Net, "value": sc.Value, "source": sc.Source,
+					}
+					if sc.CompanyName != "" {
+						row["company"] = sc.CompanyName
+					}
+					if sc.TaskID != t.taskID {
+						row["inherited"] = true
+					}
+					if sc.CompanyID != nil && t.cs != nil {
+						if rules, err := t.cs.GetScope(*sc.CompanyID); err == nil {
+							expanded := make([]map[string]any, 0, len(rules))
+							keywords := make([]string, 0, 1)
+							for _, r := range rules {
+								expanded = append(expanded, map[string]any{
+									"kind": r.Kind, "domain": r.Domain, "net": r.Net, "value": r.Value,
+								})
+								if r.Kind == "keyword" {
+									keywords = append(keywords, r.Value)
+								}
+							}
+							row["company_scope"] = expanded
+							if len(keywords) > 0 {
+								row["company_keywords"] = keywords
+							}
+						}
+					}
+					rows = append(rows, row)
+				}
+				m["scope"] = rows
+			}
 			if hosts, err := t.as.HostsByTaskWithSources(t.taskID); err == nil {
 				// 只给主机总数，不再把 host 列表平铺进 graph_overview（大范围任务里那是每轮
 				// 都重复携带的大量字符串，对规划决策价值有限）；具体主机按需 list_assets 查。
