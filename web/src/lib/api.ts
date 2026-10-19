@@ -171,7 +171,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 // Token is appended as ?token= because SSE can't carry cookies cross-origin.
 // mockReport returns a canned Markdown report for the demo.
 function mockReport(_task?: string): string {
-  return `# ARTEX 渗透测试报告 — Acme Corp
+  return `# XFSRC 渗透测试报告 — Acme Corp
 
 ## 概览
 - 范围：acme.com（含 www / admin / api / shop / vpn 子域）
@@ -1414,7 +1414,8 @@ export const api = {
   // 顶栏每次整页加载都会查一次，不缓存会很快耗光配额）。force=true 强制回源，
   // 留给用户显式点「检查更新」时用。
   getUpdateSettings: () => get<UpdateSettings>("/update/settings"),
-  saveUpdateSettings: (settings: UpdateSettings) => put<UpdateSettings>("/update/settings", settings),
+  saveUpdateSettings: (settings: { proxy: string; token?: string }) =>
+    put<UpdateSettings>("/update/settings", settings),
   checkUpdate: (force = false) => get<UpdateCheck>(`/update/check${force ? "?force=1" : ""}`),
   // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
   applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),

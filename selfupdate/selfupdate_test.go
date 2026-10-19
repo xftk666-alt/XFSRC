@@ -90,6 +90,14 @@ func TestCompareVersions(t *testing.T) {
 		{"0.3.7-dirty", "0.3.8", 0, false},
 		{"0.3", "0.3.8", 0, false},
 		{"", "0.3.8", 0, false},
+		// 本 fork 的 "-fixN" 后缀参与比较：同一上游版本下 fix 号更大即更新。
+		{"0.3.22-fix7", "0.3.22-fix6", 1, true},
+		{"0.3.22-fix6", "0.3.22-fix7", -1, true},
+		{"0.3.22-fix7", "0.3.22-fix7", 0, true},
+		{"0.3.22", "0.3.22-fix1", -1, true},
+		{"0.3.22-fix9", "0.3.23", -1, true},
+		{"v0.3.22-fix7", "0.3.22-fix7", 0, true},
+		{"0.3.22-fixX", "0.3.22", 0, false},
 	}
 	for _, c := range cases {
 		got, ok := CompareVersions(c.a, c.b)

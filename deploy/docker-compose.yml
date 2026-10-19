@@ -41,9 +41,9 @@ services:
       # start.sh，也不会因为重新生成密钥把所有会话踢下线。
       - ../deploy/start.sh:/app/start.sh:ro
       - ../data/jwt.key:/app/jwt.key:ro
-      # 固定二进制：页面「一键更新」无法覆盖本地修复版；升级时替换 bin/artex
-      # 并重建即可（镜像里也保留了一份，作为兜底）。
-      - ../bin/artex:/app/artex:ro
+      # 可写挂载的二进制目录：页面「一键更新」替换的是 /app/bin/artex，
+      # 落在宿主机 bin/ 下，容器重建后仍然是新版本（镜像内的 /app/artex 仅作兜底）。
+      - ../bin:/app/bin
     restart: unless-stopped
 
 volumes:

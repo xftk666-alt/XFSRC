@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### 0.3.22-fix8 — XFSRC 品牌与在线更新
+
+- 系统更名 ARTEX → XFSRC：前端标题/品牌/版权、登录与初始化页、侧边栏、启动 banner、Basic Auth realm、审批提示、通知测试文案；登录用户名同步改为 `XFSRC`。
+- 替换 logo：`logo.png` / `icon.png` / `favicon.ico` 由本地图片生成（去透明边、方形留白、压缩到 ~53 KB）。
+- 在线更新指向本 fork：`selfupdate.Repo = xftk666-alt/XFSRC`。
+- 版本比较支持 `-fixN`：`0.3.22-fix7 > 0.3.22-fix6 > 0.3.22`；其余后缀（dev / git describe）仍判为不可比较。
+- 私有仓库更新认证：`update.network` 新增 `token` 字段，请求时带 `Authorization: Bearer`；设置页新增只读 Token 输入（不回显）。
+- 更新构件布局：二进制改为 `/app/bin/artex`（可写挂载），`start.sh` 优先使用它；`-data` 与 `ARTEX_SKILL_DIR` 显式固定回 `/app`，避免 `BaseDir()` 随可执行文件漂移。
+
 ### 0.3.22-fix7 — 文档与发布
 
 - README 顶部明确使用场景：海外正规授权 SRC（HackerOne / Intigriti / Bugcrowd）。

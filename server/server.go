@@ -36,7 +36,7 @@ import (
 // Defaults to "dev" for local builds. Exposed to the frontend via GET /api/health.
 var BuildVersion = "dev"
 
-// Server exposes the ARTEX backend over a JSON HTTP API for the shadcn/ui
+// Server exposes the XFSRC backend over a JSON HTTP API for the shadcn/ui
 // frontend.
 type Server struct {
 	scheduleMu sync.Mutex

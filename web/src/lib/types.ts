@@ -1,4 +1,4 @@
-// ARTEX domain model — types used across the UI.
+// XFSRC domain model — types used across the UI.
 // Derived from the functional spec (section 7: 关键数据形状).
 
 export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout";
@@ -1617,6 +1617,8 @@ export interface FindingTrafficDetail {
 
 export interface UpdateSettings {
   proxy: string;
+  /** 是否已保存 GitHub Token（值不回显）。 */
+  token_set?: boolean;
 }
 
 /** GET /api/update/check —— 当前版本与 GitHub 最新正式版的比较结果。 */

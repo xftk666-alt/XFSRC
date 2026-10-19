@@ -20,8 +20,13 @@ set -u
 
 cd "$(dirname "$0")" || exit 1
 
-BIN=./artex
-[ -x "$BIN" ] || { echo "[artex] 找不到可执行文件 $BIN" >&2; exit 1; }
+# 优先使用可写挂载的 bin/artex（页面一键更新会替换它），否则回退到镜像内的 ./artex。
+if [ -x /app/bin/artex ]; then
+	BIN=/app/bin/artex
+else
+	BIN=./artex
+fi
+[ -x "$BIN" ] || { echo "[xfsrc] 找不到可执行文件 $BIN" >&2; exit 1; }
 
 # 复测闸门脚本在 /app/skills（持久卷）。镜像层 /usr/local/share/artex-src 重建会回到出厂旧版。
 # 启动时把加固脚本和 HMAC 密钥拷回去，避免只剩技能路径、运行时路径变松。

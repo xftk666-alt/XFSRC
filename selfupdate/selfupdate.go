@@ -1,4 +1,4 @@
-// Package selfupdate implements ARTEX 的页面一键更新：从 GitHub Release 拉取新版
+// Package selfupdate implements XFSRC 的页面一键更新：从 GitHub Release 拉取新版
 // 二进制、校验、暂存，并在下次启动时原子换装。
 //
 // 整体分工（见 start.sh / start.bat）：
@@ -116,13 +116,16 @@ func cleanStaged(p Paths) {
 // ok=false 表示至少一边不是可比较的版本号（例如本地开发构建的 "dev" 或
 // git describe 产出的 "0.3.7-2-gabc1234-dirty"），此时调用方应禁用一键更新，
 // 否则会把开发中的构建"升级"成正式版、覆盖掉未提交的改动。
+//
+// 本 fork 的版本号形如 "0.3.22-fix7"（上游版本 + 本地修订号）。fix 段参与比较：
+// 同一上游版本下 fix 号更大即更新；不带 fix 的正式版小于任何 fix 版。
 func CompareVersions(a, b string) (int, bool) {
 	av, aok := parseVersion(a)
 	bv, bok := parseVersion(b)
 	if !aok || !bok {
 		return 0, false
 	}
-	for i := range 3 {
+	for i := range av {
 		if av[i] != bv[i] {
 			if av[i] < bv[i] {
 				return -1, true
@@ -133,29 +136,41 @@ func CompareVersions(a, b string) (int, bool) {
 	return 0, true
 }
 
-// parseVersion 解析 "v0.3.7" / "0.3.7" 形式的版本号为 [3]int。
+// parseVersion 解析 "v0.3.7" / "0.3.7" / "0.3.22-fix7" 为 [4]int
+// （major, minor, patch, fix）。第四位是本地修订号，没有 fix 段时为 0。
 //
-// 只接受纯净的三段式：build.sh 在非 tag 构建时用 git describe 产出
-// "0.3.7-2-gabc1234" 这类带后缀的版本，它们必须被判为不可比较，而不是被当成
-// 0.3.7 —— 否则开发构建会被误判为"已是最新"或被正式版覆盖。
-func parseVersion(s string) ([3]int, bool) {
+// 除 "-fixN" 以外的后缀一律判为不可比较：build.sh 在非 tag 构建时用 git
+// describe 产出 "0.3.7-2-gabc1234" 这类版本，它们必须被判为不可比较，而不是
+// 被当成 0.3.7 —— 否则开发构建会被误判为"已是最新"或被正式版覆盖。
+func parseVersion(s string) ([4]int, bool) {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "v")
 	if s == "" {
-		return [3]int{}, false
+		return [4]int{}, false
+	}
+
+	var fix int
+	if i := strings.Index(s, "-fix"); i >= 0 {
+		n, err := strconv.Atoi(s[i+len("-fix"):])
+		if err != nil || n < 0 {
+			return [4]int{}, false
+		}
+		fix = n
+		s = s[:i]
 	}
 	parts := strings.Split(s, ".")
 	if len(parts) != 3 {
-		return [3]int{}, false
+		return [4]int{}, false
 	}
-	var out [3]int
+	var out [4]int
 	for i, p := range parts {
 		n, err := strconv.Atoi(p)
 		if err != nil || n < 0 {
-			return [3]int{}, false
+			return [4]int{}, false
 		}
 		out[i] = n
 	}
+	out[3] = fix
 	return out, true
 }
 
