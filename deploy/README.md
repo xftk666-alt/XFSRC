@@ -16,6 +16,18 @@
 | `scripts/retention.sh` | 数据保留：sessions/transcripts 30 天、聊天活动与日志 90 天；证据/任务/漏洞永不删除 |
 | `scripts/restore_to_runtime.sh` | 容器重建后把 `skills/src-retest/runtime/` 快照恢复回 `/usr/local/share/artex-src` |
 
+## 使用方式
+
+compose 里的相对路径以 `deploy/` 为基准（`../data`、`../skills`、`../bin/artex`），
+因此在仓库根目录执行：
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+或把 `deploy/docker-compose.yml`、`deploy/start.sh`、`deploy/scripts/` 复制到项目根目录后
+按上游方式部署。
+
 ## 部署前提
 
 1. 构建好的二进制放到 `bin/artex`（只读挂载到 `/app/artex`，页面一键更新无法覆盖）。

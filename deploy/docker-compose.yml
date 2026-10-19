@@ -33,17 +33,17 @@ services:
     volumes:
       # 把数据目录（含 jwt.key、SQLite 等）绑定到项目根目录的 data/，
       # 方便在宿主机直接查看/备份，容器重建也不丢。
-      - ./data:/app/data
+      - ../data:/app/data
       # 把项目根目录的 skills 挂进容器（覆盖镜像内置的 /app/skills）；
       # 改 skill 无需重建镜像，容器读的就是宿主机这份。
-      - ./skills:/app/skills
+      - ../skills:/app/skills
       # 守护脚本与 JWT 签名密钥放到持久卷：容器重建后不会退回镜像里的旧
       # start.sh，也不会因为重新生成密钥把所有会话踢下线。
-      - ./start.sh:/app/start.sh:ro
-      - ./data/jwt.key:/app/jwt.key:ro
+      - ../deploy/start.sh:/app/start.sh:ro
+      - ../data/jwt.key:/app/jwt.key:ro
       # 固定二进制：页面「一键更新」无法覆盖本地修复版；升级时替换 bin/artex
       # 并重建即可（镜像里也保留了一份，作为兜底）。
-      - ./bin/artex:/app/artex:ro
+      - ../bin/artex:/app/artex:ro
     restart: unless-stopped
 
 volumes:
