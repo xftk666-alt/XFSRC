@@ -18,12 +18,16 @@
 
 ## 使用方式
 
-compose 里的相对路径以 `deploy/` 为基准（`../data`、`../skills`、`../bin/artex`），
+compose 里的相对路径以 `deploy/` 为基准（`../data`、`../skills`、`../bin`），
 因此在仓库根目录执行：
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d
 ```
+
+Compose 工程名固定为 `xfsrc`，容器为 `xfsrc-app` / `xfsrc-db`，数据卷为
+`xfsrc_pgdata`，网络固定 `172.18.0.0/16`（宿主机转发服务只监听
+`172.18.0.1:3066`，换网段会让容器失去出海口）。
 
 或把 `deploy/docker-compose.yml`、`deploy/start.sh`、`deploy/scripts/` 复制到项目根目录后
 按上游方式部署。
