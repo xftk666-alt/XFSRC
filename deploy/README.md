@@ -22,8 +22,10 @@ compose 里的相对路径以 `deploy/` 为基准（`../data`、`../skills`、`.
 因此在仓库根目录执行：
 
 ```bash
-docker compose -f deploy/docker-compose.yml up -d
+docker compose -f deploy/docker-compose.yml --env-file /path/to/.env up -d
 ```
+
+`--env-file` 相对**当前工作目录**解析；也可以把 `.env` 直接放在 `deploy/` 下，此时无需该参数。
 
 Compose 工程名固定为 `xfsrc`，容器为 `xfsrc-app` / `xfsrc-db`，数据卷为
 `xfsrc_pgdata`，网络固定 `172.18.0.0/16`（宿主机转发服务只监听
