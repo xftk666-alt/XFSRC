@@ -34,6 +34,15 @@ Compose 工程名固定为 `xfsrc`，容器为 `xfsrc-app` / `xfsrc-db`，数据
 或把 `deploy/docker-compose.yml`、`deploy/start.sh`、`deploy/scripts/` 复制到项目根目录后
 按上游方式部署。
 
+## 镜像
+
+```bash
+# 从仓库发布包解压出二进制后，构建或复用镜像：
+docker tag xfsrc:<tag> xfsrc:latest
+```
+
+当前部署使用 `xfsrc:0.3.22-fix9`（基于官方 `ruoji6/artex` 加装扫描工具链与 proxychains）。
+
 ## 部署前提
 
 1. 构建好的二进制放到 `bin/artex`（只读挂载到 `/app/artex`，页面一键更新无法覆盖）。
