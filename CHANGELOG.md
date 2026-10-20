@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### 0.3.22-fix9 — 部署命名统一
+
+- `/api/health` 的 `service` 字段由 `artex` 改为 `xfsrc`。
+- Compose 工程名 `xfsrc`，容器 `xfsrc-app` / `xfsrc-db`，数据卷 `xfsrc_pgdata`，
+  网络 `xfsrc_default` 固定 `172.18.0.0/16`（宿主机转发只监听 `172.18.0.1:3066`）。
+- 镜像变量改名 `XFSRC_IMAGE` / `XFSRC_TAG`。
+- Cookie 名（`artex_token`、`artex_basic_auth`）保持不变：改名会让所有会话与
+  访问验证失效，收益仅为内部标识一致性。
+
 ### 0.3.22-fix8 — XFSRC 品牌与在线更新
 
 - 系统更名 ARTEX → XFSRC：前端标题/品牌/版权、登录与初始化页、侧边栏、启动 banner、Basic Auth realm、审批提示、通知测试文案；登录用户名同步改为 `XFSRC`。
