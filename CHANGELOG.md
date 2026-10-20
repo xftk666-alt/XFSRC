@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### 0.3.22-fix10 — CI/CD
+
+- `release.yml` 改为 fork 专用：接受 `v<版本>-fix<N>` 标签，五平台交叉编译后自动创建 Release 并上传 zip + `SHA256SUMS`。
+- 移除上游的 Docker Hub 发布与 Vercel demo 部署（`demo.yml`）；私有 fork 不发布公共镜像与演示站。
+- `ci.yml` 覆盖 `local` 分支：`go vet` + `go test`（带 PostgreSQL service）+ 前端静态构建。
+
 ### 0.3.22-fix9 — 部署命名统一
 
 - `/api/health` 的 `service` 字段由 `artex` 改为 `xfsrc`。
