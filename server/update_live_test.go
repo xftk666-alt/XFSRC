@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/Autumn-27/artex/selfupdate"
@@ -47,4 +48,22 @@ func TestLiveUpdateCheck(t *testing.T) {
 	if !found {
 		t.Fatal("asset missing")
 	}
+
+	// 下载 + SHA256SUMS 校验 + 解包到临时目录，覆盖一键更新的高风险步骤。
+	dir := t.TempDir()
+	stageCtx := selfupdate.WithAPIAssets(context.Background())
+	if err := selfupdate.StageTo(stageCtx, client, rel, "0.3.22-fix9", selfupdate.Paths{
+		Current: filepath.Join(dir, "artex"),
+		New:     filepath.Join(dir, "artex.new"),
+		Sum:     filepath.Join(dir, "artex.new.sha256"),
+		Old:     filepath.Join(dir, "artex.old"),
+		Marker:  filepath.Join(dir, "artex.upgrade.json"),
+	}, nil); err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	st, err := os.Stat(filepath.Join(dir, "artex.new"))
+	if err != nil {
+		t.Fatalf("staged binary: %v", err)
+	}
+	t.Logf("staged artex.new = %d bytes", st.Size())
 }

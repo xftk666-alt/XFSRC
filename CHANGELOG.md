@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### 0.3.22-fix11 — 私有仓库在线更新修复
+
+- 修复私有仓库无法下载发布包：`browser_download_url` 带 Bearer token 会返回 404，
+  改为使用 GitHub REST 资产地址并声明 `Accept: application/octet-stream`
+  （`selfupdate.WithAPIAssets` / `Asset.DownloadURL`）。
+- 新增可选的真实链路测试 `TestLiveUpdateCheck`（需 `ARTEX_UPDATE_TOKEN`）：
+  校验版本比较、资产选择、下载、SHA256SUMS 比对与解包。
+
 ### 0.3.22-fix10 — CI/CD
 
 - `release.yml` 改为 fork 专用：接受 `v<版本>-fix<N>` 标签，五平台交叉编译后自动创建 Release 并上传 zip + `SHA256SUMS`。

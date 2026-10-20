@@ -55,6 +55,17 @@ func Stage(ctx context.Context, c *http.Client, rel *Release, currentVersion str
 	return stageAt(ctx, c, rel, currentVersion, prog, p)
 }
 
+// StageTo runs the same download/verify/extract pipeline as Stage but writes to
+// caller-provided paths. Exported so the live-update test can exercise the risky
+// steps (asset download, SHA256SUMS check, zip extraction) without touching the
+// running binary.
+func StageTo(ctx context.Context, c *http.Client, rel *Release, currentVersion string, p Paths, prog Progress) error {
+	if prog == nil {
+		prog = func(Phase, int, string) {}
+	}
+	return stageAt(ctx, c, rel, currentVersion, prog, p)
+}
+
 // stageAt keeps downloads and executable replacement testable in an isolated directory.
 func stageAt(ctx context.Context, c *http.Client, rel *Release, currentVersion string, prog Progress, p Paths) error {
 	if err := checkWritable(p.Dir); err != nil {
@@ -138,7 +149,7 @@ func fetchSums(ctx context.Context, c *http.Client, rel *Release) (map[string]st
 	if !ok {
 		return nil, fmt.Errorf("该 Release 没有 %s，无法校验完整性，拒绝升级", sumsAsset)
 	}
-	body, err := get(ctx, c, asset.URL)
+	body, err := getAsset(ctx, c, asset)
 	if err != nil {
 		return nil, fmt.Errorf("下载 %s: %w", sumsAsset, err)
 	}
@@ -194,7 +205,7 @@ func isHexSHA256(s string) bool {
 
 // download 把资产写入 dst，同时计算 SHA256 并按 Content-Length 汇报进度。
 func download(ctx context.Context, c *http.Client, a Asset, dst string, prog Progress) (string, error) {
-	body, err := get(ctx, c, a.URL)
+	body, err := getAsset(ctx, c, a)
 	if err != nil {
 		return "", fmt.Errorf("下载 %s: %w", a.Name, err)
 	}
@@ -218,6 +229,44 @@ func download(ctx context.Context, c *http.Client, a Asset, dst string, prog Pro
 		return "", fmt.Errorf("下载不完整：期望 %d 字节，实际 %d 字节", a.Size, pw.written)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// useAPIAssets 报告是否需要走 GitHub 的资产 API（私有仓库场景）。
+// 由调用方通过 ctx 传入：Stage/StageTo 在配置了 token 时置位。
+type apiAssetsKey struct{}
+
+// WithAPIAssets 标记本次下载使用 GitHub REST 资产地址（私有仓库）。
+func WithAPIAssets(ctx context.Context) context.Context {
+	return context.WithValue(ctx, apiAssetsKey{}, true)
+}
+
+func apiAssets(ctx context.Context) bool {
+	v, _ := ctx.Value(apiAssetsKey{}).(bool)
+	return v
+}
+
+// getAsset 下载一个 release 资产：私有仓库走 API 地址并声明 octet-stream。
+func getAsset(ctx context.Context, c *http.Client, a Asset) (io.ReadCloser, error) {
+	useAPI := apiAssets(ctx) && a.APIURL != ""
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.DownloadURL(useAPI), nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkURL(req.URL); err != nil {
+		return nil, err
+	}
+	if useAPI {
+		req.Header.Set("Accept", "application/octet-stream")
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return resp.Body, nil
 }
 
 // get 发起一个受白名单约束的 GET，返回响应体。

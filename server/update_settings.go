@@ -109,6 +109,12 @@ func (s *Server) updateClient() (*http.Client, string, error) {
 	return client, cfg.Proxy, nil
 }
 
+// updateUsesToken reports whether a GitHub token is configured (private repo).
+func (s *Server) updateUsesToken() bool {
+	cfg, err := s.loadUpdateSettings()
+	return err == nil && strings.TrimSpace(cfg.Token) != ""
+}
+
 // authTransport adds the GitHub Authorization header to every update request.
 // The repository is private, so the unauthenticated releases API returns 404.
 type authTransport struct {

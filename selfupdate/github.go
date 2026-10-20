@@ -42,10 +42,23 @@ type Release struct {
 }
 
 // Asset 是 Release 上挂的一个文件。
+//
+// APIURL 是 GitHub REST 的资产地址（api.github.com/.../releases/assets/<id>）。
+// 私有仓库的 browser_download_url 需要浏览器 Cookie 认证，带 Bearer token 会
+// 返回 404；此时必须走 APIURL + Accept: application/octet-stream。
 type Asset struct {
-	Name string `json:"name"`
-	URL  string `json:"browser_download_url"`
-	Size int64  `json:"size"`
+	Name   string `json:"name"`
+	URL    string `json:"browser_download_url"`
+	APIURL string `json:"url"`
+	Size   int64  `json:"size"`
+}
+
+// DownloadURL 选择实际下载地址：配置了 token（私有仓库）时优先用 API 资产地址。
+func (a Asset) DownloadURL(useAPI bool) string {
+	if useAPI && a.APIURL != "" {
+		return a.APIURL
+	}
+	return a.URL
 }
 
 // ParseProxy validates an optional update proxy without including credentials in errors.
