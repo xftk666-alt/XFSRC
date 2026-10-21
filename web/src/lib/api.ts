@@ -28,6 +28,7 @@ import type {
   ConvTokenSummary,
   CoverageAssetRefs,
   CoverageGraphData,
+  CredentialTrafficDetail,
   DailyTokenBucket,
   DeleteTaskOptions,
   DeleteTaskResult,
@@ -50,6 +51,7 @@ import type {
   FindingsPage,
   FindingTraffic,
   FindingTrafficDetail,
+  IntelligencePage,
   IntentAsset,
   InterceptApprovalFilter,
   InterceptApprovalRow,
@@ -91,6 +93,7 @@ import type {
   TaskCategory,
   TaskConstraint,
   TaskGoal,
+  TaskIntelligence,
   TaskLLMResolutions,
   TaskNode,
   TaskSchedule,
@@ -174,7 +177,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 // to the Go backend on :8787, whose CORS is open.
 //
 // Override either default with NEXT_PUBLIC_SSE_BASE (set it to "" to force same-origin).
-// Token is appended as ?token= because SSE can't carry cookies cross-origin.
+// 认证走 HttpOnly cookie，不再把 token 拼进 query（见下方 sseUrl）。
 // mockReport returns a canned Markdown report for the demo.
 function mockReport(_task?: string): string {
   return `# XFSRC 渗透测试报告 — Acme Corp
@@ -917,6 +920,18 @@ export const api = {
   trafficDeleteAll: () => del<{ deleted: number; reclaimed: number }>(`/traffic/all`),
 
   // ---- app settings (runtime toggles) ----
+  intelligence: (scope: "tasks" | "assets", id: string, query: URLSearchParams) =>
+    get<IntelligencePage>(`/${scope}/${id}/intelligence?${query.toString()}`),
+  intelligenceDetail: (scope: "tasks" | "assets", id: string, intelligenceId: number) =>
+    get<TaskIntelligence>(`/${scope}/${id}/intelligence/${intelligenceId}`),
+  updateIntelligence: (taskId: number, intelligenceId: number, status: string) =>
+    patch<{ updated: boolean }>(`/tasks/${taskId}/intelligence/${intelligenceId}`, { status }),
+  retryCredentials: (taskId: number, intelligenceId: number) =>
+    post<{ queued: boolean }>(`/tasks/${taskId}/intelligence/${intelligenceId}/credentials/retry`),
+  credentialTraffic: (scope: "tasks" | "assets", scopeId: string, intelligenceId: number, trafficId: string) =>
+    get<CredentialTrafficDetail>(
+      `/${scope}/${scopeId}/intelligence/${intelligenceId}/traffic/${encodeURIComponent(trafficId)}`,
+    ),
   settings: () => get<Settings>(`/settings`),
   basicAuthSettings: () => get<{ enabled: boolean; username: string; password_set: boolean }>("/settings/basic-auth"),
   setBasicAuthSettings: (settings: { enabled: boolean; username: string; password: string }) =>

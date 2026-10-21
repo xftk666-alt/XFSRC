@@ -955,7 +955,7 @@ export default function TasksPage() {
                       onSort={sortTasksBy}
                     />
                     <TableHead>名称</TableHead>
-                    <TableHead>备注</TableHead>
+                    <TableHead className="w-px">备注</TableHead>
                     <TableHead>描述</TableHead>
                     <TableHead>目标</TableHead>
                     <SortableTaskHead

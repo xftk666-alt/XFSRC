@@ -715,7 +715,7 @@ export default function SchedulesPage() {
                   </TableHead>
                   <TableHead className="font-mono">ID</TableHead>
                   <TableHead className="min-w-44">计划名称</TableHead>
-                  <TableHead>备注</TableHead>
+                  <TableHead className="w-px">备注</TableHead>
                   <TableHead className="w-28">时间线</TableHead>
                   <TableHead className="min-w-48">运行周期</TableHead>
                   <TableHead className="min-w-40">开始时间</TableHead>

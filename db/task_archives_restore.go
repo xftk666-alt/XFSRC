@@ -92,6 +92,7 @@ WHERE relation.source_task_id=$1 LIMIT 1`, taskID).Scan(&dependent)
 		{`DELETE FROM task_asset_links WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_llm_profiles WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_scope WHERE task_id=$1`, []any{taskID}},
+		{`DELETE FROM task_intelligence WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_constraints WHERE exploration_id=$1`, []any{expID}},
 		{`DELETE FROM activity WHERE exploration_id=$1`, []any{expID}},
 		{`DELETE FROM exploration_nodes WHERE exploration_id=$1`, []any{expID}},
@@ -242,7 +243,7 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	}
 	// Insert graph rows in foreign-key order. The archived stub has no graph rows,
 	// so an ID conflict signals external corruption and must stop the restore.
-	for _, table := range []string{"exploration_nodes", "exploration_edges", "exploration_anchors", "task_constraints", "activity"} {
+	for _, table := range []string{"exploration_nodes", "exploration_edges", "exploration_anchors", "task_constraints", "activity", "task_intelligence"} {
 		if err := insertArchiveRows(tx, table, remappedTables[table]); err != nil {
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
@@ -386,7 +387,7 @@ func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
 	}
 	allowed := map[string]bool{
 		"exploration_nodes": true, "exploration_edges": true, "exploration_anchors": true,
-		"task_constraints": true, "activity": true, "task_asset_links": true, "findings": true,
+		"task_intelligence": true, "task_constraints": true, "activity": true, "task_asset_links": true, "findings": true,
 		"llm_records": true, "llm_usage": true, "skill_usage": true, "tool_usage": true,
 		"side_question_sessions": true, "side_question_requests": true,
 	}
@@ -563,7 +564,7 @@ func remapArchiveAssetReferences(tables map[string]json.RawMessage, mapping map[
 		}
 		out[table], _ = json.Marshal(rows)
 	}
-	for _, table := range []string{"exploration_nodes", "findings"} {
+	for _, table := range []string{"exploration_nodes", "findings", "task_intelligence"} {
 		rows, err := decodeArchiveRows(tables[table])
 		if err != nil {
 			return nil, err
@@ -587,6 +588,17 @@ func remapArchiveAssetReferences(tables map[string]json.RawMessage, mapping map[
 					}
 				}
 				container[key] = values
+			}
+		}
+		if table == "task_intelligence" {
+			for _, row := range rows {
+				raw, _ := json.Marshal(row)
+				var input IntelligenceInput
+				if err := json.Unmarshal(raw, &input); err != nil {
+					return nil, err
+				}
+				// Triage is human editable; preserve it even when the original observation was inferred.
+				row["fingerprint"] = intelligenceFingerprint(input)
 			}
 		}
 		out[table], _ = json.Marshal(rows)

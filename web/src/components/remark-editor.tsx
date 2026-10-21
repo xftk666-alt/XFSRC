@@ -148,7 +148,7 @@ function InlineTextEditor({
     <div
       className={cn(
         "group/inline-editor flex min-w-0 items-center gap-1 font-medium",
-        multiline ? "w-32 sm:w-48" : "max-w-xs",
+        multiline ? "w-fit max-w-32 sm:max-w-48" : "max-w-xs",
       )}
     >
       <button

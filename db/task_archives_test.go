@@ -204,6 +204,13 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 	if _, err := d.AddFinding(task.ID, nodeID, vulnclass, "archive finding", SeverityCritical, "summary", "evidence", "worker", []int64{assetID}); err != nil {
 		t.Fatal(err)
 	}
+	intel, err := d.RecordIntelligence(t.Context(), task.ID, 0, "archive-qa", IntelligenceInput{Kind: "credential", Title: "archive credential", Content: "archive-fixture", Evidence: "local fixture", Confidence: "observed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = d.Exec(`UPDATE task_intelligence SET credential_analysis='{"state":"ready","method":"rules","accounts":[{"username":"qa","password":"archive-fixture"}],"traffic":[{"id":"archive-flow","url":"http://fixture.invalid","method":"POST","status":200,"side":"request","excerpt":"archive-fixture","accounts":[0]}],"traffic_state":"ready"}'::jsonb WHERE id=$1`, intel.ID); err != nil {
+		t.Fatal(err)
+	}
 	archive, err := d.QueueTaskArchive(task.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -272,6 +279,10 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	restoredIntel, err := d.GetIntelligence(t.Context(), intel.ID)
+	if err != nil || restoredIntel.Content != "archive-fixture" || restoredIntel.Credentials == nil || len(restoredIntel.Credentials.Accounts) != 1 || len(restoredIntel.Credentials.Traffic) != 1 {
+		t.Fatalf("intelligence lost after archive: %+v %v", restoredIntel, err)
 	}
 	warningFound := false
 	for _, warning := range warnings {
