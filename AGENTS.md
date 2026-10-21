@@ -32,6 +32,12 @@ AGPL-3.0。
 - **工作区隔离**（`server/workspace.go`）：拒绝 `evidence/`、`traffic/`、`sessions/`、
   `transcripts/`、`jwt.key`；符号链接按解析后的真实路径二次校验，悬空链接直接拒绝。
 - **拦截规则匹配面**（`guard/guard.go: ruleSubject`）：Write/Edit 只匹配 `file_path`。
+- **兜底裁判失败策略**（`intercept/intercept.go: defaultJudgeFailAction`）：本 fork 默认
+  `allow`。理由：授权边界是 fail-closed 的 scope 闸（先于拦截规则执行），内置破坏性
+  规则也先于裁判；裁判只处理「没命中任何规则」的调用。无人值守下选 `ask` 会让每个
+  受影响调用挂满 300 秒再被拒，看起来像卡死且没有安全收益。失败时会在会话流里发一条
+  `judge_fallback` 活动（含错误原因），不会静默降级。需要更严可在「拦截审批」页改成
+  `ask`/`deny`。
 - **录制开关**（`traffic/traffic.go`）：关闭时存储层不落盘。
 - **登录限流**（`server/auth_limit.go`）：10 次/分钟/真实客户端 IP（本机反代后取
   `X-Forwarded-For`，防单点锁死管理员）。

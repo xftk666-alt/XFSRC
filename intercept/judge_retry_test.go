@@ -35,8 +35,10 @@ func TestJudgeFailActionDefaultsAndOverrides(t *testing.T) {
 	for _, tc := range []struct {
 		name, value, want string
 	}{
-		{"missing", "", "ask"},
-		{"invalid", "invalid", "ask"},
+		// This fork defaults to allow: the authorization boundary is the fail-closed
+		// scope gate, and "ask" in an unattended run means a 300s stall then a deny.
+		{"missing", "", "allow"},
+		{"invalid", "invalid", "allow"},
 		{"saved_allow", "allow", "allow"},
 		{"saved_ask", "ask", "ask"},
 		{"saved_deny", "deny", "deny"},
@@ -50,6 +52,53 @@ func TestJudgeFailActionDefaultsAndOverrides(t *testing.T) {
 				t.Fatalf("fail action=%s want=%s", got, tc.want)
 			}
 		})
+	}
+}
+
+// A judge outage must be both non-blocking (allow, not a 300s ask-then-deny) and
+// visible: an "allowed" history row alone is invisible to the operator.
+func TestJudgeFailureAllowsAndEmitsFallbackActivity(t *testing.T) {
+	i := retryTestInterceptor(t, map[string]string{
+		settingJudgeEnabled:         "true",
+		settingJudgeRetryCount:      "0",
+		settingJudgeRetryIntervalMS: "0",
+	})
+	i.SetReviewer(func(context.Context, int64, string, ReviewInput) (Decision, error) {
+		return Decision{}, errors.New("insufficient balance")
+	})
+	var emitted []db.Activity
+	ctx := WithTaskContext(t.Context(), "judge-fallback-task", "worker-1", func(a db.Activity) {
+		emitted = append(emitted, a)
+	})
+	dec, judged := i.Judge(ctx, "Bash", json.RawMessage(`{"command":"echo ok"}`))
+	if !judged {
+		t.Fatal("judge was not consulted")
+	}
+	if dec.Action != "allow" || !dec.ModelFallback {
+		t.Fatalf("failure verdict = %+v, want allow + ModelFallback", dec)
+	}
+	if len(emitted) != 1 {
+		t.Fatalf("emitted %d activities, want 1", len(emitted))
+	}
+	if emitted[0].Kind != "judge_fallback" || !strings.Contains(emitted[0].Detail, "insufficient balance") {
+		t.Fatalf("fallback activity = %+v", emitted[0])
+	}
+}
+
+// Operators can still choose fail-closed behaviour explicitly.
+func TestJudgeFailureHonoursExplicitDeny(t *testing.T) {
+	i := retryTestInterceptor(t, map[string]string{
+		settingJudgeEnabled:         "true",
+		settingJudgeRetryCount:      "0",
+		settingJudgeRetryIntervalMS: "0",
+		settingJudgeFailAction:      "deny",
+	})
+	i.SetReviewer(func(context.Context, int64, string, ReviewInput) (Decision, error) {
+		return Decision{}, errors.New("provider down")
+	})
+	dec, _ := i.Judge(t.Context(), "Bash", json.RawMessage(`{"command":"echo ok"}`))
+	if dec.Action != "deny" {
+		t.Fatalf("action = %s, want deny", dec.Action)
 	}
 }
 
@@ -86,7 +135,7 @@ func TestJudgeRetriesBeforeApplyingFailurePolicy(t *testing.T) {
 		{"recover", "deny", "allow", 2, 3, "allow", false},
 		{"valid_deny_is_final", "allow", "deny", 0, 1, "deny", false},
 		{"valid_ask_is_final", "allow", "ask", 0, 1, "ask", false},
-		{"exhaust_default", "", "allow", 9, 3, "ask", true},
+		{"exhaust_default", "", "allow", 9, 3, "allow", true},
 		{"exhaust_allow", "allow", "allow", 9, 3, "allow", true},
 		{"exhaust_ask", "ask", "allow", 9, 3, "ask", true},
 		{"exhaust_deny", "deny", "allow", 9, 3, "deny", true},

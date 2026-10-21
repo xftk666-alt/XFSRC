@@ -315,9 +315,24 @@ const (
 
 // Judge default values.
 const (
-	defaultJudgeTimeoutSecs      = 15
-	defaultJudgeRetryCount       = 3
-	defaultJudgeFailAction       = "ask"
+	defaultJudgeTimeoutSecs = 15
+	defaultJudgeRetryCount  = 3
+	// defaultJudgeFailAction decides what happens when the fallback judge cannot
+	// produce a verdict (provider error, timeout, unparseable output).
+	//
+	// This fork runs UNATTENDED, so "ask" is the worst option here: nobody answers,
+	// every affected tool call waits the full ask timeout (300s) and is then denied
+	// — the run looks hung and then dies, with no safety gain over denying outright.
+	//
+	// "allow" is safe to default to because the judge is NOT the authorization
+	// boundary: guard.preToolUse runs the scope gate first and fails closed on its
+	// own (out-of-scope hosts, unreadable target lists), and destructive-command
+	// rules are evaluated before the judge ever runs. The judge only ever sees
+	// calls that matched no rule, so a judge outage degrades to "rules + scope
+	// gate", which is exactly the pre-upgrade behaviour.
+	//
+	// Operators who run supervised can set 系统 → 拦截审批 → 失败策略 to ask/deny.
+	defaultJudgeFailAction       = "allow"
 	defaultJudgeAskTimeoutSecs   = 300
 	defaultJudgeAskTimeoutAction = "deny"
 	// DefaultIncompleteScriptAction keeps incomplete snapshots with the judge.
@@ -444,6 +459,28 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 	return nil
 }
 
+// emitJudgeFallback surfaces a degraded judge in the session transcript. Without
+// it a judge outage is invisible: the tool call simply proceeds, and the only
+// trace is an "allowed" intercept-history row the operator has no reason to open.
+func (i *Interceptor) emitJudgeFallback(ctx context.Context, tool, action string, cause error) {
+	detail := ""
+	if cause != nil {
+		detail = cause.Error()
+	}
+	activity := db.Activity{
+		Kind:    "judge_fallback",
+		Summary: fmt.Sprintf("裁判模型不可用，按失败策略「%s」继续：%s", judgeActionLabel(action), tool),
+		Detail:  detail,
+	}
+	if convID := ConvIDFromContext(ctx); convID != 0 {
+		_, _ = i.db.AppendConvActivity(convID, activity)
+		return
+	}
+	if emit := taskEmitFromCtx(ctx); emit != nil {
+		emit(activity)
+	}
+}
+
 // Judge runs the LLM fallback judge for a tool call that matched no rule. It
 // returns (Decision, true) when the judge produced a terminal verdict, or
 // (Decision{}, false) when the fallback is disabled or not wired (caller then
@@ -482,6 +519,7 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 	}
 	if err != nil {
 		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "模型审批失败,按失败策略处理: " + err.Error()}
+		i.emitJudgeFallback(ctx, tool, cfg.FailAction, err)
 	}
 	// By default the model receives snapshot read errors and its verdict is
 	// honored. Operators may explicitly require human review when an incomplete
@@ -492,6 +530,7 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 		// valid verdict
 	default:
 		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "模型输出无法解析,按失败策略处理"}
+		i.emitJudgeFallback(ctx, tool, cfg.FailAction, err)
 	}
 	// A model verdict never carries a rule; keep RuleID 0 (→ NULL) for history.
 	out.RuleID = 0
