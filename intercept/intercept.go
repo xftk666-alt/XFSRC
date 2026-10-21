@@ -321,7 +321,7 @@ const (
 	// produce a verdict (provider error, timeout, unparseable output).
 	//
 	// This fork runs UNATTENDED, so "ask" is the worst option here: nobody answers,
-	// every affected tool call waits the full ask timeout (300s) and is then denied
+	// every affected tool call waits the full ask timeout and is then denied
 	// — the run looks hung and then dies, with no safety gain over denying outright.
 	//
 	// "allow" is safe to default to because the judge is NOT the authorization
@@ -332,8 +332,12 @@ const (
 	// gate", which is exactly the pre-upgrade behaviour.
 	//
 	// Operators who run supervised can set 系统 → 拦截审批 → 失败策略 to ask/deny.
-	defaultJudgeFailAction       = "allow"
-	defaultJudgeAskTimeoutSecs   = 300
+	defaultJudgeFailAction = "allow"
+	// defaultJudgeAskTimeoutSecs bounds how long a call waits for a human verdict.
+	// 300s meant an unattended run could stall five minutes per affected call before
+	// finally being denied; two minutes keeps a supervised operator time to react
+	// while capping the damage of "nobody is watching".
+	defaultJudgeAskTimeoutSecs   = 120
 	defaultJudgeAskTimeoutAction = "deny"
 	// DefaultIncompleteScriptAction keeps incomplete snapshots with the judge.
 	DefaultIncompleteScriptAction = "model"

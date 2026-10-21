@@ -36,7 +36,7 @@ func TestJudgeFailActionDefaultsAndOverrides(t *testing.T) {
 		name, value, want string
 	}{
 		// This fork defaults to allow: the authorization boundary is the fail-closed
-		// scope gate, and "ask" in an unattended run means a 300s stall then a deny.
+		// scope gate, and "ask" in an unattended run means a long stall then a deny.
 		{"missing", "", "allow"},
 		{"invalid", "invalid", "allow"},
 		{"saved_allow", "allow", "allow"},
@@ -55,7 +55,7 @@ func TestJudgeFailActionDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
-// A judge outage must be both non-blocking (allow, not a 300s ask-then-deny) and
+// A judge outage must be both non-blocking (allow, not an ask-then-deny stall) and
 // visible: an "allowed" history row alone is invisible to the operator.
 func TestJudgeFailureAllowsAndEmitsFallbackActivity(t *testing.T) {
 	i := retryTestInterceptor(t, map[string]string{
@@ -173,7 +173,7 @@ func TestJudgeRetriesBeforeApplyingFailurePolicy(t *testing.T) {
 			if got.RuleID != 0 || len(got.ModelInput) == 0 || got.ModelInputDigest == "" || got.ConfigDigest == "" {
 				t.Fatalf("missing audit data: %+v", got)
 			}
-			if got.Action == "ask" && (!got.TimeoutEnabled || got.TimeoutSeconds != 300 || got.TimeoutAction != "deny") {
+			if got.Action == "ask" && (!got.TimeoutEnabled || got.TimeoutSeconds != 120 || got.TimeoutAction != "deny") {
 				t.Fatal("human approval timeout lost")
 			}
 			if tc.wantFallback && !strings.Contains(got.Message, "temporary model failure") {
