@@ -4,7 +4,7 @@
 
 ## 版本号
 
-格式：`<上游版本>-fix<N>`，例如 `0.3.22-fix13`。
+格式：`<上游版本>-fix<N>`，例如 `0.3.23-fix1`。
 
 - `<上游版本>` 表示基于哪个上游 ARTEX 版本；
 - `fix<N>` 是本地修订序号，同一上游版本内单调递增。
@@ -12,7 +12,7 @@
 比较规则（`selfupdate.parseVersion`）：
 
 ```
-0.3.22-fix13 > 0.3.22-fix12 > 0.3.22-fix1 > 0.3.22
+0.3.23-fix1 > 0.3.23 > 0.3.22-fix13 > 0.3.22-fix1 > 0.3.22
 ```
 
 `dev`、`0.3.7-2-gabc1234` 这类带其他后缀的版本会被判为**不可比较**，从而禁用一键更新——避免开发构建被正式版覆盖。
@@ -33,8 +33,8 @@ cd /home/xiaofan/xfsrc
 
 ```bash
 git add -A && git commit -m "fix: ..."
-git tag -a v0.3.22-fix13 -m "0.3.22-fix13: 说明"
-git -c http.proxy=http://127.0.0.1:3067 push origin local v0.3.22-fix13
+git tag -a v0.3.23-fix1 -m "0.3.23-fix1: 说明"
+git push origin local v0.3.23-fix1
 ```
 
 推送标签即触发 `.github/workflows/release.yml`。

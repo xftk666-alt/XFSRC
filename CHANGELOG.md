@@ -1,4 +1,16 @@
-## v0.3.22-fix14 — 安全加固（审计发现逐条修复）
+## v0.3.23-fix1 — 同步上游 v0.3.23 + 安全加固（审计发现逐条修复）
+
+### 上游同步
+- 合并 `RuoJi6/ARTEX` v0.3.23（b97472f..620ca5d）：任务情报（task_intelligence）、
+  凭据处理开关与流量卡片、拦截失败策略默认改为人工审批、任务归档 v4。
+- 冲突处理保留双方语义：settings 同时暴露本 fork 的 `scope_gate_enabled` /
+  `scope_trusted_sources` 与上游的情报/凭据开关；`record_intelligence` 可用，
+  但 `add_task_scope` 仍只给目标拆解器。
+- README 的许可章节采用上游版本，但把「仅限本地学习、禁止任何线上测试」改为与
+  本 fork 用途一致的「仅限已授权 SRC」。
+
+### 安全加固
+
 
 ### 授权边界
 - 授权闸从「只挂 worker」扩展到 **planner、任务主 Agent、以及能反查到任务的 chat 会话**

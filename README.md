@@ -16,7 +16,7 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 > - 上游：[RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)（原始历史见 [Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX)）
 > - 许可证：AGPL-3.0（见 [LICENSE](LICENSE)）
 > - 分支：`main` 跟随上游；`local` 为本人的加固与定制
-> - 版本号：`<上游版本>-fix<N>`，例如 `0.3.22-fix7` = 基于上游 0.3.22 的第 7 次本地修订
+> - 版本号：`<上游版本>-fix<N>`，例如 `0.3.23-fix1` = 基于上游 0.3.23 的第 1 次本地修订
 > - 使用场景与合规边界见 [docs/USAGE.md](docs/USAGE.md)
 >
 > 上游说明（原文）：本仓库为独立维护的 RuoJi6/ARTEX，保留 Autumn-27/ARTEX 的原始提交历史与 AGPL-3.0 许可证。
