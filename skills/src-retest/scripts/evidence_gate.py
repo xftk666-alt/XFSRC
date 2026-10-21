@@ -38,6 +38,83 @@ def hosts(pack: dict) -> list[str]:
     return hs
 
 
+def _body(outdir: str, name: str) -> bytes:
+    path = os.path.join(outdir, "cases", name, "response.body")
+    if not os.path.isfile(path):
+        return b""
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _compare_claims_hold(outdir: str, comp: dict) -> bool:
+    """用封印后的 body 复算 compare 的字段级断言。任一断言不成立即不通过。"""
+    f = comp.get("file") or ""
+    if not f or not os.path.isfile(f):
+        return False
+    try:
+        with open(f, encoding="utf-8") as fh:
+            detail = json.load(fh)
+    except Exception:
+        return False
+    if not isinstance(detail, dict):
+        return False
+    attack = comp.get("attack") or ""
+    control = comp.get("control") or ""
+    if not attack or not control:
+        return False
+    a_body = _body(outdir, attack)
+    c_body = _body(outdir, control)
+    if not a_body:
+        return False
+    field_names = {"attack_contains", "control_not_contains", "json_path_differs", "attack_json_value"}
+    seen_field = False
+    for ch in detail.get("checks") or []:
+        if not isinstance(ch, dict):
+            return False
+        name = str(ch.get("name") or "")
+        expected = ch.get("expected")
+        if name == "attack_contains":
+            seen_field = True
+            if str(expected).encode("utf-8") not in a_body:
+                return False
+        elif name == "control_not_contains":
+            seen_field = True
+            if str(expected).encode("utf-8") in c_body:
+                return False
+        elif name in ("json_path_differs", "attack_json_value"):
+            seen_field = True
+            path = ch.get("path") or ""
+            if not path:
+                return False
+            try:
+                a_json = json.loads(a_body.decode("utf-8", "replace") or "null")
+                c_json = json.loads(c_body.decode("utf-8", "replace") or "null")
+            except Exception:
+                return False
+            segs = str(path).lstrip("$.").split(".")
+
+            def walk(doc):
+                cur = doc
+                for seg in segs:
+                    if isinstance(cur, dict):
+                        cur = cur.get(seg)
+                    elif isinstance(cur, list) and seg.isdigit():
+                        cur = cur[int(seg)]
+                    else:
+                        return None
+                return cur
+
+            av, cv = walk(a_json), walk(c_json)
+            if name == "json_path_differs" and av == cv:
+                return False
+            if name == "attack_json_value" and str(av) != str(expected):
+                return False
+        elif name in field_names:
+            seen_field = True
+        # 其它断言（状态码等）不构成字段级证据，忽略。
+    return seen_field
+
+
 def main() -> int:
     outdir = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
     kind = (sys.argv[2] if len(sys.argv) > 2 else "").strip().lower()
@@ -61,9 +138,16 @@ def main() -> int:
         reasons.append("no cases recorded")
 
     try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         sys.path.insert(0, "/usr/local/share/artex-src")
-        from evidence_seal import verify_pack_cases
+        from evidence_seal import verify_pack, verify_pack_cases
 
+        # pack.seal.json 覆盖 case 归属 / compares.pass / 截图哈希；少了这一步，
+        # 手改 pack.json 把 compares.pass 改成 true 就能过闸（审计发现）。
+        pack_ok, pack_why = verify_pack(outdir)
+        if not pack_ok:
+            ok = False
+            reasons.append(f"pack.seal.json 校验未通过（{pack_why}）")
         integ = verify_pack_cases(outdir)
         if not integ.get("ok"):
             ok = False
@@ -103,18 +187,11 @@ def main() -> int:
         if not passed_compare:
             ok = False
             reasons.append("need at least one http_evidence_compare with pass=true")
+        # 字段级断言必须用封印后的 case 现场复算：compare-*.json 不参与 HMAC，
+        # 直接信它的 checks 等于允许手写一份「字段对照」过闸。
         field_ok = False
         for c in passed_compare:
-            f = c.get("file") or ""
-            detail = {}
-            if f and os.path.isfile(f):
-                try:
-                    with open(f, encoding="utf-8") as fh:
-                        detail = json.load(fh)
-                except Exception:
-                    detail = {}
-            names = {x.get("name") for x in detail.get("checks") or []}
-            if names & {"attack_contains", "control_not_contains", "json_path_differs", "attack_json_value"}:
+            if _compare_claims_hold(outdir, c):
                 field_ok = True
         if passed_compare and not field_ok:
             ok = False

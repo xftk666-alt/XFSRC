@@ -44,7 +44,7 @@ func TestCreateCompanyRejectsNormalizedDuplicateWithoutChangingScope(t *testing.
 	name := fmt.Sprintf("HTTP Strict Company %d", stamp)
 	companyID, _, _, _, _, err := m.pg.Companies().CreateCompanyWithScope(name, "", []db.ScopeInput{
 		{Kind: "domain", Value: fmt.Sprintf("existing-%d.example", stamp)},
-	}, "test")
+	}, "test", "manual")
 	if err != nil {
 		t.Fatal(err)
 	}

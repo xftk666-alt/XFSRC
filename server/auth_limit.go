@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -69,12 +70,40 @@ func (l *loginLimiter) reset(key string) {
 	l.mu.Unlock()
 }
 
+// loginClientKey identifies the client for throttling. RemoteAddr alone is wrong
+// behind the documented nginx deployment (every request then arrives from
+// 127.0.0.1, so one attacker can fill the single bucket and lock the operator
+// out), and equally wrong under Docker's port mapping. The proxy header is only
+// trusted when the connection itself comes from loopback — i.e. from a proxy on
+// the same host — so a remote client cannot spoof it.
 func loginClientKey(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if fwd := forwardedClientIP(r); fwd != "" {
+			return fwd
+		}
 	}
 	return host
+}
+
+// forwardedClientIP returns the left-most address in X-Forwarded-For (the
+// original client), falling back to X-Real-IP.
+func forwardedClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		first := strings.TrimSpace(strings.Split(xff, ",")[0])
+		if ip := net.ParseIP(first); ip != nil {
+			return ip.String()
+		}
+	}
+	if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {
+		if ip := net.ParseIP(real); ip != nil {
+			return ip.String()
+		}
+	}
+	return ""
 }
 
 func (l *loginLimiter) reject(w http.ResponseWriter, wait time.Duration) {

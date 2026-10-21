@@ -317,7 +317,7 @@ func (s *Server) syncSSRun(w http.ResponseWriter, r *http.Request) {
 						companies = append(companies, name)
 						madeCompany = true
 						if len(roots) > 0 {
-							cs.AddScope(cid, roots, "scopesentry:"+name)
+							cs.AddScope(cid, roots, "scopesentry:"+name, db.ScopeSourceAgent)
 						}
 					}
 				}

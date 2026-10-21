@@ -63,10 +63,20 @@ def default_path(task_id: int) -> str:
     p = f"/app/data/tasks/{task_id}/coverage.json"
     try:
         os.makedirs(os.path.dirname(p), exist_ok=True)
+        return p
     except Exception:
-        # 任务目录不可写时才退到工作目录，但要留下可读痕迹
-        return os.path.join(os.getcwd(), f"coverage-task{task_id}.json")
-    return p
+        pass
+    # 容器外的开发/审计环境没有 /app。回退位置同样必须与 cwd 无关：退到
+    # os.getcwd() 会让同一个任务在不同目录各长出一份台账，汇总时互相看不见。
+    base = os.environ.get("ARTEX_DATA_DIR") or os.path.join(
+        os.path.expanduser("~"), ".local", "share", "xfsrc"
+    )
+    fallback = os.path.join(base, "tasks", str(task_id), "coverage.json")
+    try:
+        os.makedirs(os.path.dirname(fallback), exist_ok=True)
+    except Exception:
+        return fallback
+    return fallback
 
 
 def load(task_id: int, path: str = "") -> dict[str, Any]:

@@ -6,7 +6,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `docker-compose.yml` | 在上游 compose 基础上增加：`start.sh`、`jwt.key`、`bin/artex` 只读挂载 |
+| `docker-compose.yml` | 在 Upstream compose 基础上增加：`start.sh` 只读挂载、`bin/artex` 可写挂载、`skills/` 挂载；`jwt.key` 由 start.sh 从 data 卷恢复（不单独挂载） |
 | `start.sh` | 守护脚本，额外挂载 `restore_to_runtime.sh`、`proxy_sync.py`、`retention.sh` 三个钩子 |
 | `scripts/proxy_sync.py` | 从 DB `global_proxy` 生成 `proxychains.conf` 与 `proxy.env` |
 | `scripts/pc_run.sh` | 用 proxychains 包装不支持 HTTP 代理的工具（nmap 等） |
@@ -41,11 +41,11 @@ Compose 工程名固定为 `xfsrc`，容器为 `xfsrc-app` / `xfsrc-db`，数据
 docker tag xfsrc:<tag> xfsrc:latest
 ```
 
-当前部署使用 `xfsrc:0.3.22-fix9`（基于官方 `ruoji6/artex` 加装扫描工具链与 proxychains）。
+当前部署使用本仓库 Dockerfile 本地构建的 `xfsrc:<版本>`（不发布公共镜像，也不再基于上游 `ruoji6/artex`）。
 
 ## 部署前提
 
-1. 构建好的二进制放到 `bin/artex`（只读挂载到 `/app/artex`，页面一键更新无法覆盖）。
+1. 构建好的二进制放到 `bin/artex`（可写挂载到 `/app/bin`，页面一键更新替换的就是它）。
 2. `data/jwt.key` 存在（避免容器重建后所有会话失效）。
 3. 镜像内含扫描工具链（本仓库的 `artex-local` 镜像已固化 subfinder/httpx/katana/nuclei/ffuf 等）。
 
@@ -75,5 +75,5 @@ RETENTION_DRY_RUN=0
 手动执行（可加 `--dry-run`）：
 
 ```bash
-docker exec artex-artex-1 /app/skills/src-retest/scripts/retention.sh --dry-run
+docker exec xfsrc-app /app/skills/src-retest/scripts/retention.sh --dry-run
 ```

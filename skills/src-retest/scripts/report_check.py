@@ -247,7 +247,11 @@ def check(report: str, finding_id: str, task_id: str, kind: str = "",
     # 6) 定级天花板：报告自评不能超过证据能支撑的档
     #    （原 docstring 声称有这一项但代码没实现，等于「自评虚高」完全裸奔）
     sev = _reported_severity(report)
-    if sev:
+    if not sev:
+        # 没有定级就等于没写清楚影响：旧实现直接跳过这一项，于是「不提严重度」
+        # 反而最安全（审计发现）。
+        problems.append("报告未给出严重度（Severity 段缺失或无法解析）")
+    else:
         try:
             sys.path.insert(0, _HERE)
             from submit_brief import submit_ceiling
@@ -269,6 +273,10 @@ def check(report: str, finding_id: str, task_id: str, kind: str = "",
         r = subprocess.run(argv, capture_output=True, text=True)
         if r.returncode == 3:
             problems.append("dup_check 发现重复候选：先按 src-triage 判重五问处理")
+        elif r.returncode == 4:
+            problems.append("dup_check 无法判重（数据源不可用）：按可能重复处理，不要直接提交")
+        elif r.returncode != 0:
+            problems.append(f"dup_check 执行失败（rc={r.returncode}）：{r.stderr.strip()[:200]}")
 
     # 7) 靶场
     try:

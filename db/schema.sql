@@ -141,6 +141,12 @@ ALTER TABLE company_scope ADD CONSTRAINT ck_company_scope_payload CHECK (
     OR (kind IN ('ip','cidr') AND domain IS NULL AND net IS NOT NULL AND value IS NULL)
     OR (kind IN ('icp','keyword') AND domain IS NULL AND net IS NULL AND value IS NOT NULL)
 );
+-- 来源：只有操作员（manual）与目标拆解（goals）写入的规则可以作为授权依据；
+-- 模型工具写入（agent）与自动导入（auto）只用于资产归属与覆盖度，见 db/scope_check.go。
+ALTER TABLE company_scope ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE company_scope DROP CONSTRAINT IF EXISTS company_scope_source_check;
+ALTER TABLE company_scope ADD CONSTRAINT company_scope_source_check
+    CHECK (source IN ('auto','agent','manual','goals'));
 CREATE INDEX IF NOT EXISTS idx_sv2_domain  ON company_scope(domain)   WHERE kind = 'domain';
 CREATE INDEX IF NOT EXISTS idx_sv2_net     ON company_scope USING GIST(net inet_ops) WHERE kind IN ('ip','cidr');
 CREATE UNIQUE INDEX IF NOT EXISTS uq_sv2_value ON company_scope(company_id, kind, value) WHERE kind IN ('icp','keyword');

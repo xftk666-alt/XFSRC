@@ -20,13 +20,25 @@ AGPL-3.0。
 ## 相对上游的关键改动
 
 - **授权闸**（`guard/scope*.go`、`db/scope_check.go`、`server/scope_gate.go`）：
-  发请求前从工具参数与目标文件提取 host，未命中 `task_scope` 即阻断（fail-closed）。
-  只信任 `manual` / `goals` 来源；`agent` / `auto` 仅用于覆盖度。
+  发请求前从工具参数与目标文件提取 host（含短写 IPv4、单标签 host:port），未命中
+  `task_scope` 即阻断（fail-closed）。**挂在所有能跑 Bash/WebFetch 的 agent 上**：
+  worker、planner、任务主 Agent，以及能反查到任务的 chat 会话（`agent/*.go`
+  `SetHooks` + `server/task_llm.go`）。只信任 `manual` / `goals` 来源；
+  `agent` / `auto` 仅用于覆盖度。`add_task_scope` 只给目标拆解器。
+- **企业范围来源**（`company_scope.source`）：`task_scope.kind=company` 只展开
+  `manual`/`goals` 写下的企业规则，模型工具写的是 `agent`（只用于归属与覆盖度）。
+- **复测结论校验**（`evidence/verdict.go`）：`reproduced` / `fixed` 必须带
+  `pack_dir`，服务端重算 HMAC 与证据指纹；`inconclusive` 不要求证据包。
 - **工作区隔离**（`server/workspace.go`）：拒绝 `evidence/`、`traffic/`、`sessions/`、
-  `transcripts/`、`jwt.key`，并做符号链接二次校验。
+  `transcripts/`、`jwt.key`；符号链接按解析后的真实路径二次校验，悬空链接直接拒绝。
 - **拦截规则匹配面**（`guard/guard.go: ruleSubject`）：Write/Edit 只匹配 `file_path`。
 - **录制开关**（`traffic/traffic.go`）：关闭时存储层不落盘。
-- **登录限流**（`server/auth_limit.go`）：10 次/分钟/IP。
+- **登录限流**（`server/auth_limit.go`）：10 次/分钟/真实客户端 IP（本机反代后取
+  `X-Forwarded-For`，防单点锁死管理员）。
+- **会话**（`server/auth.go`）：JWT 放 HttpOnly + SameSite=Strict cookie；
+  `?token=` 只允许 SSE；登出与改密递增 `auth.token_version`，已签发令牌立即失效。
+- **首启防抢注**：未设密码时生成一次性 setup token（日志 + `data/setup-token`），
+  非回环来源的 `/api/auth/init` 必须携带。
 - **私有仓库更新**（`selfupdate`）：`Repo = xftk666-alt/XFSRC`；
   私有仓库资产需走 REST API + `Accept: application/octet-stream`（`WithAPIAssets`）。
 - **品牌**：系统名、登录用户名、banner 均为 `XFSRC`。

@@ -32,6 +32,8 @@ export function AccountSwitcher({
   const [pwOpen, setPwOpen] = useState(false);
 
   function handleLogout() {
+    // 服务端会递增 JWT 版本号，使已签发的令牌全部失效，再清 cookie。
+    void auth.logout();
     auth.clearToken();
     window.location.href = "/login";
   }

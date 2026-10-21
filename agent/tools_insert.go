@@ -409,7 +409,14 @@ func (t *ToolSet) addCompanyScope() actool.CoreTool {
 				return actool.Errorf("创建/获取公司失败: " + err.Error()), nil
 			}
 			lines := splitLines(a.Scope)
-			added, skipped, invalid, errMsgs := t.cs.AddScope(companyID, lines, a.Reason)
+			// A company's scope feeds every task that references the company, so a
+			// model-written rule must never be authoritative: record it as 'agent'
+			// (attribution/coverage) and leave authorization to the operator.
+			source := db.ScopeSourceAgent
+			if t.worker == "goals" {
+				source = db.ScopeSourceGoals
+			}
+			added, skipped, invalid, errMsgs := t.cs.AddScope(companyID, lines, a.Reason, source)
 			out := map[string]any{
 				"company_id": companyID,
 				"added":      added,
@@ -449,13 +456,14 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 			if t.taskID <= 0 {
 				return actool.Errorf("add_task_scope 需要任务上下文(当前无 task)"), nil
 			}
-			// Authorization is the operator's call, not the explorer's. Only the
-			// goal decomposer (working from the operator's own task description)
-			// and the human-facing main agent may widen task_scope; planner and
-			// worker discoveries are recorded as 'auto' for coverage but never
-			// authorize a request (see db.DefaultTrustedScopeSources).
-			if t.worker != "goals" && t.worker != "human" {
-				return actool.Errorf(fmt.Sprintf("add_task_scope 仅允许目标拆解与人工主控登记范围；当前角色 %q 不能扩大授权边界。如确需扩大，请在任务页手动添加 scope 或让操作员确认", t.worker)), nil
+			// Authorization is the operator's call, not the model's. Only the goal
+			// decomposer — reading the operator's own task description — may write a
+			// TRUSTED scope row ('goals'). Every model-facing role, including the
+			// human-interface main agent, writes 'agent': recorded for coverage, but
+			// never authoritative. Otherwise any agent that reads attacker-controlled
+			// target content could widen its own authorization boundary.
+			if t.worker != "goals" {
+				return actool.Errorf(fmt.Sprintf("add_task_scope 仅允许目标拆解登记可信范围；当前角色 %q 不能扩大授权边界。如确需扩大，请在任务页手动添加 scope，由操作员确认", t.worker)), nil
 			}
 			type scopeEntry struct {
 				Kind  string `json:"kind"`
@@ -474,12 +482,7 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 			var added []map[string]any
 			errs := map[string]string{}
 			for i, e := range items {
-				source := "agent"
-				if t.worker == "goals" {
-					source = "goals"
-				} else if t.worker == "human" {
-					source = "manual"
-				}
+				source := "goals"
 				ts, err := t.as.AddAgentScope(t.taskID, strings.TrimSpace(e.Kind), e.Value, a.Reason, source)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
@@ -689,7 +692,8 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		// asset management (handlers guard nil store internally)
 		t.insertAssets(), t.addCompanyScope(), t.listAssets(),
 		t.addFinding(), t.recordFact(),
-		t.addTaskScope(),
+		// add_task_scope 刻意不给主 Agent：它读得到目标内容，模型能借它自扩授权边界。
+		// 需要扩大范围时让操作员在任务页添加（source=manual）。
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
 	}

@@ -19,7 +19,10 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 > - 版本号：`<上游版本>-fix<N>`，例如 `0.3.22-fix7` = 基于上游 0.3.22 的第 7 次本地修订
 > - 使用场景与合规边界见 [docs/USAGE.md](docs/USAGE.md)
 >
-> 上游说明（原文）：本仓库为独立维护的 RuoJi6/ARTEX，保留 Autumn-27/ARTEX 的原始提交历史与 AGPL-3.0 许可证。程序发布包从上游 Releases 下载，Docker 镜像由上游 GitHub Actions 构建并发布。
+> 上游说明（原文）：本仓库为独立维护的 RuoJi6/ARTEX，保留 Autumn-27/ARTEX 的原始提交历史与 AGPL-3.0 许可证。
+>
+> **本 fork 的差异**：发布包与一键更新只认 `xftk666-alt/XFSRC` 自己的 GitHub Release；
+> 本 fork **不发布** Docker Hub 镜像，部署时由仓库内 `Dockerfile` 本地构建。
 
 ---
 
@@ -117,7 +120,7 @@ Demo 只运行 `web/` 前端，构建时启用 `NEXT_PUBLIC_MOCK=1`，不需要 
 ### 方式一：一键安装脚本（推荐）
 
 ```bash
-git clone https://github.com/RuoJi6/ARTEX.git
+git clone https://github.com/xftk666-alt/XFSRC.git
 cd ARTEX
 ./install.sh
 ```
@@ -132,16 +135,19 @@ cd ARTEX
 ### 方式二：Docker Compose（手动）
 
 ```bash
-git clone https://github.com/RuoJi6/ARTEX.git
+git clone https://github.com/xftk666-alt/XFSRC.git
 cd ARTEX
 cp .env.example .env          # 填 POSTGRES_PASSWORD、可选 ANTHROPIC_API_KEY
-docker compose up -d          # 拉取 ruoji6/artex 镜像 + postgres
+docker compose up -d --build  # 本地构建本 fork 镜像 + postgres
 # → http://localhost:8787
 ```
 
 镜像已含常用工具（ripgrep/curl/vim/npm/nmap…）；`./skills` 与 `./data` 以绑定挂载持久化。
 
-`.env` 中默认 `ARTEX_IMAGE=ruoji6/artex`，`ARTEX_TAG=latest` 使用最新镜像，也可固定为 `v0.3.17`（完整镜像地址 `ruoji6/artex:v0.3.17`）。镜像支持 `linux/amd64` 和 `linux/arm64`，Docker 会自动选择与宿主机匹配的架构，ARM64 Kali 无需自行编译。初次部署请修改 `POSTGRES_PASSWORD`；运行服务无需配置 Docker Hub 发布 Token。
+本 fork **不发布公共镜像**：`docker-compose.yml` 直接用仓库里的 `Dockerfile` 构建
+`${XFSRC_IMAGE:-xfsrc}:${XFSRC_TAG:-latest}`，绝不会回退到上游 `ruoji6/artex`
+（那会把授权闸、工作区隔离、限流等加固全部换掉）。构建前需先准备
+`dist/<arch>/artex`（`build.sh` 或 CI 产物）。初次部署请修改 `POSTGRES_PASSWORD`。
 
 远程 MCP 可在系统设置中选择 `http`（Streamable HTTP）或 `sse`（旧版 SSE）。
 旧版 SSE 服务通常使用 `GET /sse` 建立事件流，再通过服务返回的
@@ -206,7 +212,7 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 - **随时可回退**：上一版本保留为 `artex.old`，卡片上有「回滚到上一版本」。注意数据库结构不会回退。
 - **更新会中断正在运行的任务**——更新即重启，请在空闲时进行。
 - **开发构建不给更新**：版本号是 `dev` 或 `git describe` 带后缀时禁用，避免正式版覆盖掉本地调试的二进制。
-- **Docker 下只换程序、不换镜像**：镜像里的 playwright / nmap 等工具链不会跟着升级，且 `docker compose up -d` 重建容器后会退回镜像自带的版本。要连镜像一起升级仍请用 `docker compose pull artex && docker compose up -d artex`。
+- **Docker 下只换程序、不换镜像**：镜像里的 playwright / nmap 等工具链不会跟着升级，且 `docker compose up -d` 重建容器后会退回镜像自带的版本。要连镜像一起升级用 `./update.sh`（重新构建 `app` 服务）。
 - **更新代理（可选）**与其他代理设置使用相同的「地址输入框 + 保存」方式。填写独立更新代理后保存，例如 `http://127.0.0.1:7897`；支持 `http://`、`https://`、`socks5://`、`socks5h://` 及用户名密码认证。清空并保存即为直连，不受全局代理或 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量影响。保存后自动重新检查，检查版本、校验和下载和发布包下载使用同一个出口。更新只从 GitHub 域名下载并强制 HTTPS。
 - 代理地址由 **ARTEX 服务端**访问。Docker 内的 `127.0.0.1` 指容器自身；代理运行在宿主机时，应使用容器可达地址（Docker Desktop 通常为 `http://host.docker.internal:7897`），并允许容器访问代理端口。
 
@@ -238,8 +244,8 @@ services:
 然后只更新应用容器：
 
 ```bash
-docker compose pull artex
-docker compose up -d --no-deps artex
+docker compose build app
+docker compose up -d --no-deps app
 curl --fail http://127.0.0.1:8787/api/health
 docker compose logs --tail=50 artex
 ```

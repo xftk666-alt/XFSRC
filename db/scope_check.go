@@ -71,9 +71,19 @@ WHERE task_id=$1 AND source IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if err := rows.Err(); err != nil {
 		return append([]string(nil), hosts...), err
 	}
-	// Expand company rows through company_scope (domain/cidr rules only).
+	// Expand company rows through company_scope. Only rules written by a trusted
+	// source count: a model-driven tool (add_company_scope) or an automated import
+	// can add rows to a company, and expanding those would let an agent widen the
+	// authorization boundary of every task that references the company.
+	cPlaceholders := make([]string, len(trustedSources))
+	cArgs := make([]any, 0, len(trustedSources)+1)
+	for i, src := range trustedSources {
+		cPlaceholders[i] = fmt.Sprintf("$%d", i+2)
+		cArgs = append(cArgs, src)
+	}
 	for _, id := range companyIDs {
-		crows, err := d.Query(`SELECT kind, COALESCE(domain,''), COALESCE(net::text,'') FROM company_scope WHERE company_id=$1`, id)
+		crows, err := d.Query(`SELECT kind, COALESCE(domain,''), COALESCE(net::text,'')
+FROM company_scope WHERE company_id=$1 AND source IN (`+strings.Join(cPlaceholders, ",")+`)`, append([]any{id}, cArgs...)...)
 		if err != nil {
 			continue
 		}
@@ -82,7 +92,14 @@ WHERE task_id=$1 AND source IN (`+strings.Join(placeholders, ",")+`)`, args...)
 			if err := crows.Scan(&kind, &domain, &netText); err != nil {
 				continue
 			}
-			e := scopeEntry{kind: strings.ToLower(kind), domain: strings.ToLower(strings.TrimSuffix(domain, "."))}
+			kind = strings.ToLower(kind)
+			if kind == "domain" {
+				// company_scope 'domain' means "this company owns the domain and its
+				// subdomains" (that is also how attribution works), so expand it as a
+				// root-domain rule rather than an exact-host one.
+				kind = "root_domain"
+			}
+			e := scopeEntry{kind: kind, domain: strings.ToLower(strings.TrimSuffix(domain, "."))}
 			if netText != "" {
 				if _, n, err := net.ParseCIDR(netText); err == nil {
 					e.net = n
@@ -117,17 +134,23 @@ func hostInScope(host string, entries []scopeEntry) bool {
 		if e.net != nil && ip != nil && e.net.Contains(ip) {
 			return true
 		}
+		// icp/keyword are coverage hints, not network targets: an ICP filing number
+		// or a company keyword must never authorize a hostname (a keyword such as
+		// "acme" would otherwise authorize "evil.acme").
+		if e.kind == "icp" || e.kind == "keyword" {
+			continue
+		}
 		v := strings.ToLower(strings.TrimSuffix(e.value, "."))
 		if v != "" {
 			if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
-				if vh := hostFromURL(v); vh != "" && hostMatches(h, vh, true) {
+				if vh := hostFromURL(v); vh != "" && vh == h {
 					return true
 				}
 			} else if _, n, err := net.ParseCIDR(v); err == nil {
 				if ip != nil && n.Contains(ip) {
 					return true
 				}
-			} else if hostMatches(h, v, true) {
+			} else if v == h {
 				return true
 			}
 		}
@@ -135,8 +158,12 @@ func hostInScope(host string, entries []scopeEntry) bool {
 		if d == "" {
 			continue
 		}
+		// Subdomain granularity is exact. A `subdomain` row for api.example.com
+		// must NOT authorize evil.api.example.com: the operator registered one
+		// host, and suffix matching silently widened it to every descendant.
+		// Only an explicit root-domain/wildcard row covers subdomains.
 		switch e.kind {
-		case "root_domain", "domain", "subdomain", "wildcard", "url":
+		case "root_domain", "wildcard":
 			if hostMatches(h, d, true) {
 				return true
 			}

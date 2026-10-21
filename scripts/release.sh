@@ -52,6 +52,13 @@ TAG="v${VERSION}"
 git rev-parse "$TAG" >/dev/null 2>&1 && die "标签 $TAG 已存在"
 
 # 1) 提交
+# 安装脚本会把数据库密码写进 config.json / .env：绝不能让 release 的 git add -A
+# 把凭据带进版本历史。
+for secret in config.json .env; do
+  if git status --porcelain -- "$secret" | grep -q .; then
+    die "拒绝提交：$secret 含本地凭据，请先移出版本库（.gitignore 已覆盖 config.json）"
+  fi
+done
 if [ -n "$(git status --porcelain)" ]; then
   echo "[1/4] 提交改动"
   git add -A

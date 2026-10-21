@@ -30,6 +30,30 @@ FAIL = 0
 ERRORS: list[str] = []
 
 
+def bootstrap_evidence_runtime(tmp: str) -> None:
+    """Self-contained HMAC key + recorder token under a temp runtime root.
+
+    Production paths are fixed (/app/data/evidence/.hmac-key and the root-only
+    recorder token); tests must not depend on them, so they relocate both via
+    ARTEX_EVIDENCE_TEST_ROOT. Written before any subprocess starts, because the
+    modules resolve the paths at import time.
+    """
+    root = os.path.join(tmp, "runtime")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    key = os.path.join(root, ".hmac-key")
+    if not os.path.isfile(key):
+        with open(key, "w", encoding="utf-8") as f:
+            f.write(hashlib.sha256(b"retest-test-hmac-key").hexdigest())
+        os.chmod(key, 0o600)
+    token = os.path.join(root, ".recorder-token")
+    if not os.path.isfile(token):
+        with open(token, "w", encoding="utf-8") as f:
+            f.write("test-recorder-token")
+        os.chmod(token, 0o600)
+    os.environ["ARTEX_EVIDENCE_TEST_ROOT"] = root
+    os.environ["ARTEX_EVIDENCE_RECORDER_TOKEN"] = "test-recorder-token"
+
+
 def run(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
 
@@ -53,8 +77,60 @@ def expect(name: str, cond: bool, detail: str = "") -> None:
         print(f"  FAIL  {name}  {detail}")
 
 
+
+def build_tamper_fixture(tam: str) -> None:
+    """Create a minimal sealed evidence pack, then tamper one response body.
+
+    Mirrors the layout report_check expects: pack.json + pack.seal.json +
+    cases/<name>/{request.txt,response.body,meta.json,seal.json}.
+    """
+    import evidence_seal as es
+
+    case = os.path.join(tam, "cases", "attack-ftp-listing")
+    os.makedirs(case, exist_ok=True)
+    with open(os.path.join(case, "request.txt"), "w", encoding="utf-8") as f:
+        f.write("GET /ftp HTTP/1.1\nHost: 127.0.0.1\nUser-Agent: artex-http-evidence/1.0\n\n")
+    with open(os.path.join(case, "response.body"), "w", encoding="utf-8") as f:
+        f.write("acquisitions.md\n")
+    with open(os.path.join(case, "response_headers.txt"), "w", encoding="utf-8") as f:
+        f.write("HTTP/1.1 200 OK\n")
+    meta = {
+        "ts": es._now(),
+        "recorder": "artex-recorder/2",
+        "recorder_seq": 1,
+        "url": "http://127.0.0.1/ftp",
+        "kind": "http",
+        "request": {"url": "http://127.0.0.1/ftp", "method": "GET",
+                    "headers_redacted": {"User-Agent": "artex-http-evidence/1.0"}},
+        "response": {"status": 200},
+    }
+    with open(os.path.join(case, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+    es.seal_case(case)
+    pack = {
+        "cases": [
+            {
+                "name": "attack-ftp-listing",
+                "dir": case,
+                "url": "http://127.0.0.1/ftp",
+                "status": 200,
+                "method": "GET",
+                "body_sha256": es.sha256_file(os.path.join(case, "response.body")),
+                "kind": "http",
+            }
+        ],
+        "compares": [],
+    }
+    with open(os.path.join(tam, "pack.json"), "w", encoding="utf-8") as f:
+        json.dump(pack, f)
+    es.seal_pack(tam)
+    # Tamper AFTER sealing: the case seal must no longer match.
+    with open(os.path.join(case, "response.body"), "a", encoding="utf-8") as f:
+        f.write("\nTAMPERED\n")
+
 def main() -> int:
     tmp = tempfile.mkdtemp(prefix="gates-hard-")
+    bootstrap_evidence_runtime(tmp)
     print(f"tmp={tmp}")
 
     # ---------- 判重：短路径 ----------
@@ -266,9 +342,9 @@ def main() -> int:
         shutil.rmtree("/tmp/review_tamper")
     except Exception:
         pass
-    shutil.copytree("/app/data/evidence/finding-7", tam)
-    with open(os.path.join(tam, "cases/attack-ftp-listing/response.body"), "a") as f:
-        f.write("\nTAMPERED\n")
+    # 自建 fixture：不依赖容器里某个真实 finding 目录（那会让测试只能在
+    # 生产数据上跑，且结果随数据漂移）。
+    build_tamper_fixture(tam)
     old_root = rc.EVIDENCE_ROOT
     rc.EVIDENCE_ROOT = "/tmp/review_tamper"
     ev = rc._load_evidence("777")
@@ -284,7 +360,10 @@ def main() -> int:
     os.chdir("/tmp")
     p2 = cr.default_path(31337)
     os.chdir(old)
-    expect("review_ledger_path_cwd_independent", p1 == p2 == "/app/data/tasks/31337/coverage.json", f"{p1} vs {p2}")
+    # 断言的是「与 cwd 无关」，不是某个容器内绝对路径：/app 不存在时也必须
+    # 落到一个固定位置，否则同一任务会在不同目录各长出一份台账。
+    expect("review_ledger_path_cwd_independent", p1 == p2, f"{p1} vs {p2}")
+    expect("review_ledger_path_stable", not p1.startswith(os.getcwd() + os.sep), p1)
 
     # ---------- G. inet_aton 变体 IP（2026-10-19 第二次审查） ----------
     from lab_detect import is_lab_text as _lab, to_ip as _to_ip
@@ -312,10 +391,13 @@ def main() -> int:
         expect(f"variant_ip_not_lab[{u}]", not _lab(u), f"got={_lab(u)}")
 
     # scope_check 必须与 lab_detect 用同一套 IP 语义
+    scope_fixture = os.path.join(tmp, "scope-variant.json")
+    with open(scope_fixture, "w", encoding="utf-8") as f:
+        json.dump([{"kind": "cidr", "net": "172.18.0.0/30"}], f)
     for h, want in (("0xac.0x12.0.3", "in-scope"), ("2886860803", "in-scope"),
                     ("172.18.3", "in-scope"), ("0254.022.0.3", "in-scope"),
                     ("172.18.0.4", "out-of-scope"), ("8.8.8.8", "out-of-scope")):
-        p = run(SCOPE + ["--task-id", "6", "--host", h, "--json"])
+        p = run(SCOPE + ["--task-id", "6", "--host", h, "--json", "--scope-file", scope_fixture])
         v = json.loads(p.stdout)["verdict"] if p.stdout.strip() else "ERR"
         expect(f"scope_variant_ip[{h}]", v == want, f"got={v} want={want}")
 
@@ -398,14 +480,16 @@ def main() -> int:
     print(f"\n=== {PASS} passed, {FAIL} failed ===")
     for e in ERRORS:
         print(" -", e)
-    out = "/app/data/sessions/conv-85/gates-hardening-results.json"
-    try:
-        os.makedirs(os.path.dirname(out), exist_ok=True)
-        with open(out, "w", encoding="utf-8") as f:
-            json.dump({"pass": PASS, "fail": FAIL, "errors": ERRORS}, f, ensure_ascii=False, indent=2)
-        print(f"results -> {out}")
-    except Exception as e:
-        print(f"warn: cannot write results: {e}")
+    results = json.dumps({"pass": PASS, "fail": FAIL, "errors": ERRORS}, ensure_ascii=False, indent=2)
+    out = os.path.join(tmp, "gates-hardening-results.json")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(results)
+    # 容器内运行时同时留一份到会话目录；容器外没有 /app，跳过而不是报错。
+    runtime_dir = "/app/data/sessions/conv-85"
+    if os.path.isdir(runtime_dir):
+        with open(os.path.join(runtime_dir, "gates-hardening-results.json"), "w", encoding="utf-8") as f:
+            f.write(results)
+    print(f"results -> {out}")
     return 1 if FAIL else 0
 
 

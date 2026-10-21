@@ -2,12 +2,15 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -21,6 +24,15 @@ const (
 	authPassKey    = "auth.password_hash"
 	jwtTTL         = 7 * 24 * time.Hour
 	keyChars       = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+	// authTokenVersionKey holds the JWT generation. Bumping it invalidates every
+	// token issued before the bump — that is what makes "logout" and
+	// "password changed" actually revoke a leaked 7-day token.
+	authTokenVersionKey = "auth.token_version"
+	// authSetupTokenKey holds the one-time token required by /api/auth/init for
+	// non-loopback callers. Without it, anyone who reaches a fresh instance before
+	// the operator finishes setup owns the platform.
+	authSetupTokenKey = "auth.setup_token"
 
 	// 下限与 setup 页的前端校验一致——校验只放在前端等于没放，直接打 API 就能
 	// 绕过。上限是 bcrypt 的硬限制：超过 72 字节 GenerateFromPassword 会返回
@@ -83,36 +95,104 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 	return buf, nil
 }
 
-// signJWT issues a 7-day HS256 token for the admin user (XFSRC).
-func signJWT(key []byte) (string, error) {
-	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-		Subject:   "XFSRC",
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
-		IssuedAt:  jwt.NewNumericDate(time.Now()),
-	}).SignedString(key)
+// signJWT issues a 7-day HS256 token for the admin user (XFSRC). ver is the
+// server's token generation: bumping it (password change, logout) invalidates
+// every token issued before the bump, which is what makes revocation possible.
+func signJWT(key []byte, ver int64) (string, error) {
+	claims := jwt.MapClaims{
+		"sub": "XFSRC",
+		"exp": jwt.NewNumericDate(time.Now().Add(jwtTTL)),
+		"iat": jwt.NewNumericDate(time.Now()),
+		"ver": ver,
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(key)
 }
 
-// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
-func verifyJWT(tokenStr string, key []byte) bool {
+// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token whose
+// generation matches ver. A token minted before a password change or logout no
+// longer verifies, so a leaked token cannot outlive the operator's response.
+func verifyJWT(tokenStr string, key []byte, ver int64) bool {
+	if tokenStr == "" {
+		return false
+	}
 	t, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method")
 		}
 		return key, nil
 	})
-	return err == nil && t.Valid
+	if err != nil || !t.Valid {
+		return false
+	}
+	claims, ok := t.Claims.(jwt.MapClaims)
+	if !ok {
+		return false
+	}
+	got, ok := claims["ver"].(float64)
+	return ok && int64(got) == ver
 }
 
-// extractToken reads the JWT from Authorization: Bearer header,
-// artex_token cookie, or ?token= query param (for SSE connections).
+// isSSEPath reports whether a request is a Server-Sent Events stream. Browsers
+// cannot set headers on EventSource, so these are the only endpoints where the
+// token may travel in the query string — everywhere else it must come from the
+// Authorization header or the HttpOnly cookie.
+func isSSEPath(p string) bool {
+	switch p {
+	case "/api/logs/stream", "/api/update/stream", "/api/exploration/activity/stream":
+		return true
+	}
+	return strings.HasSuffix(p, "/events")
+}
+
+const authCookieName = "artex_token"
+
+// extractToken reads the JWT from the Authorization header, the HttpOnly
+// artex_token cookie, or (SSE only) the ?token= query param.
 func extractToken(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimPrefix(h, "Bearer ")
 	}
-	if c, err := r.Cookie("artex_token"); err == nil && c.Value != "" {
+	if c, err := r.Cookie(authCookieName); err == nil && c.Value != "" {
 		return c.Value
 	}
-	return r.URL.Query().Get("token")
+	if isSSEPath(r.URL.Path) {
+		return r.URL.Query().Get("token")
+	}
+	return ""
+}
+
+// setAuthCookie stores the JWT in an HttpOnly, SameSite=Strict cookie so page
+// scripts (and therefore any XSS) cannot read it. Secure is set when the request
+// arrived over TLS, including through a reverse proxy.
+func setAuthCookie(w http.ResponseWriter, r *http.Request, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     authCookieName,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(jwtTTL / time.Second),
+		HttpOnly: true,
+		Secure:   requestIsHTTPS(r),
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func clearAuthCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     authCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   requestIsHTTPS(r),
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func requestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 // requireAuth wraps h with JWT validation.
@@ -129,7 +209,7 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			writeErr(w, 401, "未授权")
 			return
 		}
-		if !verifyJWT(tok, s.jwtKey) {
+		if !verifyJWT(tok, s.jwtKey, s.tokenVersion()) {
 			writeErr(w, 401, "token 无效或已过期")
 			return
 		}
@@ -151,7 +231,12 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, errDataSourceUnavailable)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"initialized": hash != ""})
+	writeJSON(w, 200, map[string]any{
+		"initialized": hash != "",
+		// Only a request that already comes from the machine itself may claim a
+		// fresh instance without proving it can read the server log.
+		"requires_setup_token": hash == "" && !isLoopbackRequest(r),
+	})
 }
 
 // POST /api/auth/init — sets the password for the first time; rejected if already set.
@@ -170,11 +255,26 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Password string `json:"password"`
+		Password   string `json:"password"`
+		SetupToken string `json:"setup_token"`
 	}
 	if err := decode(r, &req); err != nil || req.Password == "" {
 		writeErr(w, 400, "密码不能为空")
 		return
+	}
+	// First-run takeover guard: a remote caller must present the token printed in
+	// the server log. A local caller (the operator at the machine) is exempt so the
+	// documented setup flow keeps working.
+	if !isLoopbackRequest(r) {
+		want, ok, serr := pg.GetSetting(authSetupTokenKey)
+		if serr != nil {
+			writeErr(w, 503, errDataSourceUnavailable)
+			return
+		}
+		if !ok || want == "" || subtle.ConstantTimeCompare([]byte(req.SetupToken), []byte(want)) != 1 {
+			writeErr(w, 403, "需要初始化令牌：请从服务端启动日志或 data/setup-token 获取 setup token")
+			return
+		}
 	}
 	if msg := validatePassword(req.Password); msg != "" {
 		writeErr(w, 400, msg)
@@ -197,10 +297,18 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
-	tok, err := signJWT(s.jwtKey)
+	tok, err := signJWT(s.jwtKey, s.tokenVersion())
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return
+	}
+	setAuthCookie(w, r, tok)
+	// The setup token is single-use: a later reset of the password hash must not
+	// let an old log line claim the instance again. The file goes too — a stale
+	// credential file on disk is just noise an operator will try to use.
+	_ = pg.SetSetting(authSetupTokenKey, "")
+	if s.m != nil && s.m.dir != "" {
+		_ = os.Remove(filepath.Join(s.m.dir, "setup-token"))
 	}
 	writeJSON(w, 200, map[string]any{"token": tok})
 }
@@ -213,7 +321,7 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if !verifyJWT(extractToken(r), s.jwtKey, s.tokenVersion()) {
 		writeErr(w, 401, "未授权")
 		return
 	}
@@ -255,7 +363,148 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "保存失败: "+err.Error())
 		return
 	}
+	// Revoke every token issued under the old password, then hand the caller a
+	// fresh one so the operator is not logged out of their own session.
+	ver, err := s.bumpTokenVersion()
+	if err != nil {
+		writeErr(w, 500, "保存失败: "+err.Error())
+		return
+	}
+	tok, err := signJWT(s.jwtKey, ver)
+	if err != nil {
+		writeErr(w, 500, "token 生成失败")
+		return
+	}
+	setAuthCookie(w, r, tok)
+	writeJSON(w, 200, map[string]any{"ok": true, "token": tok})
+}
+
+// POST /api/auth/logout — revokes every issued token by bumping the generation.
+func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	if _, err := s.bumpTokenVersion(); err != nil {
+		writeErr(w, 500, "登出失败: "+err.Error())
+		return
+	}
+	clearAuthCookie(w, r)
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// tokenVersion returns the current JWT generation (0 when the DB has none yet).
+func (s *Server) tokenVersion() int64 { return s.tokenVer.Load() }
+
+// bumpTokenVersion persists and publishes the next generation.
+func (s *Server) bumpTokenVersion() (int64, error) {
+	if s.m.pg == nil {
+		return s.tokenVer.Load(), nil
+	}
+	tx, err := s.m.pg.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	// Read-modify-write under the row lock so two concurrent bumps cannot both
+	// land on the same value (which would resurrect a revoked token).
+	var cur int64
+	err = tx.QueryRow(`SELECT COALESCE((SELECT value::bigint FROM settings WHERE key=$1),0) FOR UPDATE`, authTokenVersionKey).Scan(&cur)
+	if err != nil {
+		return 0, err
+	}
+	next := cur + 1
+	if _, err := tx.Exec(`
+INSERT INTO settings(key, value) VALUES ($1, $2)
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+		authTokenVersionKey, strconv.FormatInt(next, 10)); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.tokenVer.Store(next)
+	return next, nil
+}
+
+// loadTokenVersion primes the in-memory generation from the DB at startup.
+func (s *Server) loadTokenVersion() {
+	if s.m.pg == nil {
+		return
+	}
+	raw, ok, err := s.m.pg.GetSetting(authTokenVersionKey)
+	if err != nil || !ok {
+		return
+	}
+	if v, perr := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); perr == nil {
+		s.tokenVer.Store(v)
+	}
+}
+
+// ensureSetupToken generates (and persists + logs) the first-run setup token when
+// no admin password exists yet. It is written to dataDir/setup-token so an
+// operator with shell access can read it without digging through logs, and the
+// file is removed as soon as the password is set.
+func (s *Server) ensureSetupToken(dataDir string) {
+	if s.m.pg == nil {
+		return
+	}
+	hash, _, err := s.m.pg.GetSetting(authPassKey)
+	if err != nil {
+		log.Printf("[auth] 读取密码状态失败，跳过 setup token 生成: %v", err)
+		return
+	}
+	if hash != "" {
+		_ = os.Remove(filepath.Join(dataDir, "setup-token"))
+		return
+	}
+	tok, _, err := s.m.pg.GetSetting(authSetupTokenKey)
+	if err != nil || strings.TrimSpace(tok) == "" {
+		buf := make([]byte, 24)
+		for i := range buf {
+			n, rerr := rand.Int(rand.Reader, big.NewInt(int64(len(keyChars))))
+			if rerr != nil {
+				log.Printf("[auth] 生成 setup token 失败: %v", rerr)
+				return
+			}
+			buf[i] = keyChars[n.Int64()]
+		}
+		tok = string(buf)
+		if err := s.m.pg.SetSetting(authSetupTokenKey, tok); err != nil {
+			log.Printf("[auth] 保存 setup token 失败: %v", err)
+			return
+		}
+	}
+	path := filepath.Join(dataDir, "setup-token")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		log.Printf("[auth] 写入 setup token 文件失败: %v", err)
+	} else if err := os.WriteFile(path, []byte(tok+"\n"), 0o600); err != nil {
+		log.Printf("[auth] 写入 setup token 文件失败: %v", err)
+	}
+	log.Printf("[auth] 首次初始化令牌 (setup token): %s  — 远程访问 /setup 时必须填写；本机访问可留空。文件: %s", tok, path)
+}
+
+// isLoopbackRequest reports whether the request originates on this machine.
+//
+// A loopback RemoteAddr alone is not enough: behind the documented nginx setup
+// EVERY request arrives from 127.0.0.1, so treating that as "local" would hand
+// the setup-token exemption to any remote caller. When a forwarded client address
+// is present it decides; only a request with no forwarded address and a loopback
+// peer is treated as local.
+func isLoopbackRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return false
+	}
+	if fwd := forwardedClientIP(r); fwd != "" {
+		fip := net.ParseIP(fwd)
+		return fip != nil && fip.IsLoopback()
+	}
+	return true
 }
 
 // POST /api/auth/login — validates username/password and returns a JWT.
@@ -299,10 +548,11 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 	if s.loginLimit != nil {
 		s.loginLimit.reset(client)
 	}
-	tok, err := signJWT(s.jwtKey)
+	tok, err := signJWT(s.jwtKey, s.tokenVersion())
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return
 	}
+	setAuthCookie(w, r, tok)
 	writeJSON(w, 200, map[string]any{"token": tok})
 }

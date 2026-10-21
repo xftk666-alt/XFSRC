@@ -50,6 +50,40 @@ func TestExtractHosts(t *testing.T) {
 			want:  []string{"t.example.com"},
 		},
 		{
+			// Container/lab targets are single-label. They used to be invisible to
+			// the gate, so `curl juice-shop:3000` was allowed with no scope at all.
+			name:  "single label host with port",
+			tool:  "Bash",
+			input: `{"command":"curl -s http://juice-shop:3000/rest/user/whoami"}`,
+			want:  []string{"juice-shop"},
+		},
+		{
+			name:  "loopback single label",
+			tool:  "Bash",
+			input: `{"command":"nuclei -u localhost:8080"}`,
+			want:  []string{"localhost"},
+		},
+		{
+			// inet_aton shorthand: every resolver accepts it, so the gate must too.
+			name:  "short ipv4 forms",
+			tool:  "Bash",
+			input: `{"command":"curl 127.1 ; curl 2130706433 ; curl 0x7f000001"}`,
+			want:  []string{"127.0.0.1"},
+		},
+		{
+			// Port mappings and counts are not targets: no network tool in the command.
+			name:  "docker port mapping is not a target",
+			tool:  "Bash",
+			input: `{"command":"docker run -d -p 8080:80 nginx"}`,
+			want:  nil,
+		},
+		{
+			name:  "port numbers are not addresses",
+			tool:  "Bash",
+			input: `{"command":"ls -l /tmp && echo 3000 443"}`,
+			want:  nil,
+		},
+		{
 			name:  "custom tool string args",
 			tool:  "httpx_probe",
 			input: `{"targets":"a.example.com,b.example.org"}`,

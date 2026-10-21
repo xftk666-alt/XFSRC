@@ -27,6 +27,8 @@ XFSRC 是 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX) 的**个人私有 fork
    - 是否允许外部 OOB（Intigriti 多数禁止；本 fork 的 OOB 服务器可在 `/app/data/oob/config.env` 留空禁用）。
 4. **不得使用本工具对未授权系统发起测试**。越界请求是三家平台封号的首要原因。
 5. 本仓库不包含任何真实目标数据、凭据或证据；`data/`、`.env`、`jwt.key`、HMAC 密钥均已忽略。
+6. **首次初始化**：远程访问未初始化的实例时，`/setup` 必须填写服务端日志或
+   `data/setup-token` 里的一次性令牌；本机访问可留空。令牌在设置密码后立即失效。
 
 ## 分支模型
 
@@ -35,7 +37,7 @@ XFSRC 是 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX) 的**个人私有 fork
 | `main` | 上游原样，用于 `git pull upstream` 同步 |
 | `local` | 本地加固与定制（授权闸、工作区隔离、代理链、限流等） |
 
-版本号格式：`<上游版本>-fix<N>`。带 `-fixN` 后缀的构建无法被页面「一键更新」覆盖，这是刻意设计。
+版本号格式：`<上游版本>-fix<N>`。`-fixN` 参与页面「一键更新」的版本比较：同一上游版本下 fix 号更大即视为更新（`selfupdate.parseVersion` / `CompareVersions`）。只有非 `-fixN` 后缀（如 `dev`、`-2-gabc1234`）才无法比较、从而禁用一键更新。
 
 ## 同步上游
 

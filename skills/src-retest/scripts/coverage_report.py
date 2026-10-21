@@ -27,14 +27,22 @@ if _HERE not in sys.path:
 from coverage_record import default_path, load, summary  # noqa: E402
 
 
+class FindingsUnavailable(RuntimeError):
+    """读不到 findings 表。
+
+    「读不到」与「一条都没有」必须区分：旧实现两者都返回 []，于是数据库故障时
+    覆盖体检得出「健康」结论（fail-open），未记账的 finding 全部被漏掉。
+    """
+
+
 def load_findings(task_id: int, dsn: str | None = None) -> list[dict[str, Any]]:
     dsn = dsn or os.environ.get("ARTEX_PG_DSN")
     if not dsn:
-        return []
+        raise FindingsUnavailable("未配置 ARTEX_PG_DSN")
     try:
         import psycopg2  # type: ignore
-    except Exception:
-        return []
+    except Exception as e:
+        raise FindingsUnavailable(f"psycopg2 不可用（{e.__class__.__name__}）") from e
     try:
         conn = psycopg2.connect(dsn)
         cur = conn.cursor()
@@ -51,8 +59,8 @@ def load_findings(task_id: int, dsn: str | None = None) -> list[dict[str, Any]]:
         cur.close()
         conn.close()
         return rows
-    except Exception:
-        return []
+    except Exception as e:
+        raise FindingsUnavailable(f"查询 findings 失败（{e.__class__.__name__}: {e}）") from e
 
 
 def _risk_matches(ledger_risk: str, vulnclass: str) -> bool:
@@ -112,10 +120,20 @@ def report(
     path = ledger_path or default_path(task_id)
     doc = load(task_id, path)
     rows = doc.get("rows", [])
-    findings = load_findings(task_id, dsn)
     s = summary(task_id, path, assigned_risks)
 
     problems: list[str] = []
+    findings_error = ""
+    try:
+        findings = load_findings(task_id, dsn)
+    except FindingsUnavailable as e:
+        findings, findings_error = [], str(e)
+        problems.append(f"读不到 findings 表（{e}）：无法判断覆盖，按未覆盖处理")
+
+    # 空台账 + 没有分配风险 = 什么都没证明。旧实现返回 ok:true，等于把
+    # 「没做过」报成「已覆盖」。
+    if not rows and not (assigned_risks or []):
+        problems.append("台账为空且未指定 --assigned-risk：没有任何覆盖证据")
 
     # 1) finding 未记账
     untracked: list[dict[str, Any]] = []
@@ -175,6 +193,7 @@ def report(
         "untracked_findings": untracked,
         "claimed_only_rows": claimed_only,
         "problems": problems,
+        "findings_error": findings_error,
         "ok": not problems,
         "verdict": (
             "覆盖台账健康：无缺口、无未结项、finding 与台账一致"

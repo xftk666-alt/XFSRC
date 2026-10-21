@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -26,8 +27,31 @@ const judgeWorkerLane = "judge"
 
 // chatGuard returns a guard wired with the manager's interceptor, used for chat
 // conversations. Called once per applyLLM so a new LLM config always gets a fresh guard.
+//
+// Chat agents run with ModeBypass and the SDK's default tool set (Bash/WebFetch),
+// so they need the authorization gate as much as workers do. The task is not known
+// when the agent is built, but it is recoverable per call from the conversation id
+// on the context (the retest flow links conversation → finding → task). A
+// conversation with no task link has no scope to enforce; the intercept rules still
+// apply, which is the pre-existing behaviour for pure-assistant chats.
 func (s *Server) chatGuard() *guard.Guard {
-	return guard.NewWithInterceptor(s.m.interceptor)
+	g := guard.NewWithInterceptor(s.m.interceptor)
+	g.SetScopeCheck(func(ctx context.Context, tool string, input []byte) ([]string, string) {
+		convID := intercept.ConvIDFromContext(ctx)
+		if convID <= 0 || s.m.pg == nil {
+			return nil, ""
+		}
+		taskID, err := s.m.pg.ConversationTaskID(ctx, convID)
+		if err != nil {
+			log.Printf("[scope] conversation %d 任务归属查询失败，按 fail-closed 阻止: %v", convID, err)
+			return nil, "授权范围校验失败（数据源不可用），已按 fail-closed 阻止执行"
+		}
+		if taskID <= 0 {
+			return nil, ""
+		}
+		return scopeGateFor(s.m.pg, taskID)(ctx, tool, input)
+	})
+	return g
 }
 
 // wireInterceptReviewer installs the LLM fallback judge into the interceptor. The

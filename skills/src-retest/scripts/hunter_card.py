@@ -21,6 +21,11 @@ def empty(v: str | None) -> bool:
 
 
 def load_verdict(outdir: str) -> dict[str, Any] | None:
+    """读**已验签**的 verdict.json。
+
+    旧实现直接读 payload，于是手写的 {"payload":{"verdict":"reproduced"}} 也能让
+    卡片显示「机器判定：复测成立」——卡片是给人看的，不能展示未签名结论。
+    """
     path = os.path.join(outdir, "verdict.json")
     if not os.path.isfile(path):
         return None
@@ -28,9 +33,14 @@ def load_verdict(outdir: str) -> dict[str, Any] | None:
         raw = load_json(path)
     except Exception:
         return None
-    if isinstance(raw.get("payload"), dict):
-        return raw["payload"]
-    return raw
+    try:
+        from evidence_seal import verify_document
+    except Exception:
+        return None
+    ok, _ = verify_document(raw)
+    if not ok or not isinstance(raw.get("payload"), dict):
+        return None
+    return raw["payload"]
 
 
 def card(
@@ -234,7 +244,9 @@ def main() -> int:
     print(out["markdown"])
     print("\n---\n")
     print(json.dumps({k: v for k, v in out.items() if k != "markdown"}, ensure_ascii=False, indent=2, default=str))
-    return 0  # 卡片总是生成；红灯写在 markdown 里，不靠退出码吓用户
+    # 红灯必须反映到退出码：编排器/脚本按 rc 判断成败，恒返回 0 会让一张
+    # 「禁止提交」的卡片看起来像成功。
+    return 0 if out.get("submit_action") != "do-not-submit" else 5
 
 
 if __name__ == "__main__":

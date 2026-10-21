@@ -15,15 +15,34 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
-def _resolve_secret(env_name: str, filename: str, runtime_default: str) -> str:
-    """Prefer env, then persistent /app/data, then this script dir, then runtime path.
+# 密钥与记录器令牌都只从固定路径读取。环境变量 ARTEX_EVIDENCE_HMAC_KEY 以前被
+# 当成「密钥文件路径」，等于让 agent 指向自己写的文件、用自选密钥重签整个证据包
+# （审计发现的真实绕过）；现在不再接受任何环境变量形式的密钥材料。
+#
+# ARTEX_EVIDENCE_TEST_ROOT 仅用于测试：把密钥与令牌重定位到一个临时目录。
+# 它不会削弱真实威胁模型——封印挡的是「只有 Write/Edit、没有 Bash」的伪造；
+# 能执行 Bash 的 agent 本来就是 root，可以直接读生产密钥文件，这一点在文件头
+# 已如实说明，属于同容器内的已知上限，而不是本模块的边界。
+TEST_ROOT_ENV = "ARTEX_EVIDENCE_TEST_ROOT"
+
+
+def _runtime_root() -> str:
+    root = (os.environ.get(TEST_ROOT_ENV) or "").strip()
+    if root:
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        return root
+    return ""
+
+
+def _fixed_path(filename: str, runtime_default: str) -> str:
+    """固定路径列表（不含任何 agent 可控的环境变量）。
 
     HMAC key must survive image rebuild; otherwise old packs fail and new packs
     silently use a fresh key.
     """
-    env = os.environ.get(env_name)
-    if env:
-        return env
+    test_root = _runtime_root()
+    if test_root:
+        return os.path.join(test_root, filename)
     here = os.path.dirname(os.path.abspath(__file__))
     for candidate in (
         os.path.join("/app/data/evidence", filename),
@@ -35,20 +54,22 @@ def _resolve_secret(env_name: str, filename: str, runtime_default: str) -> str:
     return os.path.join("/app/data/evidence", filename)
 
 
-KEY_PATH = _resolve_secret(
-    "ARTEX_EVIDENCE_HMAC_KEY",
-    ".hmac-key",
-    "/usr/local/share/artex-src/.evidence-hmac-key",
-)
+KEY_PATH = _fixed_path(".hmac-key", "/usr/local/share/artex-src/.evidence-hmac-key")
 SEAL_NAME = "seal.json"
 # 记录器身份令牌：只有 http_evidence_record / browser_xss_evidence 能拿到。
 # 直接调 CLI `evidence_seal.py seal` 时环境里没有它 → 拒绝封印。
 RECORDER_TOKEN_ENV = "ARTEX_EVIDENCE_RECORDER_TOKEN"
-RECORDER_TOKEN_PATH = _resolve_secret(
-    "ARTEX_EVIDENCE_RECORDER_TOKEN_FILE",
-    ".recorder-token",
-    "/usr/local/share/artex-src/.recorder-token",
-)
+
+
+def recorder_token_path() -> str:
+    """令牌文件路径：生产环境固定为 root-only 路径，测试可重定位。"""
+    test_root = _runtime_root()
+    if test_root:
+        return os.path.join(test_root, ".recorder-token")
+    return "/usr/local/share/artex-src/.recorder-token"
+
+
+RECORDER_TOKEN_PATH = recorder_token_path()
 # 证据时效：超过该秒数的 case 一律不算「当前状态」
 MAX_CASE_AGE_SEC = int(os.environ.get("ARTEX_EVIDENCE_MAX_AGE_SEC", str(2 * 60 * 60)))
 
@@ -165,6 +186,12 @@ def recorder_authorized() -> bool:
 
 def seal_case(case_dir: str, force: bool = False) -> dict[str, Any]:
     case_dir = os.path.abspath(case_dir)
+    # 封印入口本身也必须验身份：只靠 CLI 检查等于把「库函数」留给 agent 直调。
+    if not recorder_authorized():
+        raise PermissionError(
+            "seal_case 只允许记录器调用：缺少 ARTEX_EVIDENCE_RECORDER_TOKEN "
+            "或与 root-only 令牌文件不一致。请用 http_evidence_record / browser_xss_evidence。"
+        )
     payload = case_canonical(case_dir)
     doc = {
         "payload": payload,
@@ -204,6 +231,9 @@ def verify_case(case_dir: str) -> tuple[bool, str]:
         return False, "legacy seal v1: re-record with the current recorder"
     if payload.get("recorder") != "artex-recorder/2" or not payload.get("recorder_seq"):
         return False, "seal not produced by a real recorder (hand-written meta.json + direct seal)"
+    # 记录器授权标记也必须在封印里为 true；否则说明封印是绕过记录器写出来的
+    if doc.get("recorder_authorized") is not True:
+        return False, "seal 不是由已授权记录器写入的（recorder_authorized != true）"
     return True, "ok"
 
 

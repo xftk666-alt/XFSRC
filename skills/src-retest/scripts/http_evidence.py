@@ -366,23 +366,37 @@ def cmd_record(args: argparse.Namespace) -> int:
         }
     )
     save_pack(outdir, pack)
-    if _seal_case is not None:
-        try:
-            tok = _recorder_token() if _recorder_token else ""
-            if tok:
-                os.environ[_RECORDER_TOKEN_ENV] = tok
-            _seal_case(case_dir)
-        except Exception as e:
-            print(json.dumps({"warning": f"seal failed: {e}"}), file=sys.stderr)
-    if _seal_pack is not None:
-        try:
-            _seal_pack(outdir)
-        except Exception as e:
-            print(json.dumps({"warning": f"pack seal failed: {e}"}), file=sys.stderr)
+    # 封印失败必须是非零退出：旧实现只打一行 warning 就返回 0，agent 会以为证据
+    # 已经落盘并封印，直到后面跑闸门才发现（那时已经浪费了一整轮复测）。
+    seal_errors: list[str] = []
+    if _seal_case is None or _seal_pack is None:
+        seal_errors.append("evidence_seal 模块不可用：证据无法封印")
+    else:
+        tok = _recorder_token() if _recorder_token else ""
+        if not tok:
+            seal_errors.append("缺少记录器令牌文件：证据无法封印")
+        else:
+            os.environ[_RECORDER_TOKEN_ENV] = tok
+        if not seal_errors:
+            try:
+                _seal_case(case_dir)
+            except Exception as e:  # noqa: BLE001
+                seal_errors.append(f"case seal failed: {e.__class__.__name__}: {e}")
+            try:
+                _seal_pack(outdir)
+            except Exception as e:  # noqa: BLE001
+                seal_errors.append(f"pack seal failed: {e.__class__.__name__}: {e}")
+    for msg in seal_errors:
+        print(json.dumps({"error": msg}), file=sys.stderr)
 
     out = dict(meta)
+    if seal_errors:
+        out["ok"] = False
+        out["seal_errors"] = seal_errors
     out["body_excerpt"] = excerpt.decode("utf-8", "replace")
     print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+    if seal_errors:
+        return 3
     if checks and not all_pass:
         return 1
     if err and not checks:

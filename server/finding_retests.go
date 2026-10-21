@@ -7,6 +7,8 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/evidence"
 	"github.com/Autumn-27/artex/intercept"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -167,19 +170,35 @@ func (s *Server) findingRetestTools() []actool.CoreTool {
 				}
 				return jsonResult(map[string]any{"retest": r, "current_constraints": constraints})
 			}),
-		wrTool("record_finding_retest_result", "为当前复测会话保存唯一结论；原漏洞证据与报告保持不变。会话成功结束且结论为 fixed 时，系统自动将漏洞状态改为已修复；其他结论保留原状态。必须提供本次实际检查的证据，无法确认时写明阻塞原因。",
+		wrTool("record_finding_retest_result", "为当前复测会话保存唯一结论；原漏洞证据与报告保持不变。reproduced / fixed 必须传 pack_dir，服务端会校验其中签名过的 verdict.json 与证据指纹，未过闸门或证据被改动都会拒绝保存；inconclusive 无需证据包。会话成功结束且结论为 fixed 时，系统自动将漏洞状态改为已修复；其他结论保留原状态。无法确认时写明阻塞原因。",
 			objSchema(map[string]any{
 				"verdict":  map[string]any{"type": "string", "enum": []string{"reproduced", "fixed", "inconclusive"}},
 				"summary":  strParam("本次复测结论摘要"),
 				"evidence": strParam("Markdown：本次实际步骤、观察、对照、结论依据；无法确认则列出已检查内容和阻塞原因"),
+				"pack_dir": strParam("证据包目录（retest_strict 的 --outdir，含 verdict.json / pack.json / cases/）；相对路径按本会话工作目录解析。reproduced / fixed 必填，inconclusive 可留空"),
 			}, "verdict", "summary", "evidence"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 				var a struct {
 					Verdict  string `json:"verdict"`
 					Summary  string `json:"summary"`
 					Evidence string `json:"evidence"`
+					PackDir  string `json:"pack_dir"`
 				}
 				if err := json.Unmarshal(in, &a); err != nil {
 					return actool.Errorf(err.Error()), nil
+				}
+				// Only claims that assert something are gated: reproduced gets
+				// submitted, fixed closes the finding. inconclusive claims nothing and
+				// must stay available when no evidence can be collected at all
+				// (target down, no credentials), otherwise agents would be forced to
+				// fabricate a pack just to record "could not confirm".
+				if a.Verdict != "inconclusive" {
+					outdir, err := s.retestPackDir(ctx, a.PackDir)
+					if err != nil {
+						return actool.Errorf(err.Error()), nil
+					}
+					if err := s.verifyRetestVerdict(outdir, a.Verdict); err != nil {
+						return actool.Errorf(err.Error()), nil
+					}
 				}
 				if err := s.m.pg.RecordFindingRetestResult(ctx, intercept.ConvIDFromContext(ctx), a.Verdict, a.Summary, a.Evidence); err != nil {
 					return actool.Errorf(err.Error()), nil
@@ -187,6 +206,56 @@ func (s *Server) findingRetestTools() []actool.CoreTool {
 				return jsonResult(map[string]any{"saved": true, "verdict": a.Verdict})
 			}),
 	}
+}
+
+// retestPackDir resolves the evidence pack directory for a retest conversation.
+// A relative path is taken from the session working directory; either way the
+// result must stay inside the server work dir, so a tool call cannot point the
+// verifier at an unrelated (or attacker-written) tree outside the workspace.
+func (s *Server) retestPackDir(ctx context.Context, raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("reproduced / fixed 必须提供 pack_dir（retest_strict 的 --outdir）")
+	}
+	if !filepath.IsAbs(raw) {
+		wd := intercept.WorkingDir(ctx)
+		if wd == "" {
+			return "", errors.New("无法确定会话工作目录，请传绝对路径")
+		}
+		raw = filepath.Join(wd, raw)
+	}
+	abs := filepath.Clean(raw)
+	base := filepath.Clean(s.m.dir)
+	if abs != base && !strings.HasPrefix(abs, base+string(os.PathSeparator)) {
+		return "", errors.New("证据包目录必须位于工作区内")
+	}
+	fi, err := os.Stat(abs)
+	if err != nil || !fi.IsDir() {
+		return "", errors.New("证据包目录不存在: " + raw)
+	}
+	return abs, nil
+}
+
+// verifyRetestVerdict enforces that a retest conclusion was produced by the
+// sealed gates and still matches the evidence on disk. Without it, an agent
+// could call the tool directly and claim "reproduced" (or "fixed", which closes
+// the finding) with no evidence at all.
+func (s *Server) verifyRetestVerdict(outdir, verdict string) error {
+	key, err := evidence.LoadHMACKey(s.evidenceStore().Dir)
+	if err != nil {
+		return err
+	}
+	v, err := evidence.VerifyVerdict(outdir, key, verdict)
+	if err != nil {
+		return err
+	}
+	if verdict == "fixed" && v.GateOK {
+		return errors.New("闸门仍判定可复现，不能保存为已修复")
+	}
+	if verdict == "reproduced" && !v.GateOK {
+		return errors.New("闸门未通过（gate_ok=false），不能保存为可复现")
+	}
+	return nil
 }
 
 // Seed the editable agent atomically, without an automatic discovery trigger.

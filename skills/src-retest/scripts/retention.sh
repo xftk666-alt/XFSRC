@@ -7,7 +7,24 @@ set -u
 DRY_ARG=0
 [ "${1:-}" = "--dry-run" ] && DRY_ARG=1
 CONF=/app/data/retention.env
-[ -f "$CONF" ] && . "$CONF"
+# 配置来自 /app/data（agent 可写），绝不能 source 它：一行 `x=$(...)` 就是
+# 以 root 身份执行的代码。只接受白名单里的 KEY=VALUE 数值。
+if [ -f "$CONF" ]; then
+  while IFS='=' read -r key value; do
+    case "$key" in
+      RETENTION_ENABLED|RETENTION_SESSIONS_DAYS|RETENTION_TRANSCRIPTS_DAYS|\
+      RETENTION_CHAT_ACTIVITY_DAYS|RETENTION_SERVER_LOG_DAYS|RETENTION_DRY_RUN)
+        value="${value%\r}"
+        value="${value#\"}"
+        value="${value%\"}"
+        case "$value" in
+          *[!0-9]*|"") ;;   # 非数字一律忽略
+          *) export "$key=$value" ;;
+        esac
+        ;;
+    esac
+  done < "$CONF"
+fi
 
 ENABLED="${RETENTION_ENABLED:-1}"
 SESS_DAYS="${RETENTION_SESSIONS_DAYS:-30}"
@@ -25,12 +42,16 @@ fi
 STAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 echo "[retention] $STAMP start (dry=$DRY sessions>${SESS_DAYS}d transcripts>${TRANS_DAYS}d chat>${CHAT_DAYS}d logs>${LOG_DAYS}d)"
 
+# count_paths <dir> <d|f> <days>
+# 旧签名把 "-type" 和 "d" 拆成两个参数，实际执行成 `-mtime +d`，find 报错后
+# 被 2>/dev/null 吞掉、wc -l 恒为 0 —— 日志永远显示「没有候选」，但 rm 照样删。
 count_paths() {
-  find "$1" -mindepth 1 -maxdepth 1 "$2" -mtime +"$3" 2>/dev/null | wc -l
+  [ -d "$1" ] || { echo 0; return; }
+  find "$1" -mindepth 1 -maxdepth 1 -type "$2" -mtime +"$3" 2>/dev/null | wc -l | tr -d ' '
 }
 
-SESS_N=$(count_paths /app/data/sessions -type d "$SESS_DAYS")
-TRANS_N=$(count_paths /app/data/transcripts -type f "$TRANS_DAYS")
+SESS_N=$(count_paths /app/data/sessions d "$SESS_DAYS")
+TRANS_N=$(count_paths /app/data/transcripts f "$TRANS_DAYS")
 echo "[retention] candidates: sessions=$SESS_N transcripts=$TRANS_N"
 
 if [ "$DRY" != "1" ]; then

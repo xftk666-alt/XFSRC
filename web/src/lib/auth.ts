@@ -1,5 +1,17 @@
-const TOKEN_KEY = "artex_token";
-const COOKIE_MAX_AGE = 7 * 24 * 60 * 60; // 7 天（秒）
+// Session handling.
+//
+// The JWT lives in an HttpOnly, SameSite=Strict cookie set by the Go backend
+// (/api/auth/login, /api/auth/init). Page scripts therefore cannot read it, so an
+// XSS cannot exfiltrate a 7-day admin token — which is the whole point of moving
+// it out of localStorage.
+//
+// What remains in the browser is a NON-SECRET marker: it only tells the
+// client-side route guard that a session is expected, so protected UI can render
+// instead of flashing the login page. Every request is authorised by the cookie
+// server-side; forging the marker gets you a UI that immediately 401s.
+const SESSION_MARKER = "xfsrc_session";
+// Legacy key from the localStorage-token era; removed on sight.
+const LEGACY_TOKEN_KEY = "artex_token";
 
 export interface CurrentUser {
   id: string;
@@ -10,37 +22,64 @@ export interface CurrentUser {
   role: string;
 }
 
+function clearLegacyToken(): void {
+  try {
+    localStorage.removeItem(LEGACY_TOKEN_KEY);
+    // Older builds also mirrored the token into a JS-readable cookie.
+    document.cookie = `${LEGACY_TOKEN_KEY}=; path=/; max-age=0`;
+  } catch {
+    // localStorage can throw in private mode; nothing to clean up then.
+  }
+}
+
 export const auth = {
-  getToken(): string | null {
-    if (typeof window === "undefined") return null;
-    // Mock demo：无真实登录，返回一个假 token 让路由守卫放行、直接进主界面。
-    return localStorage.getItem(TOKEN_KEY) ?? (process.env.NEXT_PUBLIC_MOCK === "1" ? "mock-demo" : null);
+  /** True when a session is expected. Carries no credential. */
+  hasSession(): boolean {
+    if (typeof window === "undefined") return false;
+    if (process.env.NEXT_PUBLIC_MOCK === "1") return true;
+    return localStorage.getItem(SESSION_MARKER) === "1";
   },
 
-  setToken(token: string): void {
-    localStorage.setItem(TOKEN_KEY, token);
-    // 同步写 cookie，供 Next.js middleware 服务端读取
-    document.cookie = `${TOKEN_KEY}=${encodeURIComponent(token)}; path=/; max-age=${COOKIE_MAX_AGE}; SameSite=Lax`;
-  },
-
-  clearToken(): void {
-    localStorage.removeItem(TOKEN_KEY);
-    document.cookie = `${TOKEN_KEY}=; path=/; max-age=0`;
-  },
-
-  // 从 JWT payload 的 sub 字段解析当前用户，仅用于展示，不做签名验证。
-  getCurrentUser(): CurrentUser | null {
-    const token = this.getToken();
-    if (!token) return null;
+  /**
+   * Called after a successful login/init. The server already set the HttpOnly
+   * cookie on the response; here we only record that a session exists.
+   */
+  setToken(_token: string): void {
+    clearLegacyToken();
     try {
-      const parts = token.split(".");
-      if (parts.length !== 3) return null;
-      // base64url → base64
-      const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
-      const username: string = payload.sub ?? "XFSRC";
-      return { id: "1", name: username, username, email: "", avatar: "", role: "operator" };
+      localStorage.setItem(SESSION_MARKER, "1");
     } catch {
-      return null;
+      // Non-fatal: the route guard will fall back to the login page.
     }
+  },
+
+  /** Local-only cleanup (expired session, 401). Does NOT revoke the cookie. */
+  clearToken(): void {
+    try {
+      localStorage.removeItem(SESSION_MARKER);
+    } catch {
+      // ignore
+    }
+    clearLegacyToken();
+  },
+
+  /**
+   * Real logout: revokes every issued token server-side (the JWT generation is
+   * bumped) and clears the cookie, then drops the local marker.
+   */
+  async logout(): Promise<void> {
+    try {
+      await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
+    } catch {
+      // Offline / server down: still clear local state below.
+    }
+    this.clearToken();
+  },
+
+  getCurrentUser(): CurrentUser | null {
+    if (!this.hasSession()) return null;
+    // The username is fixed by the backend (single admin account).
+    const username = "XFSRC";
+    return { id: "1", name: username, username, email: "", avatar: "", role: "operator" };
   },
 };

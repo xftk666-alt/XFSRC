@@ -171,6 +171,9 @@ function isPriv(h) {
   pack.updated_at = new Date().toISOString();
   fs.writeFileSync(packPath, JSON.stringify(pack, null, 2) + "\n");
 
+  // 封印失败必须让整个记录失败：旧实现忽略 spawnSync 的退出码，未封印的证据
+  // 看起来「已记录」，直到跑闸门才暴露。
+  const sealErrors = [];
   try {
     const { spawnSync } = require("child_process");
     const fsTok = "/usr/local/share/artex-src/.recorder-token";
@@ -178,18 +181,31 @@ function isPriv(h) {
     try { tok = fs.readFileSync(fsTok, "utf8").trim(); } catch (_) {}
     const env = { ...process.env };
     if (tok) env.ARTEX_EVIDENCE_RECORDER_TOKEN = tok;
-    spawnSync("python3", ["/usr/local/share/artex-src/evidence_seal.py", "seal", "--case-dir", caseDir], {
-      stdio: "ignore",
-      env,
-    });
-    spawnSync("python3", ["/usr/local/share/artex-src/evidence_seal.py", "seal-pack", "--outdir", path.resolve(outdir)], {
-      stdio: "ignore",
-      env,
-    });
-  } catch (_) {}
+    else sealErrors.push("缺少记录器令牌文件：证据无法封印");
+    if (tok) {
+      for (const args of [
+        ["seal", "--case-dir", caseDir],
+        ["seal-pack", "--outdir", path.resolve(outdir)],
+      ]) {
+        const r = spawnSync("python3", ["/usr/local/share/artex-src/evidence_seal.py", ...args], {
+          stdio: "pipe",
+          env,
+          encoding: "utf8",
+        });
+        if (r.status !== 0) {
+          sealErrors.push(`evidence_seal ${args[0]} 失败: ${(r.stderr || r.stdout || "").trim().slice(0, 300)}`);
+        }
+      }
+    }
+  } catch (e) {
+    sealErrors.push(`seal 调用失败: ${String(e)}`);
+  }
 
-  console.log(JSON.stringify(meta, null, 2));
-  process.exit(executed ? 0 : 1);
+  if (sealErrors.length) {
+    console.error(JSON.stringify({ ok: false, seal_errors: sealErrors }, null, 2));
+  }
+  console.log(JSON.stringify({ ...meta, ...(sealErrors.length ? { seal_errors: sealErrors } : {}) }, null, 2));
+  process.exit(sealErrors.length ? 3 : executed ? 0 : 1);
 })().catch((e) => {
   console.error(String(e));
   process.exit(1);

@@ -234,9 +234,34 @@ def impact_ceiling(kind: str, text: str) -> str | None:
     if not blob.strip():
         return None
     for levels, words in IMPACT_CEILING:
-        if any(w in blob for w in words):
+        if any(_affirmed(blob, w) for w in words):
             return levels[0]
     return None
+
+
+# 否定词：出现在命中短语前一小段内，说明报告是在否认这个后果。
+_NEGATORS = (
+    "no ", "not ", "cannot ", "can not ", "can't ", "could not ", "unable to ",
+    "never ", "without ", "无法", "不能", "不会", "未能", "并未", "没有", "无法读取",
+)
+
+
+def _affirmed(blob: str, phrase: str) -> bool:
+    """短语在文中出现且不是被否定的那一处。
+
+    旧实现是裸子串匹配，于是「no account takeover is possible; only a static
+    directory listing」被判成 critical、「we could not read other users' data」
+    被判成 high —— 反向证据反而把天花板抬高。
+    """
+    start = 0
+    while True:
+        i = blob.find(phrase, start)
+        if i < 0:
+            return False
+        window = blob[max(0, i - 40):i]
+        if not any(n in window for n in _NEGATORS):
+            return True
+        start = i + len(phrase)
 
 
 def _is_na_form(text: str) -> bool:
@@ -276,6 +301,15 @@ def submit_ceiling(kind: str, summary: str, lab: bool) -> str:
     return "needs-human"
 
 
+class DuplicateLookupUnavailable(RuntimeError):
+    """判重数据源不可用。
+
+    「查不到」和「没有重复」是两件事：旧实现两者都返回 []，于是数据库连不上时
+    判重闸门直接放行（fail-open），重复上报仍会被当成首次提交。调用方必须把
+    这个异常当成「无法判定」，按需要人工处理的方式处置。
+    """
+
+
 def lookup_task_duplicates(
     task_id: str = "",
     kind: str = "",
@@ -287,14 +321,14 @@ def lookup_task_duplicates(
     rows = _rows
     if rows is None:
         if not task_id:
-            return []
+            raise DuplicateLookupUnavailable("缺少 task_id，无法判重")
         try:
             import psycopg2  # type: ignore
-        except Exception:
-            return []
+        except Exception as e:
+            raise DuplicateLookupUnavailable(f"psycopg2 不可用（{e.__class__.__name__}）") from e
         dsn = os.environ.get("ARTEX_PG_DSN")
         if not dsn:
-            return []
+            raise DuplicateLookupUnavailable("未配置 ARTEX_PG_DSN")
         try:
             conn = psycopg2.connect(dsn)
             cur = conn.cursor()
@@ -309,8 +343,8 @@ def lookup_task_duplicates(
             ]
             cur.close()
             conn.close()
-        except Exception:
-            return []
+        except Exception as e:
+            raise DuplicateLookupUnavailable(f"判重查询失败（{e.__class__.__name__}: {e}）") from e
     k = _norm(kind)
     hosts = [h.lower() for h in (hosts or []) if h]
     paths = [p for p in (paths or []) if p]
@@ -384,14 +418,18 @@ def brief(
     hosts = pack_hosts(pack)
     paths = pack_paths(pack)
     ceiling = submit_ceiling(kind, f"{title} {impact}", lab)
-    dups = lookup_task_duplicates(task_id, kind, hosts, paths, _rows=_dup_rows)
+    dup_error = ""
+    try:
+        dups = lookup_task_duplicates(task_id, kind, hosts, paths, _rows=_dup_rows)
+    except DuplicateLookupUnavailable as e:
+        dups, dup_error = [], str(e)
     too_high = claimed_too_high(claimed_severity, ceiling if ceiling not in ("do-not-submit", "needs-human") else "high")
     if ceiling == "do-not-submit":
         too_high = claimed_too_high(claimed_severity, "none") or too_high
 
     if lab or ceiling == "do-not-submit" or not gate_ok or recommended in ("not_a_vuln", "inconclusive"):
         action = "do-not-submit"
-    elif dups or too_high or ceiling == "needs-human":
+    elif dups or dup_error or too_high or ceiling == "needs-human":
         action = "needs-human"
     else:
         action = "maybe-submit"
@@ -405,6 +443,8 @@ def brief(
         reasons.append("闸门未过：不能当洞交")
     if dups:
         reasons.append("本任务已有同类同路径记录，先核对是不是重复")
+    if dup_error:
+        reasons.append(f"判重无法完成（{dup_error}）：按「可能重复」处理，不要直接提交")
     if too_high:
         reasons.append(f"声称严重度 {claimed_severity} 高于证据形态上限 {ceiling}，按夸大处理")
     if ceiling == "needs-human" and action == "needs-human" and gate_ok:
@@ -416,6 +456,7 @@ def brief(
         "price": None,
         "price_note": "机器不标价、不猜赏金表。",
         "duplicate_in_task": dups,
+        "duplicate_check_error": dup_error,
         "claimed_too_high": too_high,
         "reasons": reasons,
     }

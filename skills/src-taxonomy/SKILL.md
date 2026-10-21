@@ -4,6 +4,14 @@ description: 海外 SRC 漏洞分类学与选题决策表（20 族 / 328 类，�
 ---
 # src-taxonomy — 漏洞分类学与选题决策表
 
+## 合规红线（先读这条）
+
+- 只处理**已授权**资产：目标必须先在 `task_scope` 登记，且 `scope_check` 返回 in-scope。
+- 每个 program 的 `policy` 可能禁止自动化/限速/外部 OOB；按 policy 调整，不按习惯。
+- 拿不到 in-scope 结论时**不发请求**，先回 `src-roe-parser` 补范围。
+
+
+
 ## 为什么需要它
 
 `src-coverage` 只能回答「我测过什么」，回答不了「**我应该测什么、漏了什么**」。

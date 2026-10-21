@@ -115,7 +115,7 @@ func (s *Server) createCompany(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	id, added, skipped, invalid, scopeErrs, err := cs.CreateCompanyWithScope(req.Name, req.Logo, req.Scope, "api")
+	id, added, skipped, invalid, scopeErrs, err := cs.CreateCompanyWithScope(req.Name, req.Logo, req.Scope, "api", db.ScopeSourceManual)
 	if err != nil {
 		if errors.Is(err, db.ErrCompanyNameConflict) {
 			writeErr(w, http.StatusConflict, "企业名称已存在")
@@ -205,9 +205,9 @@ func (s *Server) addCompanyScope(w http.ResponseWriter, r *http.Request) {
 	var errs []string
 	var mutationErr error
 	if req.Reset {
-		added, invalid, errs, mutationErr = cs.UpdateScopeInputsChecked(id, req.Scope, req.Reason)
+		added, invalid, errs, mutationErr = cs.UpdateScopeInputsChecked(id, req.Scope, req.Reason, db.ScopeSourceManual)
 	} else {
-		added, skipped, invalid, errs, mutationErr = cs.AddScopeInputsChecked(id, req.Scope, req.Reason)
+		added, skipped, invalid, errs, mutationErr = cs.AddScopeInputsChecked(id, req.Scope, req.Reason, db.ScopeSourceManual)
 	}
 	if mutationErr != nil {
 		if errors.Is(mutationErr, db.ErrCompanyNotFound) {

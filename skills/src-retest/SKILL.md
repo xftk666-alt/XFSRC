@@ -53,6 +53,9 @@ Agent **禁止**：
 
    > **`record_finding_retest_result` 是唯一落库动作，不可跳过。**
    > 顺序固定：`retest_strict_gate` → `evidence_gate` → `retest_verdict` → `hunter_card` → **`record_finding_retest_result`**。
+   > `reproduced` / `fixed` 必须把证据包目录作为 `pack_dir` 传进去：服务端会重新校验
+   > `verdict.json` 的 HMAC 与证据指纹，未过闸门、结论与签名不符、或签发后改过证据
+   > 都会被拒绝（`inconclusive` 不需要证据包）。
    > 只跑闸门和 hunter_card 就收尾，平台会把 `finding_retests.status` 置为 `failed`
    > （error: Agent 未保存复测结论），此时任何"已完成/已保存"的自我宣告都是假的。
    > 2026-10-19 复测 #8 就是这样失败的：闸门全过、卡片已出、record 零调用。
@@ -178,10 +181,12 @@ retest_verdict(outdir="...", verdict="reproduced", submit_advice="ready",
 |---|---|---|
 | `reproduced` | `gate.json` ok=true，且正文有专属字段 | 靶场=`never`；否则默认 `needs-human`；有 signoff 才 `ready` |
 | `not_a_vuln` | 对照失败 / 无安全边界 / SPA / self-XSS / 最佳实践 / 假 SSRF | **必须 never** |
-| `fixed` | attack 失败且正向 control 仍成功 | never 或 needs-human |
+| `fixed` | attack 失败（非 WAF 拦截页）、正文不再含 victim_marker、且必须带 victim_marker | never 或 needs-human |
 | `inconclusive` | 目标挂了、缺账号、WAF、工具失败 | never |
 
 `retest_verdict` 会强制：靶场 → never；not_a_vuln → never；ready 无签字 → 拒绝。
+`fixed` 的证据门槛：没有 case、缺 `response.body`、抓取出错、WAF/拦截页、或 attack
+正文仍有 victim_marker，一律拒绝并提示改用 `inconclusive`。
 
 ---
 

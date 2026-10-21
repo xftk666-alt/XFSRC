@@ -63,8 +63,36 @@ def _as_ip(h: str):
         return None
 
 
-def load_scope(task_id: int, dsn: str | None = None) -> list[dict[str, Any]]:
+def load_scope_file(path: str) -> list[dict[str, Any]]:
+    """从 JSON 文件读 scope 条目（离线/测试/审计用，与 task_scope 行同构）。
+
+    格式：`[{"kind":"subdomain","domain":"a.example.com"}, ...]`
+    文件不可读时抛异常 —— 调用方必须按 out-of-scope 处理，绝不静默放行。
+    """
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    rows = doc.get("scope") if isinstance(doc, dict) else doc
+    if not isinstance(rows, list):
+        raise ValueError(f"scope file 必须是 list 或 {{'scope': list}}: {path}")
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        out.append(
+            {
+                "kind": str(r.get("kind") or "").lower(),
+                "domain": r.get("domain"),
+                "net": r.get("net"),
+                "value": r.get("value"),
+            }
+        )
+    return out
+
+
+def load_scope(task_id: int, dsn: str | None = None, scope_file: str = "") -> list[dict[str, Any]]:
     """读 task_scope。连不上库时返回空列表（调用方按 out-of-scope 处理）。"""
+    if scope_file:
+        return load_scope_file(scope_file)
     dsn = dsn or os.environ.get("ARTEX_PG_DSN")
     if not dsn:
         return []
@@ -170,9 +198,26 @@ def _host_in_entry(host: str, entry: dict[str, Any]) -> bool:
     return False
 
 
-def check(task_id: int, url: str = "", host: str = "", dsn: str | None = None) -> dict[str, Any]:
+def check(
+    task_id: int,
+    url: str = "",
+    host: str = "",
+    dsn: str | None = None,
+    scope_file: str = "",
+) -> dict[str, Any]:
     h = _norm_host(host or url)
-    scope = load_scope(task_id, dsn)
+    try:
+        scope = load_scope(task_id, dsn, scope_file)
+    except Exception as e:
+        # 范围来源读不出来 = 不知道是否授权 = 禁止。绝不 fail open。
+        return {
+            "verdict": "out-of-scope",
+            "host": h,
+            "reason": f"scope 来源不可读（{e.__class__.__name__}: {e}）—— fail closed",
+            "matched": [],
+            "task_id": task_id,
+            "fail_closed": True,
+        }
     constraints = load_constraints(task_id, dsn)
 
     if not h:
@@ -226,9 +271,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--host", default="")
     ap.add_argument("--json", action="store_true", help="只输出 JSON")
     ap.add_argument("--dsn", default="")
+    ap.add_argument("--scope-file", default="", help="离线 scope JSON（测试/审计用；给了就不读库）")
     a = ap.parse_args(argv)
 
-    r = check(a.task_id, a.url, a.host, a.dsn or None)
+    r = check(a.task_id, a.url, a.host, a.dsn or None, a.scope_file)
     if a.json:
         print(json.dumps(r, ensure_ascii=False, indent=2))
     else:

@@ -51,23 +51,23 @@ func (s *Server) wsResolve(rel string) (string, bool) {
 	}
 	// Deny the runtime-secret subtrees outright (checked on the cleaned relative
 	// path so neither "." nor a trailing slash can slip through).
-	if relClean, err := filepath.Rel(base, abs); err == nil && relClean != "." {
-		for _, seg := range strings.Split(filepath.ToSlash(relClean), "/") {
-			if wsSensitiveNames[seg] {
-				return "", false
-			}
-		}
+	if wsDeniedSegments(base, abs) {
+		return "", false
 	}
 	// Lexical confinement is not enough: a symlink inside the work dir can point
 	// anywhere (an agent can create one with Bash). Resolve the real path of the
-	// deepest existing ancestor and require it to stay under the real root.
+	// deepest existing ancestor, require it to stay under the real root, AND
+	// re-apply the denylist to the RESOLVED path — otherwise `ln -s traffic x`
+	// followed by `read?path=x/_ca/mitmproxy-ca.key` passes the lexical check and
+	// resolves straight into the denied subtree.
 	realBase, err := filepath.EvalSymlinks(base)
 	if err != nil {
 		realBase = base
 	}
 	probe := abs
 	for {
-		if resolved, err := filepath.EvalSymlinks(probe); err == nil {
+		resolved, resolveErr := filepath.EvalSymlinks(probe)
+		if resolveErr == nil {
 			real := resolved
 			if rest, relErr := filepath.Rel(probe, abs); relErr == nil && rest != "." {
 				real = filepath.Join(resolved, rest)
@@ -75,15 +75,44 @@ func (s *Server) wsResolve(rel string) (string, bool) {
 			if real != realBase && !strings.HasPrefix(real, realBase+string(os.PathSeparator)) {
 				return "", false
 			}
-			break
+			if wsDeniedSegments(realBase, real) {
+				return "", false
+			}
+			return abs, true
+		}
+		// A path that exists but does not resolve is a dangling symlink (or a
+		// symlink loop). Writing through it would create a file at the link's
+		// destination, outside the workspace, so refuse rather than guess.
+		if fi, lerr := os.Lstat(probe); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			return "", false
 		}
 		parent := filepath.Dir(probe)
-		if parent == probe || len(parent) <= len(base) {
-			break
+		if parent == probe || len(parent) < len(base) {
+			// Nothing between the target and the workspace root resolves, so the
+			// request cannot be a workspace path.
+			return "", false
 		}
 		probe = parent
 	}
-	return abs, true
+}
+
+// wsDeniedSegments reports whether any path segment between base and target is a
+// runtime-secret name. Both the lexical path and the symlink-resolved path are
+// checked, because a link can rename a denied subtree.
+func wsDeniedSegments(base, target string) bool {
+	relClean, err := filepath.Rel(base, target)
+	if err != nil || relClean == "." || relClean == "" {
+		return false
+	}
+	if strings.HasPrefix(relClean, "..") {
+		return true
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(relClean), "/") {
+		if wsSensitiveNames[seg] {
+			return true
+		}
+	}
+	return false
 }
 
 // wsRel renders an absolute path back as a workspace-relative path (forward slashes).

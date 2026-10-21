@@ -181,17 +181,18 @@ def pack_fingerprint(outdir: str) -> str:
 def is_lab(pack: dict[str, Any]) -> bool:
     """靶场判定：委托 lab_detect（网段/后缀/单标签/FQDN 规则）。
 
-    保留 LAB_HINTS 子串兜底，避免历史证据包判定漂移。
+    只认结构化 host。旧实现还留了一层 LAB_HINTS 子串兜底，于是 SSRF 证据里
+    `?url=http://127.0.0.1:8080/admin` 这种**攻击载荷**会把真实公网资产判成
+    靶场，导致 legitimate 发现永远 submit_advice=never（审计发现的误报）。
     """
     try:
         from lab_detect import is_lab as _detect
 
-        if _detect(pack):
-            return True
+        return bool(_detect(pack))
     except Exception:
-        pass
-    blob = json.dumps(pack, ensure_ascii=False)
-    return any(h in blob for h in LAB_HINTS)
+        # 判定器不可用时按「无法判定」处理：宁可让闸门继续用其它证据，也不要
+        # 用子串猜测把一个真实资产打成靶场。
+        return False
 
 
 def is_lab_sealed(outdir: str, pack: dict[str, Any]) -> bool:
@@ -210,30 +211,14 @@ def is_lab_sealed(outdir: str, pack: dict[str, Any]) -> bool:
                     return True
             except Exception:
                 pass
-            blob = json.dumps(payload, ensure_ascii=False)
-            if any(h in blob for h in LAB_HINTS):
-                return True
+            # 不再对 payload 做自由文本子串扫描：SSRF 的 `?url=http://127.0.0.1/`
+            # 会把真实公网资产误判成靶场（审计发现的误报）。
         except Exception:
             pass
-    # 兜底：直接看 case 的 request.txt（封印覆盖其 sha256）
-    cases_dir = os.path.join(outdir, "cases")
-    if os.path.isdir(cases_dir):
-        for n in os.listdir(cases_dir):
-            req = os.path.join(cases_dir, n, "request.txt")
-            if os.path.isfile(req):
-                try:
-                    txt = open(req, encoding="utf-8", errors="replace").read(65536)
-                except Exception:
-                    continue
-                try:
-                    from lab_detect import is_lab_text
-
-                    if is_lab_text(txt):
-                        return True
-                except Exception:
-                    pass
-                if any(h in txt for h in LAB_HINTS):
-                    return True
+    # request.txt 是「攻击载荷」而不是资产地址：SSRF 证据里出现
+    # `?url=http://127.0.0.1:8080/admin` 不代表被测资产是靶场，按它判定会把
+    # 真实公网资产的 SSRF 全部误判成 lab（审计发现的误报）。资产身份只看
+    # pack / pack.seal 的结构化 url 字段。
     return False
 
 
@@ -758,35 +743,38 @@ def evaluate(
         named_field_pass = False
         for comp in compares:
             f = comp.get("file")
-            detail: dict[str, Any] = {}
-            if f and os.path.isfile(f):
-                try:
-                    detail = load_json(f)
-                except Exception:
-                    detail = {}
-            names = {x.get("name") for x in detail.get("checks") or []}
-            has_field = bool(names & FIELD_CHECK_NAMES)
-            live_pass = detail.get("pass") if detail.get("pass") is not None else comp.get("pass")
+            # compare-*.json 不参与 HMAC：只把它当「声明」，用封印后的 case 复算；
+            # pass 只认 pack.seal.json 覆盖的 comp["pass"]。
+            verified, has_field, marker_bound, why = verify_compare_claims(
+                outdir, comp, attack_n, control_n, marker
+            )
+            sealed_pass = comp.get("pass") is True
             pair_match = (comp.get("attack") == attack_n and comp.get("control") == control_n)
-            if pair_match and has_field and live_pass is True:
+            if pair_match and sealed_pass and verified and has_field:
                 named_field_pass = True
                 if marker:
-                    marker_in_named = marker_in_named or compare_asserts_marker(detail, marker)
+                    marker_in_named = marker_in_named or marker_bound
             field_compares.append(
                 {
                     "file": f,
-                    "pass": live_pass,
+                    "pass": sealed_pass,
+                    "verified": verified,
                     "has_field_assert": has_field,
-                    "checks": list(names),
+                    "marker_bound": marker_bound,
+                    "checks": why,
                     "pair_match": pair_match,
                     "attack": comp.get("attack"),
                     "control": comp.get("control"),
                 }
             )
         unpaired_good = [
-            x for x in field_compares if x["pass"] is True and x["has_field_assert"] and not x["pair_match"]
+            x
+            for x in field_compares
+            if x["pass"] is True and x["verified"] and x["has_field_assert"] and not x["pair_match"]
         ]
-        status_only = [x for x in field_compares if x["pass"] is True and not x["has_field_assert"]]
+        status_only = [
+            x for x in field_compares if x["pass"] is True and x["verified"] and not x["has_field_assert"]
+        ]
         add(
             "field_level_compare",
             named_field_pass,
@@ -916,7 +904,10 @@ def evaluate(
         recommended = "inconclusive"
 
     fp = pack_fingerprint(outdir)
-    challenge = hashlib.sha256(f"{fp}:{marker}:{now()}".encode()).hexdigest()[:12]
+    # challenge 必须只由「证据状态 + marker」决定：每次 evaluate 现造随机 challenge
+    # 会让 signoff 与 verdict 永远对不上（gate 签一个、verdict 现场重算又换一个）。
+    # 指纹变了 challenge 自然变。
+    challenge = hashlib.sha256(f"{fp}:{marker}:{kind}".encode()).hexdigest()[:12]
     return {
         "ok": ok,
         "verdict_allowed": "reproduced" if ok else recommended,
@@ -1004,6 +995,196 @@ def cmd_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+
+WAF_HINTS = (
+    "request blocked",
+    "access denied",
+    "cloudflare",
+    "cf-ray",
+    "incapsula",
+    "sucuri",
+    "akamai",
+    "captcha",
+    "challenge-platform",
+    "web application firewall",
+    "blocked by",
+)
+
+
+def looks_like_waf(status: Any, body: bytes) -> bool:
+    """拦截页不是修复：WAF/挑战页也算「攻击没成功」，但不能据此判 fixed。"""
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        code = 0
+    if code in (403, 406, 429, 503):
+        return True
+    low = body[:4096].lower()
+    return any(h.encode() in low for h in WAF_HINTS)
+
+
+def verify_compare_claims(
+    outdir: str,
+    comp: dict[str, Any],
+    attack_name: str | None,
+    control_name: str | None,
+    marker: str = "",
+) -> tuple[bool, bool, bool, list[str]]:
+    """用封印后的 case 证据复算 compare 文件里的断言。
+
+    compare-*.json 本身不参与 HMAC；只有 pack.json 里的 (attack, control, pass)
+    被 pack.seal.json 覆盖。因此：
+      * pass 只认 pack 里的值（文件里的 pass 只能用来发现篡改）；
+      * 文件里的 checks 当声明，逐条用封印后的 body/meta 复算；
+      * 无法复算的断言一律按失败处理（fail closed）。
+
+    返回 (verified, has_field_assert, marker_bound, reasons)。
+    """
+    reasons: list[str] = []
+    if not (attack_name and control_name):
+        return False, False, False, ["缺少 named attack/control"]
+    if comp.get("attack") != attack_name or comp.get("control") != control_name:
+        return False, False, False, ["compare 不是本次 named attack/control"]
+    f = comp.get("file") or ""
+    if not f or not os.path.isfile(f):
+        return False, False, False, ["compare 文件缺失或不可读，断言无法复算"]
+    try:
+        detail = load_json(f)
+    except Exception:
+        return False, False, False, ["compare 文件无法解析"]
+    if not isinstance(detail, dict):
+        return False, False, False, ["compare 文件格式错误"]
+    if "pass" in detail and bool(detail.get("pass")) != (comp.get("pass") is True):
+        return False, False, False, ["compare 文件的 pass 与封印 pack 不一致（文件被改过）"]
+
+    a_meta = load_meta(outdir, attack_name)
+    c_meta = load_meta(outdir, control_name)
+    a_body = read_body(outdir, attack_name)
+    c_body = read_body(outdir, control_name)
+    a_status = (a_meta.get("response") or {}).get("status")
+    c_status = (c_meta.get("response") or {}).get("status")
+
+    verified_all = True
+    has_field = False
+    marker_bound = False
+    for ch in detail.get("checks") or []:
+        if not isinstance(ch, dict):
+            verified_all = False
+            continue
+        name = str(ch.get("name") or "")
+        expected = ch.get("expected")
+        ok = False
+        bound = False
+        try:
+            if name == "attack_status":
+                ok = int(a_status) == int(expected)
+            elif name == "control_status":
+                ok = int(c_status) == int(expected)
+            elif name == "attack_contains":
+                exp = str(expected)
+                ok = exp.encode("utf-8") in a_body
+                bound = bool(marker) and (exp == marker or marker in exp)
+            elif name == "control_not_contains":
+                exp = str(expected)
+                ok = exp.encode("utf-8") not in c_body
+                bound = bool(marker) and (exp == marker or marker in exp)
+            elif name == "bodies_differ":
+                want = expected if isinstance(expected, bool) else str(expected).lower() in ("1", "true", "yes")
+                ok = (hashlib.sha256(a_body).hexdigest() != hashlib.sha256(c_body).hexdigest()) == want
+            elif name in ("json_path_differs", "attack_json_value"):
+                path = ch.get("path") or ""
+                if not path:
+                    reasons.append("compare 未记录 json path，无法复算")
+                else:
+                    a_json = json.loads(a_body.decode("utf-8", "replace") or "null")
+                    c_json = json.loads(c_body.decode("utf-8", "replace") or "null")
+                    cur = a_json
+                    for seg in str(path).lstrip("$.").split("."):
+                        if isinstance(cur, dict):
+                            cur = cur.get(seg)
+                        elif isinstance(cur, list) and seg.isdigit():
+                            cur = cur[int(seg)]
+                        else:
+                            cur = None
+                            break
+                    if name == "json_path_differs":
+                        other = c_json
+                        for seg in str(path).lstrip("$.").split("."):
+                            if isinstance(other, dict):
+                                other = other.get(seg)
+                            elif isinstance(other, list) and seg.isdigit():
+                                other = other[int(seg)]
+                            else:
+                                other = None
+                                break
+                        ok = cur != other
+                        bound = bool(marker) and marker in json.dumps(cur, ensure_ascii=False)
+                    else:
+                        ok = str(cur) == str(expected)
+                        bound = bool(marker) and marker in str(expected)
+            else:
+                reasons.append(f"未知断言 {name}，无法复算")
+        except Exception as e:  # noqa: BLE001
+            reasons.append(f"复算失败 {name}: {e.__class__.__name__}")
+        if ok and name in FIELD_CHECK_NAMES:
+            has_field = True
+            if bound:
+                marker_bound = True
+        if not ok:
+            verified_all = False
+    if not (detail.get("checks") or []):
+        verified_all = False
+    if not verified_all:
+        reasons.append("compare 断言无法用封印证据复算（或与证据不符）")
+    return bool(verified_all), has_field, marker_bound, reasons
+
+
+def assess_fixed(
+    outdir: str,
+    pack: dict[str, Any] | None,
+    attack_n: str | None,
+    marker: str,
+) -> dict[str, Any]:
+    """`fixed` 的证据门槛：必须证明「攻击不再成立，而正向对照仍然正常」。
+
+    旧实现只检查 gate.ok != true，于是空包 / 缺 pack / WAF 页 / 超时
+    全都能被写成 fixed（审计发现的 fail-open）。这里逐条要求：
+      a) 至少一个 attack case，且正文真实落盘、没有网络错误；
+      b) attack 确实失败（不含 victim_marker），且不是 WAF 拦截页；
+      c) marker 必填，否则无法证明攻击不再返回该字段。
+    """
+    out: dict[str, Any] = {"ok": False, "reasons": []}
+    if not isinstance(pack, dict) or not (pack.get("cases") or []):
+        out["reasons"].append("没有 pack.json / 没有任何 case：无法证明已修复（应为 inconclusive）")
+        return out
+    if not attack_n:
+        out["reasons"].append("没有 attack case：无法证明攻击已失败（应为 inconclusive）")
+        return out
+    a_dir = os.path.join(outdir, "cases", attack_n)
+    a_meta = load_meta(outdir, attack_n)
+    a_resp = a_meta.get("response") or {}
+    a_status = a_resp.get("status")
+    a_err = a_resp.get("error")
+    a_body = read_body(outdir, attack_n)
+    a_path = os.path.join(a_dir, "response.body")
+
+    ok_seal, why_seal = verify_case(a_dir)
+    if not ok_seal:
+        out["reasons"].append(f"attack 证据未封印（{why_seal}）：不能据此声称已修复")
+    if not os.path.isfile(a_path) or not a_body:
+        out["reasons"].append("attack 没有 response.body：抓取失败不能当成「已修复」（应为 inconclusive）")
+    if a_err:
+        out["reasons"].append(f"attack 抓取出错（{a_err}）：超时/连接失败不能当成「已修复」（应为 inconclusive）")
+    if looks_like_waf(a_status, a_body):
+        out["reasons"].append(f"attack 命中 WAF/拦截页（status={a_status}）：拦截不是修复（应为 inconclusive）")
+    if marker:
+        if marker.encode("utf-8") in a_body:
+            out["reasons"].append("attack 正文里仍有 victim_marker：攻击仍然成立，不能写 fixed")
+    else:
+        out["reasons"].append("fixed 必须带 victim_marker，才能证明攻击不再返回该字段")
+    out["ok"] = not out["reasons"]
+    return out
+
 def cmd_gate(args: argparse.Namespace) -> int:
     if empty(args.outdir):
         print("ERROR: outdir 必填", file=sys.stderr)
@@ -1039,6 +1220,11 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     errors: list[str] = []
     live = None
     marker = (getattr(args, "victim_marker", "") or "").strip()
+    # 先读「已存在的签名 gate」，后面所有比对都用它。
+    # 旧实现先 write_signed_gate 再比对 signoff.challenge，等于每次 verdict 都把
+    # 用户签过的那份 gate 换成新 challenge，于是 ready 永远不可能通过，
+    # 而且一条被拒的 verdict 还会顺手毁掉原本有效的 gate。
+    persisted_gate = load_signed_gate(outdir)
     # 所有结论都现场重算。reproduced 必须 ok；fixed 不允许闸门仍判定可复现。
     live = evaluate(
         outdir,
@@ -1047,7 +1233,6 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         getattr(args, "attack", "") or "",
         getattr(args, "control", "") or "",
     )
-    write_signed_gate(outdir, live)
     if verdict == "reproduced":
         if empty(marker):
             errors.append("reproduced 必须带 victim_marker，并现场重算闸门（不信任磁盘 gate.json）")
@@ -1057,6 +1242,18 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     elif verdict == "fixed":
         if live.get("ok"):
             errors.append("fixed 被拒绝：现场闸门仍然 ok=true，当前证据仍能复现，不能写成已修复")
+        try:
+            pack_for_fixed = load_pack(outdir)
+        except FileNotFoundError:
+            pack_for_fixed = None
+        fixed = assess_fixed(
+            outdir, pack_for_fixed, getattr(args, "attack", "") or None, marker
+        )
+        if not fixed.get("ok"):
+            errors.append("fixed 被拒绝：证据不足以证明已修复（应为 inconclusive）")
+            errors.extend(fixed.get("reasons") or [])
+        if advice == "ready":
+            errors.append("fixed 不能 ready：只有 reproduced 才能进入签字提交流程")
 
     signoff_path = os.path.join(outdir, "signoff.json")
     signoff_raw = load_json(signoff_path) if os.path.isfile(signoff_path) else None
@@ -1092,9 +1289,12 @@ def cmd_verdict(args: argparse.Namespace) -> int:
             errors.append("ready 被拒绝：现场闸门未通过")
         if signed_off and fp and signoff_fp != fp:
             errors.append("signoff 指纹与当前证据包不一致")
-        persisted = load_signed_gate(outdir)
-        if signed_off and (not persisted or signoff_challenge != persisted.get("challenge")):
+        if signed_off and not persisted_gate:
+            errors.append("ready 被拒绝：没有 HMAC 签名的 gate.json（先跑 retest_strict_gate）")
+        elif signed_off and signoff_challenge != persisted_gate.get("challenge"):
             errors.append("signoff challenge 与签名 gate.json 不一致")
+        elif signed_off and live.get("challenge") and persisted_gate.get("challenge") != live.get("challenge"):
+            errors.append("gate.json 的 challenge 已过期（gate 之后证据变了），重跑 gate 再签字")
 
     if lab:
         advice = "never"
@@ -1120,6 +1320,15 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         audit("verdict_rejected", outdir=outdir, errors=errors, verdict=verdict)
         print(json.dumps({**out_payload, "hmac_sha256": doc["hmac_sha256"]}, ensure_ascii=False, indent=2, default=str))
         return 1
+
+    # 只有被接受的 verdict 才刷新 gate.json，且仅在缺失/过期时才写——否则一条结论
+    # 会顺手把用户刚签过的那份 gate 覆盖掉。
+    if (
+        not persisted_gate
+        or persisted_gate.get("fingerprint") != live.get("fingerprint")
+        or persisted_gate.get("challenge") != live.get("challenge")
+    ):
+        write_signed_gate(outdir, live)
 
     out_payload = {
         "ok": True,

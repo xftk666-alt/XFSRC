@@ -29,6 +29,9 @@ RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@late
     && playwright-cli --help \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
+# 运行时 Python 依赖：skills 里的 retention / proxy_sync / coverage 等脚本直接
+# import psycopg2；缺了它这些脚本只能 fail closed（代理不同步、台账读不到）。
+RUN pip install --no-cache-dir psycopg2-binary==2.9.9
 WORKDIR /app
 # 预编译好的对应架构二进制（dist/amd64/artex 或 dist/arm64/artex）
 COPY dist/${TARGETARCH}/artex /app/artex

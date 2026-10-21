@@ -106,14 +106,13 @@ python3 /app/skills/src-retest/scripts/coverage_report.py \
 
 退出码 0 = 健康；非 0 = 有问题（可当完成门禁用）。
 
+**fail-closed 语义**：读不到 findings 表、或台账为空且没给 `--assigned-risk`，
+一律非 0（「查不到」不等于「已覆盖」）。
+
 ### 全景体检（收尾必跑）
 
 `coverage_report` 只看「台账 vs findings」，回答不了「该测的类有没有漏」。
-收尾时用组合工具一次看全：
-
-```python
-coverage_full_report(task_id="6", assigned_risk=["idor","xss"])
-```
+收尾时把两个脚本一起跑（`coverage_report.py` + `taxonomy_gap.py`），或直接看下面这张表：
 
 它把两套账合并：
 

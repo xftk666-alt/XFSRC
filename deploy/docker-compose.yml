@@ -45,10 +45,11 @@ services:
       # 把项目根目录的 skills 挂进容器（覆盖镜像内置的 /app/skills）；
       # 改 skill 无需重建镜像，容器读的就是宿主机这份。
       - ../skills:/app/skills
-      # 守护脚本与 JWT 签名密钥放到持久卷：容器重建后不会退回镜像里的旧
-      # start.sh，也不会因为重新生成密钥把所有会话踢下线。
+      # 守护脚本放到持久卷：容器重建后不会退回镜像里的旧 start.sh。
+      # jwt.key 不单独挂载：keyDir 是 /app（可执行文件旁），宿主机文件不存在时
+      # Docker 会把绑定挂载源创建成目录，导致首次启动崩溃。改由 start.sh 在
+      # 启动前从 /app/data/jwt.key 恢复（没有则生成并写回 data 卷）。
       - ../deploy/start.sh:/app/start.sh:ro
-      - ../data/jwt.key:/app/jwt.key:ro
       # 可写挂载的二进制目录：页面「一键更新」替换的是 /app/bin/artex，
       # 落在宿主机 bin/ 下，容器重建后仍然是新版本（镜像内的 /app/artex 仅作兜底）。
       - ../bin:/app/bin

@@ -32,6 +32,8 @@ export function NavUser({
   const [pwOpen, setPwOpen] = React.useState(false);
 
   function handleLogout() {
+    // 服务端会递增 JWT 版本号，使已签发的令牌全部失效，再清 cookie。
+    void auth.logout();
     auth.clearToken();
     // 硬跳转：让浏览器用已清除的 cookie 发起全新请求，
     // middleware 才能正确读到空 token 并放行 /login

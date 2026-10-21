@@ -4,6 +4,14 @@ description: 候选漏洞的假设-证伪纪律（Deep Think 最小版）：每�
 ---
 # src-hypothesis — 假设与证伪纪律
 
+## 合规红线（先读这条）
+
+- 只处理**已授权**资产：目标必须先在 `task_scope` 登记，且 `scope_check` 返回 in-scope。
+- 每个 program 的 `policy` 可能禁止自动化/限速/外部 OOB；按 policy 调整，不按习惯。
+- 拿不到 in-scope 结论时**不发请求**，先回 `src-roe-parser` 补范围。
+
+
+
 ## 为什么需要它
 
 两个失败模式最烧预算：

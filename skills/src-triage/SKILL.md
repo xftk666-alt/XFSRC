@@ -308,6 +308,6 @@ Worker 文本 ≠ 证据。出现任一条，当**谎报**处理：
 | **范围校验** | `scope_check.py --task-id N --url U` |
 | **覆盖台账** | `coverage_record.py` / `coverage_report.py` |
 | **判重自查** | `dup_check.py --task-id T --kind K --host H --path P` |
-| **靶场识别** | `lab_detect`（原生工具：`lab_detect(url=..., host=..., pack=...)`，只读） |
+| **靶场识别** | `lab_detect_cli.py`（CLI：`python3 lab_detect_cli.py --url/--host/--pack`，只读）；判定规则在 `lab_detect.py`，闸门内部直接 import |
 
 **禁止**：为了让六问「看起来像是」而去打真实用户、爆破、DoS、越出 scope。

@@ -120,6 +120,11 @@ func run() int {
 		Addr:              *addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// A slow or absent body must not hold a connection (and its goroutine)
+		// forever; API handlers additionally cap the body size themselves.
+		ReadTimeout:  5 * time.Minute,
+		WriteTimeout: 0, // SSE streams are long-lived; per-handler timeouts apply
+		IdleTimeout:  120 * time.Second,
 	}
 
 	go func() {

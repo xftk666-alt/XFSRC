@@ -48,7 +48,7 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 		{Kind: "icp", Value: icp},
 		{Kind: "keyword", Value: keyword},
 	}
-	added, skipped, invalid, scopeErrors := companies.AddScopeInputs(companyID, inputs, "task context test")
+	added, skipped, invalid, scopeErrors := companies.AddScopeInputs(companyID, inputs, "task context test", "manual")
 	if added != len(inputs) || skipped != 0 || invalid != 0 || len(scopeErrors) != 0 {
 		t.Fatalf("add company scope: added=%d skipped=%d invalid=%d errors=%v", added, skipped, invalid, scopeErrors)
 	}

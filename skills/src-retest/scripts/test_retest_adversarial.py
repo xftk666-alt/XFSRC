@@ -33,6 +33,30 @@ FAIL = 0
 ERRORS: list[str] = []
 
 
+def bootstrap_evidence_runtime(tmp: str) -> None:
+    """Self-contained HMAC key + recorder token under a temp runtime root.
+
+    Production paths are fixed (/app/data/evidence/.hmac-key and the root-only
+    recorder token); tests must not depend on them, so they relocate both via
+    ARTEX_EVIDENCE_TEST_ROOT. Written before any subprocess starts, because the
+    modules resolve the paths at import time.
+    """
+    root = os.path.join(tmp, "runtime")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    key = os.path.join(root, ".hmac-key")
+    if not os.path.isfile(key):
+        with open(key, "w", encoding="utf-8") as f:
+            f.write(hashlib.sha256(b"retest-test-hmac-key").hexdigest())
+        os.chmod(key, 0o600)
+    token = os.path.join(root, ".recorder-token")
+    if not os.path.isfile(token):
+        with open(token, "w", encoding="utf-8") as f:
+            f.write("test-recorder-token")
+        os.chmod(token, 0o600)
+    os.environ["ARTEX_EVIDENCE_TEST_ROOT"] = root
+    os.environ["ARTEX_EVIDENCE_RECORDER_TOKEN"] = "test-recorder-token"
+
+
 def run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
@@ -168,6 +192,7 @@ def make_idor_pack(base: str, port: int) -> str:
 def main() -> int:
     httpd, port = start_server()
     tmp = tempfile.mkdtemp(prefix="retest-adv-")
+    bootstrap_evidence_runtime(tmp)
     print(f"tmp={tmp} port={port}")
     try:
         # 1 genuine IDOR
@@ -437,9 +462,15 @@ def main() -> int:
     print(f"\n=== {PASS} passed, {FAIL} failed ===")
     for e in ERRORS:
         print(" -", e)
-    Path("/app/data/sessions/conv-34/retest-adversarial-results.json").write_text(
-        json.dumps({"pass": PASS, "fail": FAIL, "errors": ERRORS}, indent=2)
-    )
+    results = json.dumps({"pass": PASS, "fail": FAIL, "errors": ERRORS}, indent=2)
+    # The suite must be runnable outside the container: the runtime session dir is
+    # only written when it already exists (the retester agent runs it in /app).
+    out = Path(tmp, "retest-adversarial-results.json")
+    out.write_text(results)
+    runtime = Path("/app/data/sessions/conv-34")
+    if runtime.is_dir():
+        (runtime / "retest-adversarial-results.json").write_text(results)
+    print(f"results: {out}")
     return 1 if FAIL else 0
 
 

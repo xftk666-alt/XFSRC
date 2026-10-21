@@ -42,11 +42,8 @@ export default function LoginPage() {
 
   useEffect(() => {
     // 已登录直接进主界面（静态导出下无 middleware 代劳这层跳转）。
-    const token = auth.getToken();
-    if (token) {
-      // localStorage 可能仍有凭据但 cookie 已丢失。先同步，再发起全新请求，
-      // 避免服务端守卫或路由缓存把跳转送回仍处于 checking 状态的登录页。
-      auth.setToken(token);
+    // 会话凭据在 HttpOnly cookie 里，页面脚本读不到，只能看本地标记。
+    if (auth.hasSession()) {
       window.location.replace("/function/tasks");
       return;
     }
@@ -199,7 +196,9 @@ export default function LoginPage() {
                 第二条 · 授权使用范围
               </h4>
               <p className="pl-7">
-                本软件用于对<b>已获得明确授权</b>的目标开展漏洞挖掘与安全测试，包括但不限于 HackerOne、Intigriti、Bugcrowd 等漏洞赏金平台上的 in-scope 资产。使用前您应确认目标属于对应 program 的授权范围，并遵守其自动化限制、速率限制与带外（OOB）政策。
+                本软件用于对<b>已获得明确授权</b>的目标开展漏洞挖掘与安全测试，包括但不限于
+                HackerOne、Intigriti、Bugcrowd 等漏洞赏金平台上的 in-scope 资产。使用前您应确认目标属于对应 program
+                的授权范围，并遵守其自动化限制、速率限制与带外（OOB）政策。
               </p>
             </section>
 

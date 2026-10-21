@@ -78,7 +78,39 @@ func pathInt(r *http.Request, name string) (int64, bool) {
 	return n, err == nil
 }
 
-func decode(r *http.Request, v any) error { return json.NewDecoder(r.Body).Decode(v) }
+// maxJSONBodyBytes bounds every JSON request body. Without it the pre-auth
+// handlers (auth/init, auth/login) would decode an unbounded body into memory,
+// so a handful of concurrent requests could OOM the process.
+const maxJSONBodyBytes = 8 << 20 // 8 MiB
+
+func decode(r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(nil, r.Body, maxJSONBodyBytes)
+	return json.NewDecoder(r.Body).Decode(v)
+}
+
+// limitBody applies a default body cap to API requests that do not already wrap
+// their own reader. Upload routes set their own (larger) limits, so they are
+// exempt here.
+func limitBody(next http.Handler) http.Handler {
+	exempt := map[string]bool{
+		"/api/workspace/upload": true,
+		"/api/chat/upload":      true,
+		"/api/skills/upload":    true,
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil && !exempt[r.URL.Path] && r.Method != http.MethodGet && r.Method != http.MethodHead {
+			// Reject an oversized declared body up front so the caller gets a 413
+			// instead of a generic decode failure; the reader cap still covers
+			// chunked uploads that omit Content-Length.
+			if r.ContentLength > maxJSONBodyBytes {
+				writeErr(w, http.StatusRequestEntityTooLarge, "请求体过大")
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 // ---------- tasks (delete) ----------
 

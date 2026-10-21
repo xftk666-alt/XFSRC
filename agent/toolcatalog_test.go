@@ -33,9 +33,11 @@ func TestBuiltinToolSeeds(t *testing.T) {
 	if !ok || !hasWorker {
 		t.Errorf("record_fact agents = %v, want to include worker", rf.Agents)
 	}
-	// add_task_scope is bound to the planner (deliberate scope widening).
-	if ts, ok := byKey["add_task_scope"]; !ok || len(ts.Agents) == 0 {
-		t.Errorf("add_task_scope not seeded / has no agent binding: %v", ts.Agents)
+	// add_task_scope must NOT be bound to any agent: it writes a TRUSTED scope row,
+	// and the only role allowed to do that is the goal decomposer, which is wired
+	// dynamically (agent/goals.go) and never appears in the catalog.
+	if ts, ok := byKey["add_task_scope"]; ok && len(ts.Agents) > 0 {
+		t.Errorf("add_task_scope must not be seeded to any agent, got %v", ts.Agents)
 	}
 	// SDK generic tools (incl. sleep, now part of DefaultTools) are deliberately NOT
 	// seeded — every agent owns them; they flow through ToolResolve untouched.

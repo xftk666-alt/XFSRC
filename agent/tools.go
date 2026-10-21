@@ -2084,8 +2084,8 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.listAssets(),
 		// add_company_scope：规划时可把域名/IP/CIDR/ICP/关键词纳入某公司的资产范围（自动认领命中资产）。
 		t.addCompanyScope(),
-		// add_task_scope：主动把整根域/整公司/某子域/IP 纳入本任务测试范围(覆盖度分母)。
-		t.addTaskScope(),
+		// add_task_scope 刻意不给 planner：它是模型可驱动的扩权通道，只有目标拆解器
+		// （读操作员自己写的任务描述）能写可信范围，见 agent/tools_insert.go。
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
 	}

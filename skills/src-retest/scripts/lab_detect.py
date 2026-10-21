@@ -208,6 +208,20 @@ def classify_host(host: str) -> str | None:
                 return f"ip {h} 解析为 {shown}，属于非公网网段 {net}"
         return None
 
+    # 1b) 「私有 IP 前缀 + 域名后缀」的写法（172.18.0.3.evil.com）：真实 bounty
+    # 资产不会长这样，它是绕过 SSRF/范围过滤的常见伪装，按靶场处理。
+    labels = h.split(".")
+    if len(labels) > 4:
+        head = ".".join(labels[:4])
+        try:
+            ip = ipaddress.ip_address(head)
+        except ValueError:
+            ip = None
+        if ip is not None:
+            for net in _LAB_NETS:
+                if ip.version == net.version and ip in net:
+                    return f"host {h} 以非公网地址 {head} 开头（伪装/绕过写法）"
+
     # 2) 裸保留域名 / 其子域（example.com、app.example.com、foo.test.com 等）
     for bare in LAB_BARE_DOMAINS:
         if h == bare or h.endswith("." + bare):
@@ -284,9 +298,12 @@ def is_lab_text(text: str) -> bool:
 
 
 def is_lab(pack: dict) -> bool:
-    """向后兼容 retest_strict.is_lab(pack) 的签名。"""
+    """向后兼容 retest_strict.is_lab(pack) 的签名。
+
+    只看结构化 host（`url`/`host`/`domain` 字段），不对整个 JSON 做子串兜底：
+    SSRF 证据的 url 是 `https://real-host/fetch?url=http://127.0.0.1/...`，
+    子串兜底会把真实公网资产判成靶场，从而禁止提交（审计发现的误报）。
+    """
     if not isinstance(pack, dict):
         return is_lab_text(json.dumps(pack, ensure_ascii=False))
-    if is_lab_obj(pack):
-        return True
-    return is_lab_text(json.dumps(pack, ensure_ascii=False))
+    return is_lab_obj(pack)

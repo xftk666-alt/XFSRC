@@ -4,6 +4,14 @@ description: 多身份差分重放与证据工作台：把「A 能读 B 的数�
 ---
 # src-traffic-workbench — 差分重放与证据工作台
 
+## 合规红线（先读这条）
+
+- 只处理**已授权**资产：目标必须先在 `task_scope` 登记，且 `scope_check` 返回 in-scope。
+- 每个 program 的 `policy` 可能禁止自动化/限速/外部 OOB；按 policy 调整，不按习惯。
+- 拿不到 in-scope 结论时**不发请求**，先回 `src-roe-parser` 补范围。
+
+
+
 ## 要解决的问题
 
 SRC 报告被退回的头号原因不是「洞不存在」，是**「无法复现 / 证据不足」**。

@@ -73,7 +73,7 @@ func TestCreateCompanyWithScopeRejectsNormalizedDuplicate(t *testing.T) {
 	name := fmt.Sprintf("Strict Company %d", stamp)
 	id, added, _, _, validationErrors, err := cs.CreateCompanyWithScope(name, "", []ScopeInput{
 		{Kind: "domain", Value: fmt.Sprintf("strict-%d.example", stamp)},
-	}, "test")
+	}, "test", "manual")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestCreateCompanyWithScopeRejectsNormalizedDuplicate(t *testing.T) {
 		"",
 		[]ScopeInput{{Kind: "domain", Value: fmt.Sprintf("replacement-%d.example", stamp)}},
 		"test",
-	)
+		"manual")
 	if !errors.Is(err, ErrCompanyNameConflict) {
 		t.Fatalf("duplicate create error=%v want ErrCompanyNameConflict", err)
 	}
@@ -111,7 +111,7 @@ func TestCreateCompanyWithScopeRollsBackOnScopeWriteFailure(t *testing.T) {
 	name := fmt.Sprintf("Atomic Create %d", time.Now().UnixNano())
 	_, _, _, _, _, err = cs.CreateCompanyWithScope(name, "", []ScopeInput{
 		{Kind: "keyword", Value: "invalid\x00postgres-text"},
-	}, "test")
+	}, "test", "manual")
 	if err == nil {
 		t.Fatal("expected scope database write to fail")
 	}
@@ -140,7 +140,7 @@ func TestCompanyScope(t *testing.T) {
 	defer cleanupCompany(d, id)
 
 	lines := []string{"example.com", "192.168.1.0/24", "10.0.0.1"}
-	added, skipped, invalid, errs := cs.AddScope(id, lines, "test")
+	added, skipped, invalid, errs := cs.AddScope(id, lines, "test", "manual")
 	if added != 3 {
 		t.Errorf("want 3 added, got %d (errs: %v)", added, errs)
 	}
@@ -149,7 +149,7 @@ func TestCompanyScope(t *testing.T) {
 	}
 
 	// Adding again should skip (duplicate)
-	added2, skipped2, invalid2, _ := cs.AddScope(id, lines, "test")
+	added2, skipped2, invalid2, _ := cs.AddScope(id, lines, "test", "manual")
 	if added2 != 0 || skipped2 != 3 {
 		t.Errorf("want 0 added 3 skipped, got %d added %d skipped %d invalid", added2, skipped2, invalid2)
 	}
@@ -183,7 +183,7 @@ func TestCompanyScopeInvalid(t *testing.T) {
 		{Kind: "domain", Value: "com"},
 		{Kind: "cidr", Value: "1.2.3.4/8"},
 	}
-	added, _, invalid, _ := cs.AddScopeInputs(id, inputs, "test")
+	added, _, invalid, _ := cs.AddScopeInputs(id, inputs, "test", "manual")
 	if added != 0 {
 		t.Errorf("want 0 added for invalid lines, got %d", added)
 	}
@@ -206,7 +206,7 @@ func TestResolveCompany(t *testing.T) {
 	}
 	defer cleanupCompany(d, id)
 
-	cs.AddScope(id, []string{"resolve-test.io", "10.20.0.0/16"}, "test")
+	cs.AddScope(id, []string{"resolve-test.io", "10.20.0.0/16"}, "test", "manual")
 
 	// domain match
 	cid, err := cs.ResolveCompany("resolve-test.io", "")
@@ -247,10 +247,10 @@ func TestUpdateScope(t *testing.T) {
 	}
 	defer cleanupCompany(d, id)
 
-	cs.AddScope(id, []string{"old-domain.com"}, "initial")
+	cs.AddScope(id, []string{"old-domain.com"}, "initial", "manual")
 
 	// UpdateScope replaces
-	added, invalid, errs := cs.UpdateScope(id, []string{"new-domain.com"}, "replacement")
+	added, invalid, errs := cs.UpdateScope(id, []string{"new-domain.com"}, "replacement", "manual")
 	if added != 1 || invalid != 0 || len(errs) != 0 {
 		t.Errorf("UpdateScope: added=%d invalid=%d errs=%v", added, invalid, errs)
 	}
@@ -264,7 +264,7 @@ func TestUpdateScope(t *testing.T) {
 	// a destructive replacement of the existing rules.
 	added, invalid, validationErrors, err := cs.UpdateScopeInputsChecked(id, []ScopeInput{
 		{Kind: "domain", Value: "co.uk"},
-	}, "invalid replacement")
+	}, "invalid replacement", "manual")
 	var validationErr *CompanyScopeValidationError
 	if added != 0 || invalid != 1 || len(validationErrors) != 1 || !errors.As(err, &validationErr) {
 		t.Fatalf("invalid replacement: added=%d invalid=%d validation=%v err=%v", added, invalid, validationErrors, err)
@@ -293,14 +293,14 @@ func TestUpdateScopeRollsBackOnInsertFailure(t *testing.T) {
 	}
 	defer cleanupCompany(d, id)
 	oldDomain := fmt.Sprintf("old-%d.example", time.Now().UnixNano())
-	added, _, invalid, addErrors := cs.AddScopeInputs(id, []ScopeInput{{Kind: "domain", Value: oldDomain}}, "initial")
+	added, _, invalid, addErrors := cs.AddScopeInputs(id, []ScopeInput{{Kind: "domain", Value: oldDomain}}, "initial", "manual")
 	if added != 1 || invalid != 0 || len(addErrors) != 0 {
 		t.Fatalf("seed scope: added=%d invalid=%d errors=%v", added, invalid, addErrors)
 	}
 
 	added, invalid, updateErrors := cs.UpdateScopeInputs(id, []ScopeInput{
 		{Kind: "keyword", Value: "invalid\x00postgres-text"},
-	}, "replacement")
+	}, "replacement", "manual")
 	if added != 0 || invalid != 0 || len(updateErrors) == 0 {
 		t.Fatalf("failed update result: added=%d invalid=%d errors=%v", added, invalid, updateErrors)
 	}
@@ -325,7 +325,7 @@ func TestDeleteCompany(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cs.AddScope(id, []string{"deletetest.com"}, "test")
+	cs.AddScope(id, []string{"deletetest.com"}, "test", "manual")
 
 	if err := cs.DeleteCompany(id); err != nil {
 		t.Fatal(err)
@@ -419,7 +419,7 @@ func TestRecomputeAttribution(t *testing.T) {
 	}
 
 	// add scope and recompute
-	cs.AddScope(id, []string{"attr-test.com"}, "test")
+	cs.AddScope(id, []string{"attr-test.com"}, "test", "manual")
 	if err := cs.RecomputeAttribution(); err != nil {
 		t.Fatal(err)
 	}

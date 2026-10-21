@@ -46,22 +46,30 @@ jobs:
           fi
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ steps.version.outputs.tag }}
       - name: Pin release commit
         id: commit
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Refuse to release a commit that is not on local
+        # 标签可能打在任意提交上：只有位于 local 分支历史里的提交才是被审过的代码。
+        run: |
+          git fetch --no-tags --depth=1 origin local
+          if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+            echo "标签提交不在 origin/local 历史中，拒绝发布：$(git rev-parse --short HEAD)" >&2
+            exit 1
+          fi
 
   # ① 前端静态导出（一次），产物给各平台复用
   frontend:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.prepare.outputs.commit }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: npm
@@ -70,14 +78,48 @@ jobs:
         working-directory: web
       - run: npm run build:static
         working-directory: web
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: web-dist
           path: web/out
 
   # ② 五平台交叉编译（内嵌前端）+ 打 zip
+  # 发版前必须跑一遍与 CI 相同的测试：标签推送不会触发 ci.yml，
+  # 没有这道门就等于允许用从未通过 go vet / go test 的提交发版。
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: artex
+          POSTGRES_PASSWORD: artex
+          POSTGRES_DB: artex_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U artex -d artex_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      ARTEX_PG_DSN: postgres://artex:artex@127.0.0.1:5432/artex_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+      - uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test -p 1 -count=1 ./...
+
   binaries:
-    needs: [prepare, frontend]
+    needs: [prepare, frontend, test]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -88,14 +130,14 @@ jobs:
           - { goos: darwin, goarch: arm64 }
           - { goos: windows, goarch: amd64 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.prepare.outputs.commit }}
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
         with:
           go-version-file: go.mod
           cache: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: web-dist
           path: server/webui/dist
@@ -114,7 +156,7 @@ jobs:
       - name: Smoke test Linux amd64 binary
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: dist/artex-linux-amd64/artex -h
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
           path: "dist/*.zip"
@@ -130,7 +172,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: pkg-*
           merge-multiple: true
@@ -163,7 +205,7 @@ jobs:
             cat /tmp/rel.err >&2
             exit 1
           fi
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: "${{ needs.prepare.outputs.tag }} — XFSRC 本地修订"
@@ -175,7 +217,7 @@ jobs:
             dist/SHA256SUMS
           generate_release_notes: true
           body: |
-            基于上游 ARTEX **v0.3.22** 的本地修订（`local` 分支）。
+            基于上游 ARTEX **${{ needs.prepare.outputs.version }}** 的本地修订（`local` 分支）。
 
             > 面向**海外正规授权的 SRC 漏洞挖掘**：
             > [HackerOne](https://www.hackerone.com/) · [Intigriti](https://www.intigriti.com/) · [Bugcrowd](https://www.bugcrowd.com/)

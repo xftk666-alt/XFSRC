@@ -14,8 +14,13 @@ services:
       retries: 10
     restart: unless-stopped
 
-  artex:
-    image: ${ARTEX_IMAGE:-ruoji6/artex}:${ARTEX_TAG:-latest}
+  app:
+    # 本 fork 不发布公共镜像：从仓库 Dockerfile 本地构建。
+    # 绝不默认 fell back 到上游 ruji6/artex —— 那会把本 fork 的安全加固全部换掉。
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${XFSRC_IMAGE:-xfsrc}:${XFSRC_TAG:-latest}
     depends_on:
       postgres:
         condition: service_healthy
