@@ -2,6 +2,36 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## v0.3.23-fix3 — 修复 Windows 构建（fix2 未发布）
+
+**fix2 未能发布**：`release` workflow 的 `binaries (windows, amd64)` 任务失败，
+其余四个平台被连带取消，因此没有任何 Release 产物。原因是 fix2 引入的工作区加固用了
+两个只在 Unix 存在的符号：
+
+```
+server/workspace.go:398: undefined: syscall.O_NOFOLLOW
+server/workspace.go:143: undefined: syscall.Stat_t
+```
+
+本版把这两处拆成按平台编译的实现，行为不变：
+
+| 能力 | Unix | Windows |
+|---|---|---|
+| 拒绝多重硬链接 | `Stat_t.Nlink > 1` | `GetFileInformationByHandle` → `NumberOfLinks > 1` |
+| 不跟随符号链接写入 | `O_NOFOLLOW`（`ELOOP` 转成明确错误） | `FILE_FLAG_OPEN_REPARSE_POINT` |
+
+新增 `server/workspace_unix.go`、`server/workspace_windows.go`，`workspace.go` 只保留
+平台无关的调用。
+
+### 验证
+
+- 5 个发布目标全部交叉编译通过（`CGO_ENABLED=0`）：
+  `windows/amd64`、`darwin/amd64`、`darwin/arm64`、`linux/amd64`、`linux/arm64`
+- `./build.sh --target windows/amd64` 实际产出 PE32+ 可执行文件
+- `go vet ./...` 通过；`go test -p 1 ./...` 15 个包全绿
+
+除上述平台适配外，本版内容与 fix2 相同——见下节。
+
 ## v0.3.23-fix2 — 第二轮安全审计（74 项修复）
 
 **建议立即升级。** 本版修复了 4 个能被外部直接利用、或会让平台自己崩掉的问题，

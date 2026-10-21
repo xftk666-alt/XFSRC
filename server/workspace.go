@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"unicode/utf8"
 )
 
@@ -140,7 +139,7 @@ func checkWorkspaceFile(path string) error {
 	if !fi.Mode().IsRegular() {
 		return errNotRegularFile
 	}
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+	if hasMultipleLinks(path, fi) {
 		return errHardLinkedFile
 	}
 	return nil
@@ -393,13 +392,11 @@ func saveUpload(hdr *multipart.FileHeader, dest string) error {
 		return err
 	}
 	defer src.Close()
-	// O_NOFOLLOW: os.Create would follow a symlink the agent planted in the
-	// uploads directory, writing the uploaded bytes to that link's target.
-	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
+	// openNoFollow (per-platform): os.Create would follow a symlink the agent
+	// planted in the uploads directory, writing the uploaded bytes to that
+	// link's target.
+	out, err := openNoFollow(dest)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
-			return errNotRegularFile
-		}
 		return err
 	}
 	defer out.Close()
