@@ -77,8 +77,19 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 			}
 		}
 	}
-	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) >= 32 {
-		return []byte(strings.TrimSpace(string(data))), nil
+	// A key that exists but cannot be read or is too short is an error, not a
+	// reason to mint a new one: regenerating silently revokes every outstanding
+	// token, and two processes racing here would persist different keys.
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		key := strings.TrimSpace(string(data))
+		if len(key) < 32 {
+			return nil, fmt.Errorf("jwt key %s 过短（%d 字节），请检查文件完整性", path, len(key))
+		}
+		return []byte(key), nil
+	case !os.IsNotExist(err):
+		return nil, fmt.Errorf("读取 jwt key %s 失败: %w", path, err)
 	}
 	buf := make([]byte, 32)
 	for i := range buf {
@@ -359,17 +370,21 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "密码加密失败")
 		return
 	}
-	if err := pg.SetSetting(authPassKey, string(newHash)); err != nil {
-		writeErr(w, 500, "保存失败: "+err.Error())
-		return
-	}
-	// Revoke every token issued under the old password, then hand the caller a
-	// fresh one so the operator is not logged out of their own session.
+	// Revoke first, persist second. If the bump fails we return 500 with the old
+	// hash still in place, so the operator retries — whereas writing the new hash
+	// first left a changed password alongside still-valid old tokens when the
+	// bump failed (a leaked token kept working for its full 7-day life).
 	ver, err := s.bumpTokenVersion()
 	if err != nil {
 		writeErr(w, 500, "保存失败: "+err.Error())
 		return
 	}
+	if err := pg.SetSetting(authPassKey, string(newHash)); err != nil {
+		writeErr(w, 500, "保存失败: "+err.Error())
+		return
+	}
+	// Hand the caller a fresh token so the operator is not logged out of their
+	// own session.
 	tok, err := signJWT(s.jwtKey, ver)
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
@@ -380,9 +395,21 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /api/auth/logout — revokes every issued token by bumping the generation.
+//
+// This route lives under /api/auth/*, which requireAuth exempts, so it validates
+// the token itself. Without that check any reachable client — including a
+// cross-site form POST, which needs no preflight and cannot read the response —
+// could bump the generation and log the administrator out of every device, over
+// and over. The cookie is still cleared when the token is already invalid, so a
+// stale browser session can always be cleaned up.
 func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
+		return
+	}
+	if !verifyJWT(extractToken(r), s.jwtKey, s.tokenVersion()) {
+		clearAuthCookie(w, r)
+		writeErr(w, 401, "未授权")
 		return
 	}
 	if _, err := s.bumpTokenVersion(); err != nil {
@@ -408,15 +435,24 @@ func (s *Server) bumpTokenVersion() (int64, error) {
 	defer tx.Rollback() //nolint:errcheck
 	// Read-modify-write under the row lock so two concurrent bumps cannot both
 	// land on the same value (which would resurrect a revoked token).
+	//
+	// The FOR UPDATE must sit on a query that actually has a FROM clause. The
+	// previous form wrapped the read in a scalar subquery and put FOR UPDATE on
+	// the outer SELECT, which has no FROM — PostgreSQL then locked nothing, so
+	// concurrent bumps both read N and both wrote N+1 (verified: no blocking, and
+	// the value advanced once instead of twice). Seed the row first so the lock
+	// always has a tuple to take, then lock and bump it.
 	var cur int64
-	err = tx.QueryRow(`SELECT COALESCE((SELECT value::bigint FROM settings WHERE key=$1),0) FOR UPDATE`, authTokenVersionKey).Scan(&cur)
-	if err != nil {
+	if _, err = tx.Exec(`INSERT INTO settings(key, value) VALUES ($1, '0')
+ON CONFLICT (key) DO NOTHING`, authTokenVersionKey); err != nil {
+		return 0, err
+	}
+	if err = tx.QueryRow(`SELECT value::bigint FROM settings WHERE key=$1 FOR UPDATE`,
+		authTokenVersionKey).Scan(&cur); err != nil {
 		return 0, err
 	}
 	next := cur + 1
-	if _, err := tx.Exec(`
-INSERT INTO settings(key, value) VALUES ($1, $2)
-ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+	if _, err := tx.Exec(`UPDATE settings SET value=$2, updated_at=now() WHERE key=$1`,
 		authTokenVersionKey, strconv.FormatInt(next, 10)); err != nil {
 		return 0, err
 	}
@@ -451,6 +487,8 @@ func (s *Server) ensureSetupToken(dataDir string) {
 	}
 	hash, _, err := s.m.pg.GetSetting(authPassKey)
 	if err != nil {
+		// A transient read error must not regenerate the token: that would
+		// invalidate one already handed to the operator.
 		log.Printf("[auth] 读取密码状态失败，跳过 setup token 生成: %v", err)
 		return
 	}
@@ -458,8 +496,12 @@ func (s *Server) ensureSetupToken(dataDir string) {
 		_ = os.Remove(filepath.Join(dataDir, "setup-token"))
 		return
 	}
-	tok, _, err := s.m.pg.GetSetting(authSetupTokenKey)
-	if err != nil || strings.TrimSpace(tok) == "" {
+	tok, ok, err := s.m.pg.GetSetting(authSetupTokenKey)
+	if err != nil {
+		log.Printf("[auth] 读取 setup token 失败，保留现有令牌: %v", err)
+		return
+	}
+	if !ok || strings.TrimSpace(tok) == "" {
 		buf := make([]byte, 24)
 		for i := range buf {
 			n, rerr := rand.Int(rand.Reader, big.NewInt(int64(len(keyChars))))

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -1104,6 +1105,77 @@ func cleanStrs(in []string) []string {
 	return out
 }
 
+// yamlScalar renders s as a safe single-line YAML scalar.
+//
+// The frontmatter is built by string concatenation, so an unescaped newline in a
+// description could inject arbitrary keys — including `mcps:`, which decides
+// which MCP servers a skill unlocks, or a second `name:` that changes the skill's
+// identity. Plain values are emitted as-is so ordinary skills stay readable; only
+// values that could change the document's structure are quoted and escaped.
+func yamlScalar(s string) string {
+	if yamlPlainSafe(s) {
+		return s
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				fmt.Fprintf(&b, `\x%02x`, r)
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// yamlPlainSafe reports whether s can be written as a bare YAML scalar without
+// changing the document's meaning.
+func yamlPlainSafe(s string) bool {
+	if s == "" || strings.TrimSpace(s) != s {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	switch strings.ToLower(s) {
+	case "true", "false", "null", "yes", "no", "on", "off", "~":
+		return false
+	}
+	if _, err := strconv.ParseFloat(s, 64); err == nil {
+		return false
+	}
+	switch s[0] {
+	case '-', '?', ':', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>',
+		'\'', '"', '%', '@', '`':
+		return false
+	}
+	// "key: value" or a trailing colon would be read as a nested mapping.
+	if strings.Contains(s, ": ") || strings.HasSuffix(s, ":") {
+		return false
+	}
+	// " #" starts a comment.
+	if strings.Contains(s, " #") {
+		return false
+	}
+	return true
+}
+
 func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name          string   `json:"name"`
@@ -1140,17 +1212,21 @@ func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
 	//   Markdown body:    step-by-step instructions
 	var sb strings.Builder
 	sb.WriteString("---\n")
-	fmt.Fprintf(&sb, "name: %s\n", body.Name)
-	fmt.Fprintf(&sb, "description: %s\n", body.Description)
+	fmt.Fprintf(&sb, "name: %s\n", yamlScalar(body.Name))
+	fmt.Fprintf(&sb, "description: %s\n", yamlScalar(body.Description))
 	if body.License != "" {
-		fmt.Fprintf(&sb, "license: %s\n", body.License)
+		fmt.Fprintf(&sb, "license: %s\n", yamlScalar(body.License))
 	}
 	if body.Compatibility != "" {
-		fmt.Fprintf(&sb, "compatibility: %s\n", body.Compatibility)
+		fmt.Fprintf(&sb, "compatibility: %s\n", yamlScalar(body.Compatibility))
 	}
 	// mcps: MCP servers this skill unlocks on load (skill-gated deferred tools).
 	if mcps := cleanStrs(body.MCPs); len(mcps) > 0 {
-		fmt.Fprintf(&sb, "mcps: %s\n", strings.Join(mcps, ", "))
+		quoted := make([]string, len(mcps))
+		for i, m := range mcps {
+			quoted[i] = yamlScalar(m)
+		}
+		fmt.Fprintf(&sb, "mcps: %s\n", strings.Join(quoted, ", "))
 	}
 	sb.WriteString("---\n")
 	if strings.TrimSpace(body.Instructions) != "" {
@@ -1241,13 +1317,16 @@ func rewriteSkillFrontmatter(content []byte, mcps *[]string, description, licens
 		if val == nil {
 			return
 		}
+		// Quote the value: an unescaped newline would inject extra frontmatter
+		// keys (`mcps:`, or a second `name:`) the same way create does.
+		quoted := yamlScalar(strings.TrimSpace(*val))
 		for i, p := range pairs {
 			if p.k == key {
-				pairs[i].v = strings.TrimSpace(*val)
+				pairs[i].v = quoted
 				return
 			}
 		}
-		pairs = append(pairs, kv{key, strings.TrimSpace(*val)})
+		pairs = append(pairs, kv{key, quoted})
 	}
 	applyStr("description", description)
 	applyStr("license", license)
@@ -1263,7 +1342,11 @@ func rewriteSkillFrontmatter(content []byte, mcps *[]string, description, licens
 		}
 		pairs = filtered
 		if len(cleaned) > 0 {
-			pairs = append(pairs, kv{"mcps", strings.Join(cleaned, ", ")})
+			quoted := make([]string, len(cleaned))
+			for i, m := range cleaned {
+				quoted[i] = yamlScalar(m)
+			}
+			pairs = append(pairs, kv{"mcps", strings.Join(quoted, ", ")})
 		}
 	}
 	// Reconstruct
@@ -2013,6 +2096,53 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 // Supports OpenAI-format (GET /models) and Anthropic-format (GET /v1/models); for
 // Anthropic-compatible third parties (e.g. DeepSeek) whose model list lives only on
 // the OpenAI path, it falls back to the OpenAI endpoint at the stripped root.
+
+// validateProbeURL rejects destinations that must never receive a stored
+// credential: non-HTTP schemes, and cloud metadata endpoints.
+//
+// Loopback and private addresses are allowed on purpose — the documented
+// deployment points profiles at local LLM proxies — so the exfiltration guard is
+// the endpoint comparison in pgListModels, not a blanket private-range ban.
+func validateProbeURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("地址格式无效")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("仅支持 http/https 地址")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("地址缺少主机名")
+	}
+	if ip := net.ParseIP(host); ip != nil && isMetadataIP(ip) {
+		return fmt.Errorf("禁止访问云元数据地址")
+	}
+	switch strings.ToLower(host) {
+	case "metadata.google.internal", "metadata.goog":
+		return fmt.Errorf("禁止访问云元数据地址")
+	}
+	return nil
+}
+
+// isMetadataIP reports whether ip is a link-local or metadata address.
+func isMetadataIP(ip net.IP) bool {
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	return ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00:ec2::254"))
+}
+
+// sameEndpointHost reports whether two URLs point at the same host:port.
+func sameEndpointHost(a, b string) bool {
+	ua, errA := url.Parse(strings.TrimSpace(a))
+	ub, errB := url.Parse(strings.TrimSpace(b))
+	if errA != nil || errB != nil || ua.Host == "" || ub.Host == "" {
+		return false
+	}
+	return strings.EqualFold(ua.Host, ub.Host)
+}
+
 func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Provider  string `json:"provider"` // "openai" | "anthropic"
@@ -2025,10 +2155,27 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
+	// Validate the destination before attaching any credential to it. This
+	// handler used to GET an arbitrary caller-supplied URL with the profile's
+	// stored key in the Authorization header, which is both SSRF into the
+	// management network and a way to exfiltrate a saved secret.
+	if err := validateProbeURL(baseURL); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+
 	// Resolve API key: form input > profile stored key.
 	apiKey := strings.TrimSpace(req.APIKey)
 	if apiKey == "" && req.ProfileID != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+			// Only reuse the stored key when the request targets the host that
+			// profile was configured for. Otherwise a caller could point base_url
+			// at their own server and collect the key.
+			if !sameEndpointHost(p.BaseURL, baseURL) {
+				writeErr(w, 400, "base_url 与所选配置的主机不一致，请显式提供 API Key")
+				return
+			}
 			apiKey = p.APIKey
 		}
 	}
@@ -2037,7 +2184,6 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
 	provider := strings.TrimSpace(req.Provider)
 
 	// Candidate endpoints to try in order. Some Anthropic-compatible providers

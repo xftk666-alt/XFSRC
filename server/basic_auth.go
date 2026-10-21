@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -138,11 +139,27 @@ func (s *Server) requireBasicAuth(next http.Handler) http.Handler {
 			return
 		}
 		username, password, ok := r.BasicAuth()
-		if !ok || len(password) > maxPasswordBytes || username != cfg.Username ||
-			bcrypt.CompareHashAndPassword([]byte(cfg.PasswordHash), []byte(password)) != nil {
+		// Always run bcrypt, even for a wrong username, so the response time does
+		// not reveal whether the configured username exists. The username
+		// comparison itself is constant-time for the same reason.
+		passOK := ok && len(password) <= maxPasswordBytes &&
+			bcrypt.CompareHashAndPassword([]byte(cfg.PasswordHash), []byte(password)) == nil
+		userOK := subtle.ConstantTimeCompare([]byte(username), []byte(cfg.Username)) == 1
+		if !ok || !passOK || !userOK {
 			w.Header().Set("WWW-Authenticate", `Basic realm="XFSRC", charset="UTF-8"`)
 			writeErr(w, http.StatusUnauthorized, "请先完成 HTTP Basic Auth 验证")
 			return
+		}
+		// The gate had no throttle, so this path was an unthrottled password
+		// oracle that also burned a bcrypt hash per attempt. Reuse the admin
+		// login limiter, keyed by the same client identity.
+		client := loginClientKey(r)
+		if s.loginLimit != nil {
+			if allowed, wait := s.loginLimit.allow("basic:" + client); !allowed {
+				s.loginLimit.reject(w, wait)
+				return
+			}
+			s.loginLimit.reset("basic:" + client)
 		}
 		// Browser API requests already use Authorization: Bearer. A separate
 		// HttpOnly cookie keeps the gate satisfied without replacing that header.

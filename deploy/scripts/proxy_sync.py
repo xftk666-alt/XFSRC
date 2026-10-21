@@ -24,9 +24,16 @@ localnet 192.168.0.0/255.255.0.0
 
 
 def load_proxy():
+    """Return the configured global proxy, or None when it cannot be determined.
+
+    None and "" must stay distinct: "" means "no proxy configured" (scanners run
+    direct, which is a deliberate choice), while None means "could not read the
+    setting". Collapsing them meant a single database hiccup deleted the proxy
+    config, so every later nmap/naabu run went out on the host's real egress IP.
+    """
     dsn = os.environ.get("ARTEX_PG_DSN")
     if not dsn:
-        return ""
+        return None
     try:
         import psycopg2
         conn = psycopg2.connect(dsn)
@@ -38,11 +45,16 @@ def load_proxy():
         return (row[0] or "").strip() if row else ""
     except Exception as exc:
         print("[proxy_sync] db: %s" % exc, file=sys.stderr)
-        return ""
+        return None
 
 
 def main():
     raw = load_proxy()
+    if raw is None:
+        # Keep the existing config: guessing "direct" here would leak the real
+        # egress IP on every scan until the database comes back.
+        print("[proxy_sync] 读不到代理设置，保留现有配置并退出", file=sys.stderr)
+        return 2
     if not raw:
         try:
             os.remove(CONF)

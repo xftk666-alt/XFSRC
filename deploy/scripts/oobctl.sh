@@ -8,8 +8,28 @@
 #
 # 每个 gen 会话是独立的 correlation-id；同一轮测试请使用同一会话的域名。
 
-# 配置来自持久卷；OOB_SERVER 为空表示禁用外部 OOB。
-[ -f /app/data/oob/config.env ] && . /app/data/oob/config.env
+# 配置来自持久卷（agent 可写），绝不能 source 它：一行 `x=$(...)` 就是命令执行。
+# 只接受白名单 KEY=VALUE，与 retention.sh 的做法一致。
+OOB_SERVER=""
+OOB_TOKEN=""
+if [ -f /app/data/oob/config.env ]; then
+  while IFS='=' read -r key value; do
+    case "$key" in
+      OOB_SERVER|OOB_TOKEN)
+        value="${value%\r}"
+        value="${value#\"}"
+        value="${value%\"}"
+        case "$value" in
+          *\$*|*\`*) ;;                 # 命令替换一律拒绝
+          *) case "$key" in
+               OOB_SERVER) OOB_SERVER="$value" ;;
+               OOB_TOKEN)  OOB_TOKEN="$value" ;;
+             esac ;;
+        esac
+        ;;
+    esac
+  done < /app/data/oob/config.env
+fi
 SERVER="${OOB_SERVER:-}"
 TOKEN="${OOB_TOKEN:-}"
 if [ -z "$SERVER" ] || [ -z "$TOKEN" ]; then

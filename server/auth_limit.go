@@ -51,15 +51,43 @@ func (l *loginLimiter) allow(key string) (bool, time.Duration) {
 		return false, b.reset.Sub(now)
 	}
 	b.count++
-	// Opportunistic cleanup: keep the map from growing with spoofed sources.
-	if len(l.buckets) > 4096 {
-		for k, v := range l.buckets {
-			if now.After(v.reset) {
-				delete(l.buckets, k)
-			}
-		}
+	// Hard cap on the map. Expired-only cleanup is not enough: a caller can keep
+	// every bucket live for a full window (and, before the X-Forwarded-For fix,
+	// mint an unbounded number of distinct keys per second). When the cap is hit,
+	// evict the bucket that expires soonest — the attacker's newest bucket — so
+	// legitimate throttling state survives.
+	if len(l.buckets) > maxLoginBuckets {
+		l.evictSoonestLocked(now)
 	}
 	return true, 0
+}
+
+// maxLoginBuckets bounds the throttle map. Each entry is ~64 bytes, so this is a
+// few hundred KB worst case.
+const maxLoginBuckets = 8192
+
+// evictSoonestLocked drops expired buckets, and if that is not enough, the
+// soonest-expiring ones, until the map is back under the cap. Caller holds mu.
+func (l *loginLimiter) evictSoonestLocked(now time.Time) {
+	for k, v := range l.buckets {
+		if now.After(v.reset) {
+			delete(l.buckets, k)
+		}
+	}
+	for len(l.buckets) > maxLoginBuckets {
+		var victim string
+		var victimReset time.Time
+		first := true
+		for k, v := range l.buckets {
+			if first || v.reset.Before(victimReset) {
+				victim, victimReset, first = k, v.reset, false
+			}
+		}
+		if first {
+			return
+		}
+		delete(l.buckets, victim)
+	}
 }
 
 // reset clears a bucket after a successful login so the operator is not locked
@@ -89,13 +117,38 @@ func loginClientKey(r *http.Request) string {
 	return host
 }
 
-// forwardedClientIP returns the left-most address in X-Forwarded-For (the
-// original client), falling back to X-Real-IP.
+// forwardedClientIP returns the address our own proxy wrote into
+// X-Forwarded-For.
+//
+// nginx's documented `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`
+// APPENDS the peer it saw to whatever the client sent:
+//
+//	client sends:   X-Forwarded-For: 127.0.0.1
+//	nginx forwards: X-Forwarded-For: 127.0.0.1, 203.0.113.7
+//
+// Everything left of the last hop is client-controlled. Reading the left-most
+// entry (as this used to) let any caller claim to be 127.0.0.1, which skipped the
+// first-run setup token entirely and minted a fresh throttle bucket per request.
+// The right-most entry is the one our proxy appended, so that is the one used.
+//
+// Deployments should additionally overwrite rather than append
+// (`proxy_set_header X-Forwarded-For $remote_addr`), which makes the header
+// single-valued and immune to this class of confusion; see README.
 func forwardedClientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		first := strings.TrimSpace(strings.Split(xff, ",")[0])
-		if ip := net.ParseIP(first); ip != nil {
-			return ip.String()
+		parts := strings.Split(xff, ",")
+		// Walk from the right: only the nearest proxy's entry is trustworthy.
+		for i := len(parts) - 1; i >= 0; i-- {
+			v := strings.TrimSpace(parts[i])
+			if v == "" {
+				continue
+			}
+			if ip := net.ParseIP(v); ip != nil {
+				return ip.String()
+			}
+			// Right-most hop is not an IP: the header is malformed. Stop here
+			// rather than fall back to a client-controlled entry further left.
+			return ""
 		}
 	}
 	if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {

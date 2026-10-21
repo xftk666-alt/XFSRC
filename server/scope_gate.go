@@ -42,6 +42,14 @@ func scopeGateFor(pg *db.DB, taskID int64) guard.ScopeChecker {
 			return hosts, blockReason
 		}
 		hosts = append(hosts, fileHosts...)
+		// Targets can also live inside a script the call would run
+		// (`python3 /tmp/recon.py`). The tool prompt recommends exactly that for
+		// anything non-trivial, so leaving it unscanned made the gate optional.
+		scriptHosts, scriptReason := guard.ScriptHosts(ctx, tool, input)
+		if scriptReason != "" {
+			return append(hosts, scriptHosts...), scriptReason
+		}
+		hosts = append(hosts, scriptHosts...)
 		if len(hosts) == 0 {
 			return nil, ""
 		}

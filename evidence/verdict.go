@@ -67,7 +67,15 @@ func CanonicalJSON(v any) ([]byte, error) {
 	if err := enc.Encode(v); err != nil {
 		return nil, err
 	}
-	return []byte(strings.TrimSuffix(buf.String(), "\n")), nil
+	out := strings.TrimSuffix(buf.String(), "\n")
+	// encoding/json always escapes U+2028/U+2029 (a JS-safety rule), while
+	// Python's json.dumps with ensure_ascii=False leaves them literal. The
+	// signatures must agree byte for byte, so undo that escaping: a payload
+	// containing either character otherwise produced a different HMAC on each
+	// side and the Go verifier rejected a pack Python had legitimately sealed.
+	out = strings.ReplaceAll(out, `\u2028`, "\u2028")
+	out = strings.ReplaceAll(out, `\u2029`, "\u2029")
+	return []byte(out), nil
 }
 
 // LoadHMACKey reads the evidence signing key from the first readable candidate.

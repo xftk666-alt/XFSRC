@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -328,6 +330,48 @@ func ensureSchema(raw json.RawMessage) map[string]any {
 
 // ---------- command:渲染命令 → 复用 Bash 底层 run ----------
 
+// gateCustomExecution re-checks a custom tool's rendered command or script with
+// the same two gates a normal tool call goes through.
+//
+// Custom tools and MCP servers reach the shell through actool.NewBash().Call /
+// exec.Command rather than through the model's tool-call loop, so PreToolUse
+// never fires for them. Without this, an agent could install a tool (or a stdio
+// MCP server) and run anything — the authorization gate and every intercept rule
+// were skipped entirely.
+func (s *Server) gateCustomExecution(ctx context.Context, tool, subject string) error {
+	// Authorization scope.
+	taskID := intercept.TaskIDFromContext(ctx)
+	if taskID > 0 && s.m.pg != nil {
+		input, _ := json.Marshal(map[string]string{"command": subject})
+		blocked, reason := scopeGateFor(s.m.pg, taskID)(ctx, "Bash", input)
+		if len(blocked) > 0 || reason != "" {
+			if reason == "" {
+				reason = "目标不在本任务授权范围内：" + strings.Join(blocked, ", ")
+			}
+			return errors.New("平台安全管控阻止执行：" + reason)
+		}
+	}
+	// Intercept rules (destructive commands etc.).
+	if s.m.interceptor != nil && s.m.interceptor.IsToolEnabled("Bash") {
+		input, _ := json.Marshal(map[string]string{"command": subject})
+		if dec, matched := s.m.interceptor.Match("Bash", input); matched {
+			switch dec.Action {
+			case "deny":
+				msg := dec.Message
+				if msg == "" {
+					msg = "命中拦截规则"
+				}
+				return errors.New("平台安全管控阻止执行：" + msg)
+			case "ask":
+				if !s.m.interceptor.HandleAsk(ctx, intercept.ConvIDFromContext(ctx), dec, "Bash", input) {
+					return errors.New("平台安全管控阻止执行：人工审批未通过")
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, params map[string]any, tc *actool.ToolContext) (actool.Result, error) {
 	var spec commandExec
 	_ = json.Unmarshal(execRaw, &spec)
@@ -335,6 +379,9 @@ func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, pa
 		return actool.Errorf("command 为空"), nil
 	}
 	cmd := renderTemplate(spec.Command, params, shellQuote)
+	if err := s.gateCustomExecution(ctx, "Bash", cmd); err != nil {
+		return actool.Errorf(err.Error()), nil
+	}
 	// 复用 Bash 也在用的底层 run(经 Bash CoreTool.Call):自动继承安全 floor/超时/
 	// 代理 env/输出溢出。工具与 Bash 平级、共用底层,不经过 Bash 这个工具让模型调。
 	bashIn, _ := json.Marshal(map[string]any{"command": cmd})
@@ -357,6 +404,9 @@ func (s *Server) runScriptTool(ctx context.Context, key string, execRaw json.Raw
 	interp := s.pythonInterpreter()
 	if interp == "" {
 		return actool.Errorf("未配置且未检测到 python 解释器(在系统配置里设置)"), nil
+	}
+	if err := s.gateCustomExecution(ctx, "Bash", spec.Code); err != nil {
+		return actool.Errorf(err.Error()), nil
 	}
 	workDir := s.m.dir
 	var sessionEnv []string
@@ -408,9 +458,12 @@ func execPython(ctx context.Context, interp, key, code string, params map[string
 	out, err := c.CombinedOutput()
 	body := string(out)
 	if runCtx.Err() == context.DeadlineExceeded {
-		body += "\n... [超时终止] ..."
-	} else if err != nil {
-		body += "\n[exit: " + err.Error() + "]"
+		// A killed script is a failed call, not a successful one with a note:
+		// callers check IsError to decide whether the step worked.
+		return body + "\n... [超时终止] ...", fmt.Errorf("脚本执行超时")
+	}
+	if err != nil {
+		return body + "\n[exit: " + err.Error() + "]", fmt.Errorf("脚本执行失败: %w", err)
 	}
 	return body, nil
 }
@@ -471,8 +524,14 @@ func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
 		return nil
 	}
 	pu, err := url.Parse(proxyStr)
-	if err != nil {
-		return nil
+	if err != nil || pu.Host == "" {
+		// Returning nil here made runHTTPTool fall back to the default
+		// transport, i.e. a direct connection: a typo in the proxy URL silently
+		// bypassed both the recording proxy and the egress proxy. Signal the
+		// failure so the call errors out instead.
+		return &http.Transport{Proxy: func(*http.Request) (*url.URL, error) {
+			return nil, fmt.Errorf("代理地址无效: %q", proxyStr)
+		}}
 	}
 	tr := &http.Transport{Proxy: http.ProxyURL(pu)}
 	if caFile != "" {
@@ -495,11 +554,45 @@ func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''
 
 // renderTemplate replaces {name} placeholders with each param's rendered value.
 func renderTemplate(tmpl string, params map[string]any, quote func(string) string) string {
-	out := tmpl
-	for k, v := range params {
-		out = strings.ReplaceAll(out, "{"+k+"}", quote(valToStr(v)))
+	// Single pass, matching only `{identifier}` placeholders. Replacing key by key
+	// let a value that itself contains "{other}" be expanded again when "other"
+	// was processed later (map order made this nondeterministic), so a
+	// caller-supplied parameter could inject placeholders the template author
+	// never wrote. Scanning for identifier-shaped placeholders (rather than the
+	// next '}') also leaves JSON bodies alone: in `{"flag":"{flag}"}` the outer
+	// brace is followed by a quote, not an identifier.
+	var b strings.Builder
+	for i := 0; i < len(tmpl); {
+		if tmpl[i] != '{' {
+			b.WriteByte(tmpl[i])
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(tmpl) && isPlaceholderByte(tmpl[j]) {
+			j++
+		}
+		if j == i+1 || j >= len(tmpl) || tmpl[j] != '}' {
+			b.WriteByte(tmpl[i])
+			i++
+			continue
+		}
+		name := tmpl[i+1 : j]
+		v, ok := params[name]
+		if !ok {
+			b.WriteString(tmpl[i : j+1])
+			i = j + 1
+			continue
+		}
+		b.WriteString(quote(valToStr(v)))
+		i = j + 1
 	}
-	return out
+	return b.String()
+}
+
+// isPlaceholderByte reports whether c may appear in a `{name}` placeholder.
+func isPlaceholderByte(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 // valToStr renders a param value: scalars as-is, arrays/objects as compact JSON.

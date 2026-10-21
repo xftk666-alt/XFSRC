@@ -87,6 +87,11 @@ func normalizeHeaders(headers map[string]string) (map[string]string, error) {
 		if clean == "" || strings.ContainsAny(clean, "\r\n") {
 			return nil, fmt.Errorf("invalid HTTP header name %q", key)
 		}
+		// Values need the same check: a CRLF here injects extra headers on every
+		// request the client makes.
+		if strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("invalid HTTP header value for %q", key)
+		}
 		out[clean] = value
 	}
 	return out, nil
@@ -180,16 +185,33 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
 }
 
 func readSSEEndpoint(r *bufio.Reader, base string) (string, error) {
+	// Only an `event: endpoint` frame names the POST target. Treating any data:
+	// line as the endpoint let a server (or anything that can answer for it)
+	// rebind the message URL to an arbitrary host, and the configured
+	// Authorization header went with it.
+	event := ""
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
 			return "", fmt.Errorf("mcp sse endpoint: %w", err)
 		}
 		line = strings.TrimRight(line, "\r\n")
-		if !strings.HasPrefix(line, "data:") {
+		if line == "" {
+			event = "" // frame boundary
 			continue
 		}
-		candidate := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if name, ok := strings.CutPrefix(line, "event:"); ok {
+			event = strings.TrimSpace(name)
+			continue
+		}
+		data, ok := strings.CutPrefix(line, "data:")
+		if !ok {
+			continue
+		}
+		if event != "endpoint" {
+			continue
+		}
+		candidate := strings.TrimSpace(data)
 		if candidate == "" {
 			continue
 		}
@@ -197,14 +219,19 @@ func readSSEEndpoint(r *bufio.Reader, base string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("mcp sse endpoint URL: %w", err)
 		}
-		if !u.IsAbs() {
-			b, err := url.Parse(base)
-			if err != nil {
-				return "", err
-			}
-			candidate = b.ResolveReference(u).String()
+		b, err := url.Parse(base)
+		if err != nil {
+			return "", err
 		}
-		return candidate, nil
+		if !u.IsAbs() {
+			u = b.ResolveReference(u)
+		}
+		// The endpoint must stay on the host we connected to: forwarding the
+		// configured headers anywhere else is credential disclosure.
+		if u.Scheme != b.Scheme || u.Host != b.Host {
+			return "", fmt.Errorf("mcp sse endpoint 跨主机（%s → %s），已拒绝", b.Host, u.Host)
+		}
+		return u.String(), nil
 	}
 }
 
@@ -532,6 +559,7 @@ func (c *Client) legacyRoundTrip(ctx context.Context, body rpcRequest, expectRes
 
 // parseSSE reads an SSE stream and returns the first data frame that is a JSON-RPC
 // response matching wantID (server-to-client requests/notifications are skipped).
+// parseSSE joins multi-line `data:` fields with the newline the SSE spec requires.
 func parseSSE(r io.Reader, wantID int) (*rpcResponse, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -560,7 +588,13 @@ func parseSSE(r io.Reader, wantID int) (*rpcResponse, error) {
 			continue
 		}
 		if strings.HasPrefix(line, "data:") {
-			dataBuf.WriteString(strings.TrimSpace(line[len("data:"):]))
+			// The SSE spec joins successive data: fields with a newline. Gluing
+			// them without one produced invalid JSON for multi-line payloads, so
+			// the matching response was skipped.
+			if dataBuf.Len() > 0 {
+				dataBuf.WriteByte('\n')
+			}
+			dataBuf.WriteString(strings.TrimPrefix(line[len("data:"):], " "))
 		}
 	}
 	if resp, ok := flush(); ok {

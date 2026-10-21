@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"unicode/utf8"
 )
 
@@ -39,6 +41,9 @@ var wsSensitiveNames = map[string]bool{
 	".delete-staging": true,
 	".tools":          true,
 	"jwt.key":         true,
+	// Grants admin to any remote caller of /api/auth/init until first-run setup
+	// completes; it must not be readable through the file manager.
+	"setup-token": true,
 }
 
 func (s *Server) wsResolve(rel string) (string, bool) {
@@ -78,7 +83,11 @@ func (s *Server) wsResolve(rel string) (string, bool) {
 			if wsDeniedSegments(realBase, real) {
 				return "", false
 			}
-			return abs, true
+			// Return the RESOLVED path, not the lexical one. Callers reopen what
+			// they get back, so handing them `abs` left a window in which the
+			// agent could swap a validated symlink for one pointing elsewhere
+			// between the check and the open.
+			return real, true
 		}
 		// A path that exists but does not resolve is a dangling symlink (or a
 		// symlink loop). Writing through it would create a file at the link's
@@ -114,6 +123,33 @@ func wsDeniedSegments(base, target string) bool {
 	}
 	return false
 }
+
+// checkWorkspaceFile rejects paths that must never be opened through the file
+// manager: non-regular files (a FIFO in the shared dir would block the request
+// goroutine forever) and multiply-linked files (a hard link makes a runtime
+// secret reachable under an innocent name, since the denylist only looks at path
+// segments).
+func checkWorkspaceFile(path string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if fi.IsDir() {
+		return nil // directories are handled by the caller
+	}
+	if !fi.Mode().IsRegular() {
+		return errNotRegularFile
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+		return errHardLinkedFile
+	}
+	return nil
+}
+
+var (
+	errNotRegularFile = errors.New("不是普通文件，无法通过工作区访问")
+	errHardLinkedFile = errors.New("文件存在多个硬链接，无法通过工作区访问")
+)
 
 // wsRel renders an absolute path back as a workspace-relative path (forward slashes).
 func (s *Server) wsRel(abs string) string {
@@ -193,6 +229,10 @@ func (s *Server) wsRead(w http.ResponseWriter, r *http.Request) {
 	}
 	if fi.IsDir() {
 		writeErr(w, 400, "是目录，不能作为文件读取")
+		return
+	}
+	if err := checkWorkspaceFile(abs); err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
 	if fi.Size() > maxWorkspaceRead {
@@ -297,6 +337,10 @@ func (s *Server) wsDownload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "文件不存在")
 		return
 	}
+	if err := checkWorkspaceFile(abs); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	name := filepath.Base(abs)
 	// RFC 5987 filename* keeps non-ASCII names intact; plain filename is the fallback.
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+sanitizeFilename(name)+"\"; filename*=UTF-8''"+url.PathEscape(name))
@@ -349,8 +393,13 @@ func saveUpload(hdr *multipart.FileHeader, dest string) error {
 		return err
 	}
 	defer src.Close()
-	out, err := os.Create(dest)
+	// O_NOFOLLOW: os.Create would follow a symlink the agent planted in the
+	// uploads directory, writing the uploaded bytes to that link's target.
+	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
 	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return errNotRegularFile
+		}
 		return err
 	}
 	defer out.Close()

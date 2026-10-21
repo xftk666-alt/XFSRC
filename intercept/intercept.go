@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -62,6 +63,17 @@ func WithTaskContext(ctx context.Context, taskID, agentName string, emit func(db
 		ctx = context.WithValue(ctx, taskEmitCtxKey, emit)
 	}
 	return ctx
+}
+
+// TaskIDFromContext returns the numeric task id bound by WithTaskContext, or 0
+// when the call is not running inside a task.
+func TaskIDFromContext(ctx context.Context) int64 {
+	id, _ := taskInfoFromCtx(ctx)
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func taskInfoFromCtx(ctx context.Context) (taskID, agentName string) {
@@ -176,7 +188,13 @@ func (i *Interceptor) loadLocked() error {
 		if r.MatchType == "regex" {
 			re, err := regexp.Compile(r.Pattern)
 			if err != nil {
-				continue // skip rules with bad regex rather than crashing
+				// A rule whose pattern does not compile would never fire, so a
+				// typo in a deny rule silently removed a safety control. Keep the
+				// rule but make it fail closed: it now matches every call it is
+				// scoped to, which surfaces the misconfiguration instead of
+				// hiding it.
+				log.Printf("[intercept] 规则 %q 的正则无法编译，按始终匹配处理（fail-closed）：%v", r.Name, err)
+				re = regexp.MustCompile(`(?s).*`)
 			}
 			cr.re = re
 		}
@@ -195,7 +213,15 @@ func (i *Interceptor) loadLocked() error {
 	} else {
 		var names []string
 		if json.Unmarshal([]byte(val), &names) != nil {
-			i.enabledTools = map[string]bool{}
+			// Corrupt JSON previously cached an empty set, which disabled the
+			// whole intercept layer until someone repaired the setting. Fall
+			// back to the built-in defaults instead.
+			log.Printf("[intercept] intercept_enabled_tools 无法解析，回退内置默认列表")
+			m := make(map[string]bool, len(defaultEnabledTools))
+			for _, n := range defaultEnabledTools {
+				m[n] = true
+			}
+			i.enabledTools = m
 		} else {
 			m := make(map[string]bool, len(names))
 			for _, n := range names {
@@ -242,7 +268,16 @@ func (i *Interceptor) IsToolEnabled(name string) bool {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.enabledTools == nil {
-		_ = i.loadLocked()
+		if err := i.loadLocked(); err != nil {
+			// A failed load is not "no tools are gated": treating it that way
+			// skipped every rule (including the destructive-command denies) for
+			// as long as the DB stayed unhappy. Report the tool as gated so the
+			// caller proceeds to Match, which fails closed on the same error.
+			return true
+		}
+	}
+	if i.enabledTools == nil {
+		return true
 	}
 	return i.enabledTools[name]
 }
@@ -585,9 +620,20 @@ func judgeActionLabel(action string) string {
 // Match evaluates the rule list (priority DESC) against a tool call.
 // Returns (Decision, true) for the first matching enabled rule, or
 // (Decision{}, false) if no rule matches.
+//
+// A rule-load failure returns a deny decision rather than (false): callers treat
+// "not matched" as "nothing to enforce here" and fall through to the judge or to
+// allow, so a DB hiccup would have disabled every deny rule at once.
 func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	rules, err := i.rules()
-	if err != nil || len(rules) == 0 {
+	if err != nil {
+		log.Printf("[intercept] 规则加载失败，按 fail-closed 拦截 %s：%v", toolName, err)
+		return Decision{
+			Action:  "deny",
+			Message: "拦截规则加载失败（数据源不可用），已按 fail-closed 阻止执行",
+		}, true
+	}
+	if len(rules) == 0 {
 		return Decision{}, false
 	}
 	for _, r := range rules {

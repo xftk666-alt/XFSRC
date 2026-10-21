@@ -23,6 +23,28 @@ import (
 // hostTools, if set, returns runtime host tools (currently the traffic tools when
 // capture is on) to add to EVERY agent's base list — the DB tools table then
 // filters them per-agent binding. Empty/nil → no host tools this run (capture off).
+// privilegedToolKeys are host/orchestration/platform tools whose visibility is
+// decided per agent by the tools table. They must never be handed out as a
+// fallback, because that fallback bypasses per-agent binding.
+var privilegedToolKeys = func() map[string]bool {
+	m := map[string]bool{}
+	for _, k := range platformToolKeys {
+		m[k] = true
+	}
+	// Traffic capture tools.
+	for _, k := range []string{"traffic_search", "traffic_get", "traffic_blob"} {
+		m[k] = true
+	}
+	// Cross-task orchestration tools.
+	for _, k := range []string{
+		"spawn_task", "pause_task", "list_task_findings", "get_task_node_detail",
+		"get_task_graph", "list_task_assets", "add_hint", "read_task_hint",
+	} {
+		m[k] = true
+	}
+	return m
+}()
+
 func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.CoreTool, map[string][]string)) {
 	agent.ToolAugment = func(ctx context.Context, agentKey string) ([]actool.CoreTool, agent.DeferredInfo, func()) {
 		a, err := pg.GetAgentByKey(agentKey)
@@ -251,8 +273,20 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 	agent.ToolResolve = func(ctx context.Context, agentKey string, tools []actool.CoreTool) []actool.CoreTool {
 		rows, err := pg.ListTools()
 		if err != nil {
-			log.Printf("[tools] 读取工具表失败，按代码默认放行: %v", err)
-			return tools
+			// Returning `tools` here handed the agent the whole code-default list,
+			// which includes host tools (traffic, orchestration, platform tools
+			// such as create_mcp / delete_assets_by_host) that per-agent binding
+			// exists to withhold. Filter those out instead: a DB hiccup must not
+			// widen what an agent can call.
+			log.Printf("[tools] 读取工具表失败，仅保留基础工具（fail-closed）: %v", err)
+			kept := make([]actool.CoreTool, 0, len(tools))
+			for _, t := range tools {
+				if privilegedToolKeys[t.Name()] {
+					continue
+				}
+				kept = append(kept, t)
+			}
+			return kept
 		}
 		byKey := make(map[string]*db.Tool, len(rows))
 		for _, t := range rows {

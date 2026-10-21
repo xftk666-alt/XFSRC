@@ -2,7 +2,6 @@ package intercept
 
 import (
 	"encoding/json"
-	"io"
 	"strings"
 )
 
@@ -160,46 +159,84 @@ func stripCodeFence(text string) string {
 // Never extract a decision keyword from prose, arguments, or a broken JSON
 // reply. Invalid/incomplete responses follow the configured model-failure path.
 func ParseVerdict(text string) Verdict {
-	d := json.NewDecoder(strings.NewReader(stripCodeFence(text)))
-	if tok, err := d.Token(); err != nil || tok != json.Delim('{') {
+	dec := json.NewDecoder(strings.NewReader(stripCodeFence(text)))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return Verdict{}
 	}
-	fields := map[string]string{}
-	for d.More() {
-		tok, err := d.Token()
+	// Read the object key by key so duplicate `decision` keys are detectable
+	// (a plain map would silently keep the last one, which is ambiguous).
+	// Unknown keys are ignored rather than rejected: a model that adds
+	// `confidence` still gave an unambiguous verdict.
+	seen := map[string]bool{}
+	var action, reason string
+	for dec.More() {
+		tok, err := dec.Token()
 		if err != nil {
 			return Verdict{}
 		}
 		key, ok := tok.(string)
-		if _, duplicate := fields[key]; !ok || duplicate || (key != "decision" && key != "comment") {
+		if !ok || seen[key] {
 			return Verdict{}
 		}
+		seen[key] = true
 		var value *string
-		if d.Decode(&value) != nil || value == nil {
+		if err := dec.Decode(&value); err != nil {
 			return Verdict{}
 		}
-		fields[key] = *value
+		switch key {
+		case "decision":
+			if value == nil {
+				return Verdict{}
+			}
+			action = *value
+		case "comment":
+			if value != nil {
+				reason = strings.TrimSpace(*value)
+			}
+		}
 	}
-	if tok, err := d.Token(); err != nil || tok != json.Delim('}') {
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
 		return Verdict{}
 	}
-	if _, err := d.Token(); err != io.EOF || len(fields) != 2 {
-		return Verdict{}
+	// Anything after the object (trailing prose) is ignored: the verdict itself is
+	// already unambiguous. A second JSON object is not — that is two verdicts.
+	body := stripCodeFence(text)
+	if off := dec.InputOffset(); off > 0 && off <= int64(len(body)) {
+		if rest := strings.TrimSpace(body[off:]); strings.HasPrefix(rest, "{") {
+			return Verdict{}
+		}
 	}
-	action, reason := fields["decision"], strings.TrimSpace(fields["comment"])
 	if action != "allow" && action != "ask" && action != "deny" {
 		return Verdict{}
 	}
-	if len(reason) > 2400 || !strings.HasPrefix(reason, "实际操作：") {
-		return Verdict{}
+	if len(reason) > maxVerdictCommentBytes {
+		return Verdict{} // unbounded explanations are refused, not truncated
 	}
-	operation, rest, ok := strings.Cut(strings.TrimPrefix(reason, "实际操作："), "；成功后的后果：")
-	if !ok || strings.TrimSpace(operation) == "" {
-		return Verdict{}
-	}
-	consequence, rule, ok := strings.Cut(rest, "；命中规则：")
-	if !ok || strings.TrimSpace(consequence) == "" || strings.TrimSpace(rule) == "" {
-		return Verdict{}
+	if !completeExplanation(reason) {
+		// A deny/ask with a sloppy explanation is still the safe direction, so it
+		// is honored: discarding it sent the caller to its model-failure action,
+		// which is `allow` by default. An `allow` without a well-formed
+		// justification is refused instead — that is the permissive direction.
+		if action == "allow" {
+			return Verdict{}
+		}
+		return Verdict{Action: action, Reason: reason}
 	}
 	return Verdict{Action: action, Reason: reason}
 }
+
+// completeExplanation reports whether reason has the three required clauses.
+func completeExplanation(reason string) bool {
+	if !strings.HasPrefix(reason, "实际操作：") {
+		return false
+	}
+	operation, rest, ok := strings.Cut(strings.TrimPrefix(reason, "实际操作："), "；成功后的后果：")
+	if !ok || strings.TrimSpace(operation) == "" {
+		return false
+	}
+	consequence, rule, ok := strings.Cut(rest, "；命中规则：")
+	return ok && strings.TrimSpace(consequence) != "" && strings.TrimSpace(rule) != ""
+}
+
+// maxVerdictCommentBytes bounds a model-supplied explanation.
+const maxVerdictCommentBytes = 2400

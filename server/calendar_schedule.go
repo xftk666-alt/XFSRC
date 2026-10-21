@@ -28,10 +28,22 @@ func scheduleLocation(mode string) *time.Location {
 	return loc
 }
 
+// scheduleClock parses "HH:MM" (and "24:00") into a time on day. It never
+// panics: a malformed stored value (legacy row, bad import) is treated as
+// midnight, matching the old Atoi behaviour without the index out of range.
 func scheduleClock(day time.Time, clock string, loc *time.Location) time.Time {
-	parts := strings.Split(clock, ":")
-	h, _ := strconv.Atoi(parts[0])
-	m, _ := strconv.Atoi(parts[1])
+	h, m := 0, 0
+	if left, right, ok := strings.Cut(strings.TrimSpace(clock), ":"); ok {
+		if v, err := strconv.Atoi(left); err == nil {
+			h = v
+		}
+		if v, err := strconv.Atoi(right); err == nil {
+			m = v
+		}
+	}
+	if h < 0 || h > 24 || m < 0 || m > 59 {
+		h, m = 0, 0
+	}
 	return time.Date(day.Year(), day.Month(), day.Day(), h, m, 0, 0, loc)
 }
 
@@ -70,6 +82,12 @@ func evaluateScheduleWindow(s *db.TaskSchedule, now time.Time) scheduleWindow {
 				endClock = "24:00"
 			}
 			endValue := scheduleClock(endDay, endClock, loc)
+			// A window that ends before it starts crosses midnight (22:00 → 02:00),
+			// so the end belongs to the following day. Computing it straight on
+			// endDay marked such a window complete the moment it opened.
+			if !endValue.After(start) {
+				endValue = scheduleClock(endDay.AddDate(0, 0, 1), endClock, loc)
+			}
 			end = &endValue
 		} else {
 			start, end = windowBounds(day, s, loc)

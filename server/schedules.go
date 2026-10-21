@@ -100,10 +100,10 @@ func decodeSchedule(r *http.Request) (scheduleRequest, error) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return req, fmt.Errorf("bad json: %w", err)
 	}
-	if req.Enabled == nil {
-		v := true
-		req.Enabled = &v
-	}
+	// Enabled stays nil when the field is absent. Defaulting it to true here ran
+	// for updates too, so a PATCH that omitted `enabled` silently re-enabled a
+	// schedule the operator had paused; scheduleInput's "keep the existing value"
+	// branch was unreachable. The default is applied on create instead.
 	return req, nil
 }
 
@@ -112,6 +112,10 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	if req.Enabled == nil {
+		v := true
+		req.Enabled = &v
 	}
 	item, err := s.m.pg.CreateTaskSchedule(s.scheduleInput(req, nil))
 	if err != nil {

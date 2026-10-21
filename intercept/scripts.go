@@ -106,6 +106,12 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 	for _, stmt := range tree.Stmts {
 		markStraightLine(stmt)
 	}
+	// A `cd` inside a conditional, loop or function body may never run, and its
+	// effect on later statements is not knowable statically. When the script
+	// contains any such construct, the tracked directory is treated as unknown
+	// rather than followed — `if false; then cd /tmp; fi; python3 run.py` used to
+	// resolve run.py under /tmp even though the shell never changed directory.
+	cdUnreliable := hasConditionalControl(tree)
 	constants := shellConstants(tree, topStatements)
 	allowSed := staticSedCommandUnshadowed(tree)
 	sedAnalysisRemaining, envAnalysisRemaining := 8192, 8192
@@ -212,6 +218,14 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 					delete(generated, path)
 				}
 			}
+			// A `cd` that is not on the straight-line path (`if …; then cd …`,
+			// inside a loop, or in a function body) may never run. Following it
+			// made the analyzer resolve later relative scripts under a directory
+			// the shell never entered.
+			if cdUnreliable && !topStatements[stmt] {
+				dir = "" // unknown: cannot prove which directory later statements see
+				return true
+			}
 			if len(args) == 2 {
 				path, known := staticWord(args[1])
 				if known && path != "-" {
@@ -275,6 +289,16 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 						}
 					} else if shell {
 						refs = append(refs, scriptReference{problem: "Shell 内联执行缺少命令内容"})
+					} else if i+1 < len(args) {
+						// `python3 -c "…"`, `node -e "…"`: the inline text itself is
+						// already part of ReviewInput.Arguments, so the judge sees it
+						// without a separate script entry. Only flag it when the text
+						// cannot be resolved statically.
+						if _, known := staticWord(args[i+1]); !known {
+							refs = append(refs, scriptReference{problem: "内联执行内容无法静态解析"})
+						}
+					} else {
+						refs = append(refs, scriptReference{problem: "内联执行缺少代码内容"})
 					}
 					return true
 				}
@@ -336,6 +360,8 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 					add(r.Word, false)
 					return true
 				}
+				// The heredoc body is part of ReviewInput.Arguments, so the judge
+				// already sees it; a separate script entry would only duplicate it.
 				if r.Hdoc != nil || r.Op == syntax.Hdoc || r.Op == syntax.DashHdoc || r.Op == syntax.WordHdoc {
 					return true
 				}
@@ -352,12 +378,40 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 	})
 	return refs
 }
+
+// hasConditionalControl reports whether the tree contains constructs that may
+// skip or repeat statements, making working-directory tracking unsound.
+func hasConditionalControl(tree *syntax.File) bool {
+	found := false
+	syntax.Walk(tree, func(node syntax.Node) bool {
+		if found {
+			return false
+		}
+		switch node.(type) {
+		case *syntax.IfClause, *syntax.ForClause, *syntax.WhileClause,
+			*syntax.CaseClause, *syntax.FuncDecl, *syntax.Subshell, *syntax.Block:
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
 func knownScriptExtension(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".sh", ".bash", ".zsh", ".fish", ".py", ".py3", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".rb", ".pl", ".php", ".ps1", ".lua":
 		return true
 	}
 	return false
+}
+
+// CaptureScripts returns the script bodies a tool call would execute, plus a
+// completeness status. Exported so the authorization gate can scan the same
+// bodies for network targets: a gate that only reads the command line is blind
+// to `python3 /tmp/recon.py`.
+func CaptureScripts(workingDir, tool string, arguments json.RawMessage) ([]ReviewScript, string) {
+	return captureScripts(workingDir, tool, arguments)
 }
 
 func captureScripts(workingDir, tool string, arguments json.RawMessage) ([]ReviewScript, string) {

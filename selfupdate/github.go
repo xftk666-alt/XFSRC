@@ -29,6 +29,13 @@ var allowedHosts = map[string]bool{
 	"raw.githubusercontent.com":            true,
 }
 
+// AllowedHost reports whether host may be contacted (and may receive the update
+// token). Exported so the token-injecting transport can apply the same allowlist
+// that the redirect check uses.
+func AllowedHost(host string) bool {
+	return allowedHosts[strings.ToLower(host)]
+}
+
 // Release 是 GitHub Release 里我们关心的字段。
 type Release struct {
 	TagName     string    `json:"tag_name"`

@@ -28,18 +28,21 @@ for f in retest_strict.py evidence_seal.py hunter_card.py submit_brief.py http_e
   fi
 done
 
-# 3) HMAC key / recorder token: persistent copy wins; seed runtime if missing.
-if [ -f "$DATA/.hmac-key" ]; then
+# 3) HMAC key / recorder token live in the runtime tree ONLY.
+#
+# They used to be mirrored into /app/data/evidence as well. /app/data is the
+# agent's working directory — reachable by its Bash and by the workspace file
+# manager — so a copy there put the evidence signing key within arm's reach of
+# the code it is supposed to constrain. Seed the runtime copy from any existing
+# data-dir copy once (migration), then delete the data-dir copy.
+if [ -f "$DATA/.hmac-key" ] && [ ! -f "$DST/.evidence-hmac-key" ]; then
   cp -f "$DATA/.hmac-key" "$DST/.evidence-hmac-key"
-elif [ -f "$DST/.evidence-hmac-key" ]; then
-  cp -f "$DST/.evidence-hmac-key" "$DATA/.hmac-key"
 fi
-if [ -f "$DATA/.recorder-token" ]; then
+if [ -f "$DATA/.recorder-token" ] && [ ! -f "$DST/.recorder-token" ]; then
   cp -f "$DATA/.recorder-token" "$DST/.recorder-token"
-elif [ -f "$DST/.recorder-token" ]; then
-  cp -f "$DST/.recorder-token" "$DATA/.recorder-token"
 fi
-chmod 600 "$DATA/.hmac-key" "$DATA/.recorder-token" "$DST/.evidence-hmac-key" "$DST/.recorder-token" 2>/dev/null || true
+rm -f "$DATA/.hmac-key" "$DATA/.recorder-token" 2>/dev/null || true
+chmod 400 "$DST/.evidence-hmac-key" "$DST/.recorder-token" 2>/dev/null || true
 chmod +x "$DST"/*.sh "$DST"/*.py "$DST"/srctools/*.sh 2>/dev/null || true
 
 # 4) Hide the evidence directory from the HTTP workspace browser by removing
