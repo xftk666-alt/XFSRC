@@ -2,18 +2,18 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## v0.3.23-fix3 — 修复 Windows 构建（fix2 未发布）
+## v0.3.23-fix3 — 第二轮安全审计（74 项修复）
 
-**fix2 未能发布**：`release` workflow 的 `binaries (windows, amd64)` 任务失败，
-其余四个平台被连带取消，因此没有任何 Release 产物。原因是 fix2 引入的工作区加固用了
-两个只在 Unix 存在的符号：
+**建议立即升级。** 本版交付第二轮安全审计的全部修复：**6 Critical / 47 High /
+18 Medium / 3 Low，共 74 项**。其中 4 项能被外部直接利用、或会让平台自己崩掉，
+2 项在 SRC 场景下是封号级风险。
 
-```
-server/workspace.go:398: undefined: syscall.O_NOFOLLOW
-server/workspace.go:143: undefined: syscall.Stat_t
-```
+> **版本说明**：原本计划以 `v0.3.23-fix2` 发布，但那次 CI 的
+> `binaries (windows, amd64)` 失败（工作区加固用了 `syscall.O_NOFOLLOW` /
+> `syscall.Stat_t` 两个 Unix 专有符号），其余四个平台被连带取消，未产出任何 Release。
+> 本版修掉平台适配问题，内容与 fix2 完全一致。
 
-本版把这两处拆成按平台编译的实现，行为不变：
+### 本版修掉的构建问题
 
 | 能力 | Unix | Windows |
 |---|---|---|
@@ -21,25 +21,7 @@ server/workspace.go:143: undefined: syscall.Stat_t
 | 不跟随符号链接写入 | `O_NOFOLLOW`（`ELOOP` 转成明确错误） | `FILE_FLAG_OPEN_REPARSE_POINT` |
 
 新增 `server/workspace_unix.go`、`server/workspace_windows.go`，`workspace.go` 只保留
-平台无关的调用。
-
-### 验证
-
-- 5 个发布目标全部交叉编译通过（`CGO_ENABLED=0`）：
-  `windows/amd64`、`darwin/amd64`、`darwin/arm64`、`linux/amd64`、`linux/arm64`
-- `./build.sh --target windows/amd64` 实际产出 PE32+ 可执行文件
-- `go vet ./...` 通过；`go test -p 1 ./...` 15 个包全绿
-
-除上述平台适配外，本版内容与 fix2 相同——见下节。
-
-## v0.3.23-fix2 — 第二轮安全审计（74 项修复）
-
-**建议立即升级。** 本版修复了 4 个能被外部直接利用、或会让平台自己崩掉的问题，
-其中两个在 SRC 场景下是封号级风险。
-
-审计方式：OCR 全文件扫描（86 文件 / 275 条意见）+ 人工逐行审 `skills/src-retest`
-与 `deploy/scripts`。核实出 **74 项**（6 Critical / 47 High / 18 Medium / 3 Low），
-本版全部修复。每条 Critical 都有可执行 PoC，修复前后各验证一次。
+平台无关的调用。5 个发布目标全部交叉编译通过（`CGO_ENABLED=0`）。
 
 ### 为什么必须升级
 
@@ -158,6 +140,18 @@ server/workspace.go:143: undefined: syscall.Stat_t
 4. **反代配置建议**：把 nginx 的 `proxy_set_header X-Forwarded-For
    $proxy_add_x_forwarded_for;` 改成 `$remote_addr`。代码已能正确处理两种写法，
    但覆盖式配置让这层信任关系更明确。
+
+## v0.3.23-fix2 — 未发布（构建失败，内容并入 fix3）
+
+CI 的 `binaries (windows, amd64)` 失败：
+
+```
+server/workspace.go:398: undefined: syscall.O_NOFOLLOW
+server/workspace.go:143: undefined: syscall.Stat_t
+```
+
+其余四个平台被 matrix 连带取消，未产出 Release。修复后的同一批改动以
+**`v0.3.23-fix3`** 发布，详见上一节。
 
 ## v0.3.23-fix1 — 同步上游 v0.3.23 + 安全加固（审计发现逐条修复）
 

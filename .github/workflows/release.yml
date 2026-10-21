@@ -204,6 +204,22 @@ jobs:
           if [ ! -s /tmp/notes.md ]; then
             echo "::warning::CHANGELOG.md 中没有 v${version} 章节，发布说明将只包含变更链接"
             printf '> ⚠️ 本次发布未在 CHANGELOG.md 中找到 `v%s` 章节，请补充后再编辑 Release。\n\n' "$version" > /tmp/notes.md
+          else
+            # The extracted section is the WHOLE release note for this version, so it
+            # must be self-contained. A "见下节" / "见上一节" pointer is a dangling
+            # reference: the reader has no way to follow it from the Release page.
+            # (v0.3.23-fix3 shipped this way and its auto-generated note described
+            # only the Windows build fix, not the 74 security fixes it delivered.)
+            if grep -qE '见下节|见上一节|see below|see above|详见下' /tmp/notes.md; then
+              echo "::error::CHANGELOG 的 v${version} 章节含有指向别节的引用（见下节/见上一节）。发布说明只截取本节，引用会失效——请把被引用的内容并入本节。"
+              exit 1
+            fi
+            # A note that only says "nothing changed except X" is not a release note.
+            lines=$(grep -c '[^[:space:]]' /tmp/notes.md || true)
+            if [ "$lines" -lt 10 ]; then
+              echo "::error::CHANGELOG 的 v${version} 章节只有 ${lines} 行非空内容，太短，无法说明本版改了什么。"
+              exit 1
+            fi
           fi
           {
             echo "基于上游 ARTEX **${{ needs.prepare.outputs.base }}** 的本地修订（\`local\` 分支）。"
