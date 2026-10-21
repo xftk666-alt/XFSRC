@@ -2,12 +2,23 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## v0.3.23-fix2 — 第二轮安全审计修复（74 项发现）
+## v0.3.23-fix2 — 第二轮安全审计（74 项修复）
 
-对 `local` 分支做了一次完整审计（OCR 全文件扫描 86 文件 / 275 条意见 + 人工逐行审
-`skills/src-retest` 与 `deploy/scripts`），核实出 74 项问题（6 Critical / 47 High /
-18 Medium / 3 Low），本版全部修复。每条 Critical 都有可执行 PoC 验证修复前可复现、
-修复后失效。
+**建议立即升级。** 本版修复了 4 个能被外部直接利用、或会让平台自己崩掉的问题，
+其中两个在 SRC 场景下是封号级风险。
+
+审计方式：OCR 全文件扫描（86 文件 / 275 条意见）+ 人工逐行审 `skills/src-retest`
+与 `deploy/scripts`。核实出 **74 项**（6 Critical / 47 High / 18 Medium / 3 Low），
+本版全部修复。每条 Critical 都有可执行 PoC，修复前后各验证一次。
+
+### 为什么必须升级
+
+| 问题 | 修复前会发生什么 |
+|---|---|
+| **证据链可伪造** | Agent 能读到证据签名密钥，凭空造一份「已复现漏洞」并通过官方闸门（实测输出 `verdict_allowed: reproduced`）。交到 HackerOne 等于伪造证据。 |
+| **远程接管全新实例** | 只需一个请求头 `X-Forwarded-For: 127.0.0.1` 就能跳过首启初始化令牌，把管理员密码设成自己的。 |
+| **开一次日志页就崩溃** | 日志页开关与后台打日志并发时触发 `send on closed channel`，panic 在 `log.Printf` 内部，无 recover，进程直接退出（实测 46ms 复现）。 |
+| **带端口的网址全被拦** | `https://host:8443` 会多解析出一个 `com` 目标，判定越权。操作员会误以为范围没配好，进而把授权闸关掉。 |
 
 ### Critical
 
@@ -26,8 +37,8 @@
   再 `SELECT ... FOR UPDATE`（实测第二个事务由 47ms 变为阻塞 3053ms）。
 - **带端口的 URL 多提取一个 TLD → 合法请求被拦**（`guard/scope.go`）：单标签
   `host:port` 正则在原始文本上扫描，`api.example.com:8443` 额外匹配出 `com:8443`，
-  而 `com` 永远不在 `task_scope` 里。所有显式带端口的请求因此被判定越权 —— 操作员会
-  误以为范围没配好，进而关掉授权闸。改为检查匹配前的字节不属于主机名。
+  而 `com` 永远不在 `task_scope` 里。所有显式带端口的请求因此被判定越权。改为检查
+  匹配前的字节不属于主机名。
 - **`staticScriptPreparation` 接受不安全前置语句**（`intercept/shell_static.go`）：
   只检查 `Background`，不看 `Negated` / `Redirs`，也跳过带 `Args` 的 `Assigns`。
   `! cd /tmp`、`cd /tmp >"$(id)"`、`X=$(id) cd /tmp` 都被当成「目录已切换」，导致静态
@@ -50,10 +61,10 @@
 - **自定义工具 / MCP 绕过 hook**（新增 `Server.gateCustomExecution`）：`runCommandTool`
   与 `runScriptTool` 走 `actool.NewBash().Call` / `exec.Command`，不经过 PreToolUse，
   于是授权闸与拦截规则全被跳过。执行前重跑同一套检查。
-- 密钥移出 agent 可达范围：证据 HMAC 密钥与记录器令牌不再镜像到 `/app/data`
+- **证据密钥移出 agent 可达范围**：HMAC 密钥与记录器令牌不再镜像到 `/app/data`
   （agent 的工作目录），`restore_to_runtime.sh` 只保留运行时树并删除数据目录副本；
-  `evidence_seal.py` 优先读运行时路径；新增内置拦截规则
-  「读取平台签名密钥」覆盖 `.hmac-key` / `.recorder-token` / `setup-token` / `jwt.key`。
+  `evidence_seal.py` 优先读运行时路径；新增内置拦截规则「读取平台签名密钥」覆盖
+  `.hmac-key` / `.recorder-token` / `setup-token` / `jwt.key`。
 - `server/workspace.go`：硬链接绕过（`ln .hmac-key innocent.txt` 后经 Web 可读）——
   拒绝 `Nlink > 1`；FIFO/设备节点拒绝；`wsResolve` 返回**解析后**路径而非词法路径
   （TOCTOU）；上传用 `O_NOFOLLOW` 且 `Lstat` 判占用。
@@ -93,10 +104,30 @@
   `env["NODE_EXTRA_CA_CERTS"]` 处 panic）；`trafficOn` 在代理启动前加锁写入。
 - `server/basic_auth.go`：恒定时间比较用户名、始终执行 bcrypt、复用登录限流。
 - `server/assets.go`：资产增删加 2 MiB body 与 2000 条批量上限。
+- `server/auth_limit.go`：登录限流桶加硬上限（8192）并按最早过期淘汰。
+- `server/task_llm.go`：`agentsForTask` 的 bundle 缓存只按 task id 命中，Guard 被替换后
+  仍用旧 hooks。现在命中缓存时重新绑定 guard。
 - `db/notification.go`：没有启用渠道时不再把事件标记为已分派（否则期间的漏洞通知
-  永久丢失）；`evidence.CanonicalJSON` 与 Python 对 U+2028/U+2029 对齐。
-- `server/finding_cases.go`、`server/auth_limit.go`：登录限流桶加硬上限并按最早过期淘汰。
+  永久丢失）。
+- `db/db.go`：新增内置拦截规则「读取平台签名密钥」（`intercept_default_rules_v4`）。
+- `evidence/verdict.go`：`CanonicalJSON` 与 Python 对 U+2028/U+2029 对齐，
+  否则 Go 侧验签会拒绝 Python 合法封印的证据包。
 - 新增 `guard` / `intercept` 回归测试，覆盖上述每条绕过。
+
+### 升级注意
+
+1. **首次启动会自动迁移证据密钥**：从 `/app/data/evidence/` 移到
+   `/usr/local/share/artex-src/`（后者权限 0400）。数据目录里的副本会被删除。
+   升级前如需保留，请先备份 `data/evidence/`。
+2. **部署脚本有改动**：`deploy/scripts/` 下 3 个脚本与
+   `skills/src-retest/scripts/evidence_seal.py` 需同步到容器（重建镜像，或同步
+   `skills/` 挂载点后重启）。
+3. **拦截规则新增一条**：升级后「拦截审批」页会多一条「读取平台签名密钥」，
+   默认启用。它拦截对 `.hmac-key` / `.recorder-token` / `setup-token` / `jwt.key`
+   的读取——这是有意的，不要为图方便关掉。
+4. **反代配置建议**：把 nginx 的 `proxy_set_header X-Forwarded-For
+   $proxy_add_x_forwarded_for;` 改成 `$remote_addr`。代码已能正确处理两种写法，
+   但覆盖式配置让这层信任关系更明确。
 
 ## v0.3.23-fix1 — 同步上游 v0.3.23 + 安全加固（审计发现逐条修复）
 
