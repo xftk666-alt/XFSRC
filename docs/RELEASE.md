@@ -29,6 +29,10 @@ cd /home/xiaofan/xfsrc
 
 脚本做四件事：提交 → 打标签 → 推送分支与标签 → 提示 Actions 地址。
 
+**发版前必须在 `CHANGELOG.md` 写一节 `## v<版本>`**（例如 `## v0.3.23-fix1 — …`）。
+`release.yml` 会把这一节原样作为 Release 正文；`scripts/release.sh` 在打标签前就会
+检查它存在，缺了直接报错退出，避免发出一个没有任何说明的版本。
+
 ### 手动
 
 ```bash
@@ -38,6 +42,11 @@ git push origin local v0.3.23-fix1
 ```
 
 推送标签即触发 `.github/workflows/release.yml`。
+
+Release 正文的来源顺序：
+
+1. `CHANGELOG.md` 里 `## v<版本>` 这一节（推荐，脚本会强制）；
+2. 找不到时正文会显式标注「未找到 CHANGELOG 章节」，不会假装有说明。
 
 ## Actions 流水线
 

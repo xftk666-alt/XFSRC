@@ -33,6 +33,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       commit: ${{ steps.commit.outputs.sha }}
       version: ${{ steps.version.outputs.version }}
+      base: ${{ steps.version.outputs.base }}
     steps:
       - name: Validate release version
         id: version
@@ -46,6 +47,9 @@ jobs:
           fi
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          # Upstream base version: 0.3.23-fix1 -> 0.3.23. Used in the release body
+          # so it never claims to be "based on" its own fork version.
+          echo "base=${RELEASE_TAG#v}" | sed -E 's/-fix[0-9]+$//' >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ steps.version.outputs.tag }}
@@ -186,6 +190,36 @@ jobs:
           done
           sha256sum *.zip > SHA256SUMS
           sha256sum --check SHA256SUMS
+      - name: Compose release notes from CHANGELOG.md
+        # The body must say what actually changed. CHANGELOG.md is the source of
+        # truth (it is written with the fix); fall back to a stub only when the
+        # section is missing, and say so explicitly instead of pretending.
+        run: |
+          version="${{ needs.prepare.outputs.version }}"
+          awk -v want="## v${version}" '
+            index($0, want) == 1 { inside = 1; next }
+            inside && /^## / { exit }   # 下一个版本章节（含旧格式 ## [0.3.18]）
+            inside { print }
+          ' CHANGELOG.md > /tmp/notes.md
+          if [ ! -s /tmp/notes.md ]; then
+            echo "::warning::CHANGELOG.md 中没有 v${version} 章节，发布说明将只包含变更链接"
+            printf '> ⚠️ 本次发布未在 CHANGELOG.md 中找到 `v%s` 章节，请补充后再编辑 Release。\n\n' "$version" > /tmp/notes.md
+          fi
+          {
+            echo "基于上游 ARTEX **${{ needs.prepare.outputs.base }}** 的本地修订（\`local\` 分支）。"
+            echo
+            echo "> 面向**海外正规授权的 SRC 漏洞挖掘**："
+            echo "> [HackerOne](https://www.hackerone.com/) · [Intigriti](https://www.intigriti.com/) · [Bugcrowd](https://www.bugcrowd.com/)"
+            echo
+            cat /tmp/notes.md
+            echo
+            echo "---"
+            echo
+            echo "程序包提供 Linux / macOS 的 AMD64、ARM64 与 Windows AMD64，并附 \`SHA256SUMS\`。"
+            echo "部署与在线更新说明见仓库 \`README.md\` 与 \`docs/USAGE.md\`。"
+          } > /tmp/release-body.md
+          echo "release body 长度: $(wc -c < /tmp/release-body.md) 字节"
+
       - name: Replace release only when the tag moved to a new commit
         env:
           RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
@@ -215,14 +249,6 @@ jobs:
           files: |
             dist/*.zip
             dist/SHA256SUMS
-          generate_release_notes: true
-          body: |
-            基于上游 ARTEX **${{ needs.prepare.outputs.version }}** 的本地修订（`local` 分支）。
-
-            > 面向**海外正规授权的 SRC 漏洞挖掘**：
-            > [HackerOne](https://www.hackerone.com/) · [Intigriti](https://www.intigriti.com/) · [Bugcrowd](https://www.bugcrowd.com/)
-
-            程序包提供 Linux / macOS 的 AMD64、ARM64 与 Windows AMD64，并附 `SHA256SUMS`。
-            部署与在线更新说明见仓库 `README.md` 与 `docs/USAGE.md`。
+          body_path: /tmp/release-body.md
       - name: Publish complete release
         run: gh release edit "$RELEASE_TAG" --draft=false --latest

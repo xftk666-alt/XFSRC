@@ -1,3 +1,7 @@
+# 更新日志
+
+本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
 ## v0.3.23-fix1 — 同步上游 v0.3.23 + 安全加固（审计发现逐条修复）
 
 ### 上游同步
@@ -19,7 +23,7 @@
 ### 安全加固
 
 
-### 授权边界
+#### 授权边界
 - 授权闸从「只挂 worker」扩展到 **planner、任务主 Agent、以及能反查到任务的 chat 会话**
   （`agent.Planner/MainAgent.SetHooks`、`server/task_llm.go`、`server/intercept.go`）。
 - `add_task_scope` 只允许目标拆解器写可信范围；主 Agent / planner 不再能自扩授权边界，
@@ -29,7 +33,7 @@
 - host 提取补齐短写 IPv4（`127.1`、`2130706433`、`0x7f000001`）与单标签 `host:port`
   （`curl juice-shop:3000`）；仅当命令中出现网络工具时才采信单标签形式。
 
-### 复测证据链
+#### 复测证据链
 - `record_finding_retest_result` 的 `reproduced`/`fixed` 必须带 `pack_dir`，服务端重算
   HMAC 与证据指纹（`evidence/verdict.go`）；`inconclusive` 不要求证据包。
 - 修复 `ready` 不可达：challenge 改为由证据指纹推导，且被拒的 verdict 不再覆盖已签 gate。
@@ -41,7 +45,7 @@
 - 靶场判定只看结构化 host：SSRF 载荷里的 `127.0.0.1` 不再把真实资产判成靶场；
   `172.18.0.3.evil.com` 这类「私网前缀 + 域名」伪装仍判靶场。
 
-### Skills 其它 fail-open 修复
+#### Skills 其它 fail-open 修复
 - `dup_check` / 判重查询：数据源不可用时退出码 4（未知≠没有重复），`report_check`
   把 rc 4/其它非零都当问题。
 - `coverage_report`：读不到 findings、或空台账且未指定 `--assigned-risk` 时非零。
@@ -54,7 +58,7 @@
   写 `proxy.env` 时对值做 shell 引号转义、文件以 0600 创建。
 - 镜像补装 `psycopg2-binary`（这些脚本依赖它，缺失时只能 fail closed）。
 
-### 会话与沙箱
+#### 会话与沙箱
 - JWT 改 HttpOnly + SameSite=Strict cookie；`?token=` 仅限 SSE；登出与改密递增
   `auth.token_version` 使旧令牌立即失效。
 - 首启生成一次性 setup token（日志 + `data/setup-token`），非回环来源的 `/api/auth/init`
@@ -62,7 +66,7 @@
 - 请求体 8 MiB 上限（413）、`ReadTimeout`/`IdleTimeout`；登录限流按真实客户端 IP。
 - 工作区符号链接按解析后的真实路径二次校验，悬空链接直接拒绝。
 
-### 交付链路
+#### 交付链路
 - `install.sh`/`update.sh`/compose 改为本地构建本 fork 镜像，不再默认拉上游 `ruoji6/artex`。
 - `jwt.key` 不再以 `:ro` 挂载；`start.sh` 启动前从 data 卷恢复或生成。
 - release 增加测试门与 `origin/local` 祖先校验；Actions 全部 pin 到提交 SHA；CI 声明
@@ -70,17 +74,13 @@
 - `.gitignore` 覆盖 `config.json`，`release.sh` 拒绝提交含凭据的 `config.json`/`.env`。
 - 文档漂移修正：`-fixN` 更新语义、更新来源、`reset-password.sh` 用户名、部署说明。
 
-### 测试
+#### 测试
 - 新增 `evidence/verdict_test.go`（与 Python 闸门逐字节对齐 + 篡改/伪造拒绝）、
   `server/auth_hardening_test.go`、`server/agent_guard_test.go`、
   `server/retest_pack_test.go`、`server/workspace_test.go`、
   `skills/src-retest/scripts/test_retest_gate_state.py`（ready/fixed/compare 状态机）。
 - `test_retest_adversarial.py` 38 例、`test_gates_hardening.py` 123 例、
   `test_retest_gate_state.py` 11 例全部自包含并通过；`skill_lint` 38/38。
-
-# 更新日志
-
-本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
 ## [Unreleased]
 

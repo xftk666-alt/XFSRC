@@ -51,6 +51,11 @@ TAG="v${VERSION}"
 [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-fix[0-9]+)?$ ]] || die "版本格式无效：$VERSION（应形如 0.3.22-fix13）"
 git rev-parse "$TAG" >/dev/null 2>&1 && die "标签 $TAG 已存在"
 
+# 发布说明直接取自 CHANGELOG.md 的对应章节（release.yml 用它生成 Release 正文）。
+# 没有这一节，Release 页面就只剩一句模板话——所以在这里就拦住。
+awk -v want="## $TAG" 'index($0, want) == 1 { found = 1 } END { exit !found }' CHANGELOG.md \
+  || die "CHANGELOG.md 缺少「## $TAG」章节：请先写清楚本版更新了什么再发版"
+
 # 1) 提交
 # 安装脚本会把数据库密码写进 config.json / .env：绝不能让 release 的 git add -A
 # 把凭据带进版本历史。
