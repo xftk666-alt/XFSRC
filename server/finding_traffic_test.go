@@ -381,8 +381,8 @@ func TestFindingTrafficFailedReportDoesNotTrigger(t *testing.T) {
 	// A nil server makes any attempted trigger fail this test immediately.
 	scheduler := &Scheduler{pg: s.m.pg}
 	scheduler.fireToolCalls([]*db.AgentTrigger{{OnToolCall: true, ToolNames: []string{"report_finding"}, AgentKey: "reporter"}})
-	if got := scheduler.mustState(schedKeyLastToolCall); got != strconv.FormatInt(id, 10) {
-		t.Fatal("failed finding must still advance watermark", got)
+	if got, ok := scheduler.mustState(schedKeyLastToolCall); !ok || got != strconv.FormatInt(id, 10) {
+		t.Fatal("failed finding must still advance watermark", got, ok)
 	}
 }
 

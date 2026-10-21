@@ -25,8 +25,21 @@ except ValueError:
 PY
 )
 if [ "$IS_PRIVATE" != "1" ] && [ -f /app/data/proxy/proxy.env ]; then
-  # shellcheck disable=SC1091
-  . /app/data/proxy/proxy.env
+  # 配置由 agent 可写，绝不 source：只解析白名单 KEY=VALUE（同 retention.sh）。
+  PROXY_KIND=""; PROXY_HOST=""; PROXY_PORT=""; PROXY_USER=""; PROXY_PASS=""
+  while IFS='=' read -r key value; do
+    case "$key" in
+      PROXY_KIND|PROXY_HOST|PROXY_PORT|PROXY_USER|PROXY_PASS)
+        value="${value%\r}"
+        value="${value#\"}"
+        value="${value%\"}"
+        case "$value" in
+          *\$*|*\`*) ;;                 # 命令替换一律拒绝
+          *) export "$key=$value" ;;
+        esac
+        ;;
+    esac
+  done < /app/data/proxy/proxy.env
   if [ -n "${PROXY_HOST:-}" ] && [ -n "${PROXY_PORT:-}" ]; then
     ARGS+=(-proxy "${PROXY_HOST}:${PROXY_PORT}")
     if [ -n "${PROXY_USER:-}" ]; then

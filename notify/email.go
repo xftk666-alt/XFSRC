@@ -188,15 +188,45 @@ func smtpReplyCode(text string) int {
 	return n
 }
 
+// headerSafe rejects header values containing CR, LF or other control
+// characters, which would otherwise inject extra headers.
+func headerSafe(v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", errors.New("空地址")
+	}
+	for _, r := range v {
+		if r == '\r' || r == '\n' || r < 0x20 || r == 0x7f {
+			return "", errors.New("地址包含换行或控制字符")
+		}
+	}
+	return v, nil
+}
+
 // buildEmailMessage 组装完整的 RFC 5322 邮件。
 //
 // 正文用 base64 编码有两个原因：一是 SMTP 规定单行不超过 1000 字节，而 HTML
 // 正文（尤其汇总邮件）很容易出现超长行；二是 base64 天然不会出现以 "." 开头
 // 的行，省去 SMTP 点号转义的麻烦。
 func buildEmailMessage(from string, to []string, m Message) (string, error) {
+	// Header values come from channel configuration and must never contain CR/LF:
+	// a newline there starts a new header, so a crafted "from" could add a Bcc or
+	// rewrite the Subject.
+	from, err := headerSafe(from)
+	if err != nil {
+		return "", fmt.Errorf("发件人地址无效: %w", err)
+	}
+	safeTo := make([]string, 0, len(to))
+	for _, addr := range to {
+		clean, err := headerSafe(addr)
+		if err != nil {
+			return "", fmt.Errorf("收件人地址无效: %w", err)
+		}
+		safeTo = append(safeTo, clean)
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "From: %s\r\n", from)
-	fmt.Fprintf(&b, "To: %s\r\n", strings.Join(to, ", "))
+	fmt.Fprintf(&b, "To: %s\r\n", strings.Join(safeTo, ", "))
 	// 中文主题必须做 RFC 2047 编码，否则会被客户端显示成乱码。
 	fmt.Fprintf(&b, "Subject: %s\r\n", mime.QEncoding.Encode("utf-8", htmlTitle(m)))
 	b.WriteString("MIME-Version: 1.0\r\n")

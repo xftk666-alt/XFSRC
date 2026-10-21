@@ -2,6 +2,102 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## v0.3.23-fix2 — 第二轮安全审计修复（74 项发现）
+
+对 `local` 分支做了一次完整审计（OCR 全文件扫描 86 文件 / 275 条意见 + 人工逐行审
+`skills/src-retest` 与 `deploy/scripts`），核实出 74 项问题（6 Critical / 47 High /
+18 Medium / 3 Low），本版全部修复。每条 Critical 都有可执行 PoC 验证修复前可复现、
+修复后失效。
+
+### Critical
+
+- **日志页开关一次即崩溃**（`server/logsink.go`）：`add()` 在锁内快照订阅者、解锁后
+  发送，而退订闭包在锁内 `delete` 后立刻 `close(ch)`；两者交错触发
+  `send on closed channel`。panic 发生在 `log.Printf` 内部，调用方无 recover，进程直接
+  退出。改为锁内发送、锁内 close，两侧共享同一把锁。
+- **`X-Forwarded-For` 取最左值 → 首启 setup token 失效**（`server/auth_limit.go`、
+  `server/auth.go`）：nginx 的 `$proxy_add_x_forwarded_for` 把客户端自带值放在左边，
+  于是远程攻击者只需发 `X-Forwarded-For: 127.0.0.1` 就被判定为本机，跳过
+  `/api/auth/init` 的一次性令牌校验，直接设成自己的管理员密码。改为取**最右**跳
+  （本机反代追加的那一条），右侧不是合法 IP 时不再回退到左侧。
+- **`bumpTokenVersion` 的 `FOR UPDATE` 从未生效**（`server/auth.go`）：锁加在无 `FROM`
+  的外层查询上，`settings` 那一行完全没被锁，并发 bump 都读到 N 并写 N+1 —— 丢失更新，
+  改密/登出后旧令牌可能仍有效。改为先 `INSERT ... ON CONFLICT DO NOTHING` 保证行存在，
+  再 `SELECT ... FOR UPDATE`（实测第二个事务由 47ms 变为阻塞 3053ms）。
+- **带端口的 URL 多提取一个 TLD → 合法请求被拦**（`guard/scope.go`）：单标签
+  `host:port` 正则在原始文本上扫描，`api.example.com:8443` 额外匹配出 `com:8443`，
+  而 `com` 永远不在 `task_scope` 里。所有显式带端口的请求因此被判定越权 —— 操作员会
+  误以为范围没配好，进而关掉授权闸。改为检查匹配前的字节不属于主机名。
+- **`staticScriptPreparation` 接受不安全前置语句**（`intercept/shell_static.go`）：
+  只检查 `Background`，不看 `Negated` / `Redirs`，也跳过带 `Args` 的 `Assigns`。
+  `! cd /tmp`、`cd /tmp >"$(id)"`、`X=$(id) cd /tmp` 都被当成「目录已切换」，导致静态
+  分析看到的脚本路径与实际执行的不是同一个。三者一律拒绝。
+
+### High（授权与执行边界）
+
+- `guard/scope.go` host 提取重写：URL 用 `net/url` 解析（修 userinfo 被当作主机、
+  `[::1]:8080` 被破坏）、不再用 token/文件名启发式丢弃真实目标（`evil.zip`、
+  混合大小写标签）、单标签主机（`localhost`）无条件提取、新增**操作数扫描**（网络工具的
+  非 flag 参数即目标），并保证 URL 内文不再被二次扫描出多余主机。
+- `guard/scope_files.go`：`cat targets | httpx` 的 `filepath.Ext("")[1:]` panic；
+  tokenizer 按 shell 元字符切分（`cat f|httpx`、`-l f;cmd` 曾整条被丢弃）；
+  支持 `-l=FILE` / `--targets=FILE` / `-lFILE`；`@` 取右侧而非左侧；目录、FIFO、
+  设备节点、超大文件、超过行数上限、无法解析的行一律 fail-closed 而非静默返回空。
+- **脚本内容纳入授权闸**（新增 `guard.ScriptHosts` + `server/scope_gate.go`）：
+  之前闸门只看命令行，`python3 /tmp/recon.py` 的目标完全不可见，而平台的 Bash 提示词
+  正是建议「写个脚本再执行」。现在解析脚本正文（按行判断是否有网络调用，只认带引号的
+  主机与网络命令的操作数），读不完整即 fail-closed。
+- **自定义工具 / MCP 绕过 hook**（新增 `Server.gateCustomExecution`）：`runCommandTool`
+  与 `runScriptTool` 走 `actool.NewBash().Call` / `exec.Command`，不经过 PreToolUse，
+  于是授权闸与拦截规则全被跳过。执行前重跑同一套检查。
+- 密钥移出 agent 可达范围：证据 HMAC 密钥与记录器令牌不再镜像到 `/app/data`
+  （agent 的工作目录），`restore_to_runtime.sh` 只保留运行时树并删除数据目录副本；
+  `evidence_seal.py` 优先读运行时路径；新增内置拦截规则
+  「读取平台签名密钥」覆盖 `.hmac-key` / `.recorder-token` / `setup-token` / `jwt.key`。
+- `server/workspace.go`：硬链接绕过（`ln .hmac-key innocent.txt` 后经 Web 可读）——
+  拒绝 `Nlink > 1`；FIFO/设备节点拒绝；`wsResolve` 返回**解析后**路径而非词法路径
+  （TOCTOU）；上传用 `O_NOFOLLOW` 且 `Lstat` 判占用。
+- `server/server_mgmt.go`：`/api/llm/models` 的 SSRF 与凭据外带 —— 校验 scheme 与
+  云元数据地址，且只在 `base_url` 与所选 profile 同主机时才复用已存 Key。
+- `server/update_settings.go`：更新令牌只发给首个请求的主机（注入式
+  RoundTripper 绕过了 net/http 的跨主机剥离）。
+- `server/platform_tools.go`：skill frontmatter 注入（`description` 含换行可注入
+  `mcps:` / `name:`）—— 新增 `yamlScalar`，仅对结构敏感值加引号转义；`create_mcp`
+  校验 transport/command/URL；`update_custom_tool` / `update_mcp` 改为与既有行合并，
+  不再用零值覆盖。
+- `notify/email.go`：`From` / `To` 含 CRLF 可注入额外头（Bcc）—— 一律拒绝控制字符。
+- `mcphttp/client.go`：SSE 端点必须是 `event: endpoint` 且与 SSE 同源（否则重绑到
+  任意主机会带着 `Authorization`）；头**值**也校验 CRLF；多行 `data:` 按规范用换行拼接。
+- `deploy/scripts/oobctl.sh`、`run_naabu.sh`：`source` agent 可写配置 = 命令执行
+  （`retention.sh` 上一版已修，这两处漏了）—— 改白名单 KEY=VALUE 解析。
+- `server/auth.go`：JWT key 读失败/过短不再静默重新生成（会吊销全部令牌）；
+  setup token 读取失败不再覆盖已下发的令牌。
+- `server/assembly.go`：工具表读取失败时不再把全部 host 工具交给 agent，
+  按 `privilegedToolKeys` 过滤（fail-closed）。
+- `server/finding_cases.go`：`caseHTTPError` 只把已知哨兵映射为 4xx，其余记日志并回 500
+  通用文案，不再回显驱动错误。
+
+### Medium / Low
+
+- `intercept`：规则加载失败改为 deny 而非放行；正则编译失败按「始终匹配」处理并记日志；
+  `intercept_enabled_tools` 损坏时回退内置默认；`ParseVerdict` 对格式不完美的
+  deny/ask 保留决定（allow 仍要求完整理由），同时拒绝重复 key 与第二个 JSON 对象。
+- `server/scheduler.go`：`mustState` 返回 `(value, ok)`，读失败跳过本轮而不是当作
+  「从未初始化」重放全部历史；播种查询失败不再写入 0。
+- `server/schedules.go`：`enabled` 缺省只在创建时默认 true，PATCH 不再重新启用已停用的计划。
+- `server/calendar_schedule.go`：畸形时间不再 panic；跨夜一次性计划（22:00→02:00）
+  的结束时间正确落到次日。
+- `server/customtool.go`：模板单遍替换（`{a}` 的值含 `{b}` 曾被二次展开）；
+  脚本超时/非零退出返回错误而非「成功」；代理地址非法时报错而不是静默直连。
+- `server/manager.go`：`decodeStrMap` 对 JSON `null` 返回非 nil map（曾在
+  `env["NODE_EXTRA_CA_CERTS"]` 处 panic）；`trafficOn` 在代理启动前加锁写入。
+- `server/basic_auth.go`：恒定时间比较用户名、始终执行 bcrypt、复用登录限流。
+- `server/assets.go`：资产增删加 2 MiB body 与 2000 条批量上限。
+- `db/notification.go`：没有启用渠道时不再把事件标记为已分派（否则期间的漏洞通知
+  永久丢失）；`evidence.CanonicalJSON` 与 Python 对 U+2028/U+2029 对齐。
+- `server/finding_cases.go`、`server/auth_limit.go`：登录限流桶加硬上限并按最早过期淘汰。
+- 新增 `guard` / `intercept` 回归测试，覆盖上述每条绕过。
+
 ## v0.3.23-fix1 — 同步上游 v0.3.23 + 安全加固（审计发现逐条修复）
 
 ### 上游同步

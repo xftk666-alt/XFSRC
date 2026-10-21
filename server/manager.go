@@ -419,7 +419,12 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	}
 	// Asset auto-completion engine (§5): HTTP probes routed through the recording
 	// proxy (via m.ProxyAddr, which honors the traffic-capture toggle).
+	// Set before the recording proxy goroutine can accept a request: the gate
+	// installed above reads this field under RLock, so writing it later (and
+	// without the lock) raced with in-flight recording decisions.
+	m.mu.Lock()
 	m.trafficOn = pg.GetBool(settingTrafficCapture, false)
+	m.mu.Unlock()
 	// LLM 录制开关（默认关）。录制器每次调用时读取此标志。
 	m.llmRecOn = pg.GetBool(settingLLMRecord, false)
 	// Load persisted web-search config (default: off, ddgs).
@@ -719,7 +724,17 @@ func decodeStrSlice(raw json.RawMessage) []string {
 func decodeStrMap(raw json.RawMessage) map[string]string {
 	out := map[string]string{}
 	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &out)
+		// JSON null unmarshals into a nil map, which would then panic on the
+		// first assignment ("assignment to entry in nil map") — syncBrowserMCPProxy
+		// writes env["NODE_EXTRA_CA_CERTS"] straight after this.
+		var decoded map[string]string
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			log.Printf("[mcp] 环境变量不是有效的字符串映射，按空处理: %v", err)
+			return out
+		}
+		if decoded != nil {
+			out = decoded
+		}
 	}
 	return out
 }

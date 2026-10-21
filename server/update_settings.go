@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/Autumn-27/artex/selfupdate"
 )
@@ -115,15 +116,34 @@ func (s *Server) updateUsesToken() bool {
 	return err == nil && strings.TrimSpace(cfg.Token) != ""
 }
 
-// authTransport adds the GitHub Authorization header to every update request.
+// authTransport adds the GitHub Authorization header to update requests.
 // The repository is private, so the unauthenticated releases API returns 404.
+//
+// The token goes only to the host the update flow started on. Injecting it in
+// the RoundTripper bypasses net/http's own cross-host stripping of Authorization
+// on redirects, so a redirect to an arbitrary host would otherwise carry the
+// token with it — the release host list cannot help there, because a redirect
+// target is chosen by whoever answers the first request.
 type authTransport struct {
 	base  http.RoundTripper
 	token string
+
+	mu     sync.Mutex
+	origin string // host of the first request in this flow
 }
 
 func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	host := req.URL.Hostname()
+	t.mu.Lock()
+	if t.origin == "" {
+		t.origin = host
+	}
+	allowed := strings.EqualFold(host, t.origin)
+	t.mu.Unlock()
+
 	clone := req.Clone(req.Context())
-	clone.Header.Set("Authorization", "Bearer "+t.token)
+	if allowed {
+		clone.Header.Set("Authorization", "Bearer "+t.token)
+	}
 	return t.base.RoundTrip(clone)
 }

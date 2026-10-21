@@ -44,10 +44,15 @@ def _fixed_path(filename: str, runtime_default: str) -> str:
     if test_root:
         return os.path.join(test_root, filename)
     here = os.path.dirname(os.path.abspath(__file__))
+    # Prefer the runtime tree (/usr/local/share/artex-src), NOT the data
+    # directory: /app/data is the agent's working directory and is served by the
+    # workspace file manager, so a key stored there is reachable by any tool the
+    # agent can call. The data-dir copy is still honored as a fallback so
+    # existing installs keep working, but it is no longer preferred.
     for candidate in (
-        os.path.join("/app/data/evidence", filename),
-        os.path.join(here, filename),
         runtime_default,
+        os.path.join(here, filename),
+        os.path.join("/app/data/evidence", filename),
     ):
         if os.path.isfile(candidate):
             return candidate

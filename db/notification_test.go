@@ -872,3 +872,32 @@ func TestFinishFindingRetestEmitsStatusChange(t *testing.T) {
 		t.Fatalf("快照缺少渲染字段: %+v", snap)
 	}
 }
+
+// No enabled channel must leave events pending, not discard them: a finding
+// created while notifications were unconfigured should still go out once a
+// channel is added.
+func TestFanOutKeepsEventsWhenNoChannelEnabled(t *testing.T) {
+	d := notifyTestDB(t)
+	ctx := context.Background()
+	ev := addTestEvent(t, d, notify.EventFindingCreated, 2101, notify.Snapshot{Severity: "high", VulnClass: "XSS"})
+	if _, _, err := d.FanOutPendingEvents(ctx, 100); err != nil {
+		t.Fatal(err)
+	}
+	var fanned bool
+	if err := d.QueryRowContext(ctx, `SELECT fanned_out FROM notification_events WHERE id=$1`, ev).Scan(&fanned); err != nil {
+		t.Fatal(err)
+	}
+	if fanned {
+		t.Fatal("没有启用渠道时不得标记已分派，否则事件会被永久丢弃")
+	}
+
+	// Enable a channel: the pending event must now produce a delivery.
+	newTestChannel(t, d, notify.KindDingTalk, NotifyModeRealtime, `{}`)
+	_, deliveries, err := d.FanOutPendingEvents(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deliveries != 1 {
+		t.Fatalf("启用渠道后应补推 1 条，得到 %d", deliveries)
+	}
+}

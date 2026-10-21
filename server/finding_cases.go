@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 
@@ -35,12 +36,25 @@ func (a findingCaseRequest) ids() []int64 {
 	}
 	return out
 }
+
+// caseHTTPError maps a finding-case error to a status code.
+//
+// Only known validation/conflict sentinels become 4xx with their message; every
+// other error is a server-side fault and is reported as 500 with a generic
+// message. Returning 400 + err.Error() for everything both mislabelled outages
+// as client mistakes and echoed SQL/driver details to the caller.
 func caseHTTPError(w http.ResponseWriter, err error) {
-	code := 400
-	if errors.Is(err, db.ErrFindingCaseConflict) || errors.Is(err, db.ErrFindingCaseReviewBusy) {
-		code = 409
+	switch {
+	case errors.Is(err, db.ErrFindingCaseConflict):
+		writeErr(w, 409, err.Error())
+	case errors.Is(err, db.ErrFindingCaseReviewBusy):
+		writeErr(w, 409, err.Error())
+	case errors.Is(err, db.ErrFindingNotFound), errors.Is(err, sql.ErrNoRows):
+		writeErr(w, 404, "漏洞组或漏洞不存在")
+	default:
+		log.Printf("[finding-case] 处理失败: %v", err)
+		writeErr(w, 500, "服务端处理失败，请稍后重试")
 	}
-	writeErr(w, code, err.Error())
 }
 func decodeCaseRequest(w http.ResponseWriter, r *http.Request, a any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)

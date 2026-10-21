@@ -109,15 +109,21 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 // uniqueUploadPath returns dir/name, or dir/name-1, dir/name-2… when it already exists,
 // so re-uploading the same filename never clobbers a prior attachment.
 func uniqueUploadPath(dir, name string) string {
+	// Lstat, not Stat: a symlink planted in the uploads dir must count as "taken"
+	// rather than resolve to its target (and be written through).
+	exists := func(p string) bool {
+		_, err := os.Lstat(p)
+		return err == nil
+	}
 	dest := filepath.Join(dir, name)
-	if _, err := os.Stat(dest); os.IsNotExist(err) {
+	if !exists(dest) {
 		return dest
 	}
 	ext := filepath.Ext(name)
 	stem := strings.TrimSuffix(name, ext)
 	for i := 1; ; i++ {
 		cand := filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, i, ext))
-		if _, err := os.Stat(cand); os.IsNotExist(err) {
+		if !exists(cand) {
 			return cand
 		}
 	}

@@ -14,8 +14,10 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/transcript"
 )
 
@@ -27,6 +29,7 @@ type taskAgentBundle struct {
 	pl             *agent.Planner
 	wk             *agent.Worker
 	main           *agent.MainAgent
+	guard          *guard.Guard // guard whose hooks are currently installed
 }
 
 type llmAuditProfile struct {
@@ -549,10 +552,38 @@ func (s *Server) invalidateTaskAgents() {
 	s.taskAgentMu.Unlock()
 }
 
+// applyTaskGuard wires (or clears) the per-task guard hooks on the agents that
+// store them. The worker receives its hooks per run from the engine, so it is not
+// touched here.
+func (s *Server) applyTaskGuard(b *taskAgentBundle, g *guard.Guard) {
+	if b == nil {
+		return
+	}
+	if b.guard == g {
+		return
+	}
+	var hooks harness.HookRunner
+	if g != nil {
+		hooks = g.Hooks()
+	}
+	if b.pl != nil {
+		b.pl.SetHooks(hooks)
+	}
+	if b.main != nil {
+		b.main.SetHooks(hooks)
+	}
+	b.guard = g
+}
+
 func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	s.taskAgentMu.Lock()
 	defer s.taskAgentMu.Unlock()
 	if bundle := s.taskAgents[t.ID]; bundle != nil {
+		// Re-apply the guard on a cache hit. The bundle is keyed by task id only,
+		// so a task whose Guard was replaced (or cleared) would otherwise keep
+		// serving the hooks of the guard that happened to be installed when the
+		// bundle was built — a stale gate, or none at all.
+		s.applyTaskGuard(bundle, t.Guard)
 		return bundle
 	}
 	goalRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "goals"}
@@ -608,6 +639,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
 		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,
+		guard: t.Guard,
 	}
 	s.taskAgents[t.ID] = bundle
 	return bundle

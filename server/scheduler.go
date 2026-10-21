@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -60,58 +61,54 @@ func (sc *Scheduler) Run(ctx context.Context) {
 // init seeds the watermarks on first run so pre-existing findings/goals don't all
 // fire at once — only events created AFTER the scheduler first starts count.
 func (sc *Scheduler) init() {
-	if sc.mustState(schedKeyLastFinding) == "" {
+	// seed writes maxID as the watermark. A failed read leaves the value unset so
+	// the next start retries; a failed *query* must not persist 0, which would
+	// make the first tick replay every pre-existing event.
+	seed := func(key string, maxID func() (int64, error)) {
+		raw, ok := sc.mustState(key)
+		if !ok {
+			return // read failed: retry on the next start
+		}
+		if raw != "" {
+			return // already seeded
+		}
+		value, err := maxID()
+		if err != nil {
+			log.Printf("[scheduler] 初始化 %q 失败，下次启动重试: %v", key, err)
+			return
+		}
+		if err := sc.pg.SetSchedState(key, strconv.FormatInt(value, 10)); err != nil {
+			log.Printf("[scheduler] 写入 %q 失败: %v", key, err)
+		}
+	}
+	maxNodeID := func(events []db.TaskEvent, err error) (int64, error) {
+		if err != nil {
+			return 0, err
+		}
 		var maxID int64
-		if evs, err := sc.pg.NewFindingsSince(0); err == nil {
-			for _, e := range evs {
-				if e.NodeID > maxID {
-					maxID = e.NodeID
-				}
+		for _, e := range events {
+			if e.NodeID > maxID {
+				maxID = e.NodeID
 			}
 		}
-		_ = sc.pg.SetSchedState(schedKeyLastFinding, strconv.FormatInt(maxID, 10))
+		return maxID, nil
 	}
-	if sc.mustState(schedKeyFiredGoals) == "" {
+	seed(schedKeyLastFinding, func() (int64, error) { return maxNodeID(sc.pg.NewFindingsSince(0)) })
+	seed(schedKeyLastTimeout, func() (int64, error) { return maxNodeID(sc.pg.TimedOutTasksSince(0)) })
+	seed(schedKeyLastToolCall, func() (int64, error) { return maxNodeID(sc.pg.NewToolCallsSince(0)) })
+	seed(schedKeyLastTaskCreate, func() (int64, error) { return maxNodeID(sc.pg.NewTasksSince(0)) })
+
+	if raw, ok := sc.mustState(schedKeyFiredGoals); ok && raw == "" {
 		set := map[int64]bool{}
-		if evs, err := sc.pg.MetGoals(); err == nil {
+		evs, err := sc.pg.MetGoals()
+		if err != nil {
+			log.Printf("[scheduler] 初始化已触发目标失败，下次启动重试: %v", err)
+		} else {
 			for _, e := range evs {
 				set[e.NodeID] = true
 			}
+			sc.saveFiredGoalSet(set)
 		}
-		sc.saveFiredGoalSet(set)
-	}
-	if sc.mustState(schedKeyLastTimeout) == "" {
-		var maxID int64
-		if evs, err := sc.pg.TimedOutTasksSince(0); err == nil {
-			for _, e := range evs {
-				if e.NodeID > maxID {
-					maxID = e.NodeID
-				}
-			}
-		}
-		_ = sc.pg.SetSchedState(schedKeyLastTimeout, strconv.FormatInt(maxID, 10))
-	}
-	if sc.mustState(schedKeyLastToolCall) == "" {
-		var maxID int64
-		if evs, err := sc.pg.NewToolCallsSince(0); err == nil {
-			for _, e := range evs {
-				if e.NodeID > maxID {
-					maxID = e.NodeID
-				}
-			}
-		}
-		_ = sc.pg.SetSchedState(schedKeyLastToolCall, strconv.FormatInt(maxID, 10))
-	}
-	if sc.mustState(schedKeyLastTaskCreate) == "" {
-		var maxID int64
-		if evs, err := sc.pg.NewTasksSince(0); err == nil {
-			for _, e := range evs {
-				if e.NodeID > maxID {
-					maxID = e.NodeID
-				}
-			}
-		}
-		_ = sc.pg.SetSchedState(schedKeyLastTaskCreate, strconv.FormatInt(maxID, 10))
 	}
 }
 
@@ -158,7 +155,11 @@ func (sc *Scheduler) fireFindings(triggers []*db.AgentTrigger) {
 			want = append(want, tr)
 		}
 	}
-	last, _ := strconv.ParseInt(sc.mustState(schedKeyLastFinding), 10, 64)
+	raw, ok := sc.mustState(schedKeyLastFinding)
+	if !ok {
+		return // state unreadable: skip this tick rather than replay from 0
+	}
+	last, _ := strconv.ParseInt(raw, 10, 64)
 	events, err := sc.pg.NewFindingsSince(last)
 	if err != nil || len(events) == 0 {
 		return
@@ -197,7 +198,11 @@ func (sc *Scheduler) fireGoals(triggers []*db.AgentTrigger) {
 	}
 	// Mark goals as consumed whether or not a trigger is active, so enabling an
 	// on_goal_met trigger later doesn't replay every already-met goal.
-	fired := sc.firedGoalSet()
+	fired, err := sc.firedGoalSet()
+	if err != nil {
+		log.Printf("[scheduler] %v，跳过本轮目标触发", err)
+		return
+	}
 	changed := false
 	for _, e := range events {
 		if fired[e.NodeID] {
@@ -227,7 +232,11 @@ func (sc *Scheduler) fireTaskTimeouts(triggers []*db.AgentTrigger) {
 			want = append(want, tr)
 		}
 	}
-	last, _ := strconv.ParseInt(sc.mustState(schedKeyLastTimeout), 10, 64)
+	raw, ok := sc.mustState(schedKeyLastTimeout)
+	if !ok {
+		return // state unreadable: skip this tick rather than replay from 0
+	}
+	last, _ := strconv.ParseInt(raw, 10, 64)
 	events, err := sc.pg.TimedOutTasksSince(last)
 	if err != nil || len(events) == 0 {
 		return
@@ -258,7 +267,11 @@ func (sc *Scheduler) fireTaskCreates(triggers []*db.AgentTrigger) {
 			want = append(want, tr)
 		}
 	}
-	last, _ := strconv.ParseInt(sc.mustState(schedKeyLastTaskCreate), 10, 64)
+	raw, ok := sc.mustState(schedKeyLastTaskCreate)
+	if !ok {
+		return // state unreadable: skip this tick rather than replay from 0
+	}
+	last, _ := strconv.ParseInt(raw, 10, 64)
 	events, err := sc.pg.NewTasksSince(last)
 	if err != nil || len(events) == 0 {
 		return
@@ -290,7 +303,11 @@ func (sc *Scheduler) fireToolCalls(triggers []*db.AgentTrigger) {
 			want = append(want, tr)
 		}
 	}
-	last, _ := strconv.ParseInt(sc.mustState(schedKeyLastToolCall), 10, 64)
+	raw, ok := sc.mustState(schedKeyLastToolCall)
+	if !ok {
+		return // state unreadable: skip this tick rather than replay from 0
+	}
+	last, _ := strconv.ParseInt(raw, 10, 64)
 	events, err := sc.pg.NewToolCallsSince(last)
 	if err != nil || len(events) == 0 {
 		return
@@ -344,24 +361,37 @@ func trunc(s string, max int) string {
 	return string(r[:max]) + fmt.Sprintf("…(已截断,共 %d 字)", len(r))
 }
 
-func (sc *Scheduler) mustState(key string) string {
-	v, _ := sc.pg.GetSchedState(key)
-	return v
+// mustState returns a stored watermark. It reports ok=false when the read failed,
+// which callers must distinguish from "never initialised": treating a transient
+// DB error as an empty value made the scheduler replay the entire history.
+func (sc *Scheduler) mustState(key string) (string, bool) {
+	v, err := sc.pg.GetSchedState(key)
+	if err != nil {
+		log.Printf("[scheduler] read state %q failed: %v", key, err)
+		return "", false
+	}
+	return v, true
 }
 
-func (sc *Scheduler) firedGoalSet() map[int64]bool {
+func (sc *Scheduler) firedGoalSet() (map[int64]bool, error) {
 	out := map[int64]bool{}
-	raw := sc.mustState(schedKeyFiredGoals)
+	raw, ok := sc.mustState(schedKeyFiredGoals)
+	if !ok {
+		return nil, errors.New("读取已触发目标失败")
+	}
 	if raw == "" {
-		return out
+		return out, nil
 	}
 	var ids []int64
-	if json.Unmarshal([]byte(raw), &ids) == nil {
-		for _, id := range ids {
-			out[id] = true
-		}
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+		// A corrupt set is not "nothing was fired": re-firing every goal would
+		// launch a run per historical goal. Skip the tick instead.
+		return nil, fmt.Errorf("已触发目标记录损坏: %w", err)
 	}
-	return out
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out, nil
 }
 
 func (sc *Scheduler) saveFiredGoalSet(set map[int64]bool) {

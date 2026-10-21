@@ -3,6 +3,8 @@ package guard
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -32,6 +34,16 @@ var targetFileFlag = map[string]map[string]bool{
 	"-targets":     nil,
 	"-target-file": nil,
 	"--url-file":   nil,
+	// GNU-style long forms. These were missing, so `--targets=FILE` never
+	// registered as a target list at all.
+	"--list":        {"httpx": true, "nuclei": true, "katana": true, "naabu": true},
+	"--targets":     nil,
+	"--target":      nil,
+	"--target-file": nil,
+	"--input":       nil,
+	"--inputlist":   nil,
+	"--input-file":  nil,
+	"--urls":        nil,
 }
 
 // FileHosts scans the target-list files referenced by a tool call. It returns
@@ -93,8 +105,18 @@ func targetFilesIn(command string) []string {
 	var out []string
 	for i, tok := range tokens {
 		name := strings.ToLower(tok)
-		if tools, ok := targetFileFlag[name]; ok {
+		// Attached forms: `-l=targets.txt`, `--targets=targets.txt`, and GNU short
+		// `-ltargets.txt`. Without these the flag never matched, so the file was
+		// never read and the call was allowed with no hosts checked.
+		flag, value, hasValue := splitAttachedFlag(tok)
+		if tools, ok := targetFileFlag[flag]; ok {
 			if tools != nil && !toolMatches(tokens, tools) {
+				continue
+			}
+			if hasValue {
+				if p := cleanPathToken(value); p != "" && !strings.Contains(p, "://") {
+					out = append(out, p)
+				}
 				continue
 			}
 			if i+1 < len(tokens) {
@@ -117,22 +139,55 @@ func targetFilesIn(command string) []string {
 				out = append(out, p)
 			}
 		}
-		// `< targets.txt` (tokenizer keeps the operator separate from its path)
-		if tok == "<" || tok == "0<" {
-			if i+1 < len(tokens) {
-				if p := cleanPathToken(tokens[i+1]); p != "" {
-					out = append(out, p)
-				}
-			}
+	}
+	// `< targets.txt` / `0< targets.txt`. The tokenizer treats '<' as a word
+	// separator, so the operator is gone by now — scan the raw text instead.
+	out = append(out, redirectSources(command)...)
+	return dedupe(out)
+}
+
+// redirectSources finds `FILE` in `< FILE` and `0< FILE`.
+func redirectSources(command string) []string {
+	var out []string
+	for i := 0; i < len(command); i++ {
+		if command[i] != '<' {
 			continue
 		}
-		if strings.HasPrefix(tok, "<") && len(tok) > 1 {
-			if p := cleanPathToken(strings.TrimPrefix(tok, "<")); p != "" {
-				out = append(out, p)
-			}
+		// Skip `<<` (heredoc) — its body is not a target list.
+		if i+1 < len(command) && command[i+1] == '<' {
+			i++
+			continue
+		}
+		rest := command[i+1:]
+		rest = strings.TrimLeft(rest, " \t")
+		end := strings.IndexAny(rest, " \t\n|&;()<>")
+		if end < 0 {
+			end = len(rest)
+		}
+		if p := cleanPathToken(rest[:end]); p != "" {
+			out = append(out, p)
 		}
 	}
-	return dedupe(out)
+	return out
+}
+
+// splitAttachedFlag splits `--targets=x`, `-l=x` and `-lx` into ("--targets", "x", true)
+// / ("-l", "x", true). A token without an attached value returns (tok, "", false).
+func splitAttachedFlag(tok string) (flag, value string, hasValue bool) {
+	if !strings.HasPrefix(tok, "-") {
+		return tok, "", false
+	}
+	if eq := strings.IndexByte(tok, '='); eq > 0 {
+		return strings.ToLower(tok[:eq]), tok[eq+1:], true
+	}
+	// GNU short option with an attached value: only for flags we know take one.
+	lower := strings.ToLower(tok)
+	for known := range targetFileFlag {
+		if len(known) == 2 && strings.HasPrefix(lower, known) && len(tok) > 2 {
+			return known, tok[2:], true
+		}
+	}
+	return lower, "", false
 }
 
 // toolMatches reports whether any token names one of the tools the flag
@@ -162,50 +217,81 @@ func looksLikePath(p string) bool {
 	if strings.HasPrefix(p, "/") || strings.HasPrefix(p, "./") || strings.HasPrefix(p, "../") {
 		return true
 	}
-	return strings.Contains(p, "/") || hostOnlyFiles[strings.ToLower(filepath.Ext(p)[1:])]
+	if strings.Contains(p, "/") {
+		return true
+	}
+	// An extensionless name ("targets", "hosts") has no Ext at all; slicing
+	// Ext(p)[1:] there panicked, and `cat targets | httpx` is a normal way to
+	// feed a target list.
+	ext := filepath.Ext(p)
+	if ext == "" {
+		return true
+	}
+	return hostOnlyFiles[strings.ToLower(ext[1:])]
 }
 
 // readTargetHosts reads one target list and returns the hosts it contains.
-// Files that parse as something else (wordlists, payload lists) yield nothing:
-// they are not an authorization source.
+//
+// The file was named as a target list, so anything it cannot be read as is a
+// fail-closed condition, not "no targets here". Returning (nil, nil) for a
+// directory, an oversized file, or a non-regular file let an agent point the
+// gate at something it would not read while the tool still scanned the real
+// hosts.
 func readTargetHosts(path string) ([]string, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
-	if fi.IsDir() {
-		return nil, nil
+	if !fi.Mode().IsRegular() {
+		// FIFOs, sockets and device nodes would block or stream forever inside
+		// the authorization path (`nuclei -l /dev/zero`).
+		return nil, fmt.Errorf("不是普通文件（%s）", fi.Mode().Type())
 	}
 	if fi.Size() > maxTargetFileBytes {
-		return nil, nil // too large to be a curated target list
+		return nil, fmt.Errorf("超过 %d 字节上限", maxTargetFileBytes)
 	}
-	data, err := os.ReadFile(path)
+	// Read through a LimitReader as well: Size() is advisory and a growing file
+	// would otherwise be buffered whole.
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxTargetFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxTargetFileBytes {
+		return nil, fmt.Errorf("读取过程中超过 %d 字节上限", maxTargetFileBytes)
+	}
 	lines := strings.Split(string(data), "\n")
 	if len(lines) > maxTargetFileLines {
-		lines = lines[:maxTargetFileLines]
+		// Silently truncating let an agent push out-of-scope hosts past the cap.
+		return nil, fmt.Errorf("超过 %d 行上限", maxTargetFileLines)
 	}
 	var hosts []string
-	valid, total := 0, 0
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		total++
-		if h, ok := parseTargetLine(line); ok {
-			valid++
-			hosts = append(hosts, h)
+		h, ok := parseTargetLine(line)
+		if !ok {
+			// A line the parser does not understand could be a host it failed to
+			// read; skipping it silently is how padding with junk hid targets.
+			return nil, fmt.Errorf("无法解析的行：%q", truncateForError(line))
 		}
-	}
-	// A file where most lines are not hosts is a wordlist/payload list, not an
-	// authorization source. Reading it as one would block every scan.
-	if total == 0 || valid*2 < total {
-		return nil, nil
+		hosts = append(hosts, h)
 	}
 	return dedupe(hosts), nil
+}
+
+// truncateForError keeps error text bounded when echoing an agent-supplied line.
+func truncateForError(s string) string {
+	if len(s) > 120 {
+		return s[:120] + "…"
+	}
+	return s
 }
 
 // parseTargetLine accepts URL / host[:port] / IP / CIDR lines.
@@ -213,8 +299,11 @@ func parseTargetLine(line string) (string, bool) {
 	if i := strings.Index(line, "://"); i >= 0 {
 		line = line[i+3:]
 	}
-	if h, _, ok := strings.Cut(line, "@"); ok {
-		line = h
+	// Keep the part AFTER the last '@': that is the host. Keeping the left side
+	// (the old strings.Cut behaviour) made "https://in-scope@evil.example/"
+	// authorize the in-scope userinfo while the tool talked to evil.example.
+	if at := strings.LastIndexByte(line, '@'); at >= 0 {
+		line = line[at+1:]
 	}
 	line = strings.TrimSpace(line)
 	if line == "" || strings.ContainsAny(line, " \t") {
@@ -267,6 +356,12 @@ func shellTokens(s string) []string {
 	var cur strings.Builder
 	var quote rune
 	escaped := false
+	flush := func() {
+		if cur.Len() > 0 {
+			out = append(out, cur.String())
+			cur.Reset()
+		}
+	}
 	for _, r := range s {
 		switch {
 		case escaped:
@@ -283,17 +378,17 @@ func shellTokens(s string) []string {
 		case r == '\'' || r == '"':
 			quote = r
 		case r == ' ' || r == '\t' || r == '\n':
-			if cur.Len() > 0 {
-				out = append(out, cur.String())
-				cur.Reset()
-			}
+			flush()
+		// Shell metacharacters terminate a word. Without this, `cat targets.txt|httpx`
+		// produced the single token "targets.txt|httpx", which cleanPathToken then
+		// rejected — so the target list was never read and the gate saw no hosts.
+		case r == '|' || r == ';' || r == '&' || r == '(' || r == ')' || r == '>' || r == '<':
+			flush()
 		default:
 			cur.WriteRune(r)
 		}
 	}
-	if cur.Len() > 0 {
-		out = append(out, cur.String())
-	}
+	flush()
 	return out
 }
 

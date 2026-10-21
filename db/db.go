@@ -274,10 +274,13 @@ ON CONFLICT (name) DO NOTHING`,
 		return fmt.Errorf("seed intercept rules: %w", err)
 	}
 	if err := d.seedDefaultInterceptRulesV2(); err != nil {
-		return fmt.Errorf("seed intercept rules v2: %w", err)
+		return err
 	}
 	if err := d.seedDefaultInterceptRulesV3(); err != nil {
 		return fmt.Errorf("seed intercept rules v3: %w", err)
+	}
+	if err := d.seedDefaultInterceptRulesV4(); err != nil {
+		return fmt.Errorf("seed intercept rules v4: %w", err)
 	}
 	if err := d.seedDefaultAssetInterceptRules(); err != nil {
 		return fmt.Errorf("seed asset intercept rules: %w", err)
@@ -531,6 +534,29 @@ ON CONFLICT DO NOTHING`,
 		}
 	}
 	return d.SetSetting("intercept_default_rules_v1", "done")
+}
+
+// seedDefaultInterceptRulesV4 adds the credential-file deny rule. Gated by its
+// own flag so it lands on databases that already ran v1–v3.
+//
+// The evidence signing key and the recorder token decide whether a retest
+// conclusion is accepted; reading them is the first step to forging a pack, so
+// the access is denied outright instead of being left to the fallback judge.
+func (d *DB) seedDefaultInterceptRulesV4() error {
+	if v, _, _ := d.GetSetting("intercept_default_rules_v4"); v == "done" {
+		return nil
+	}
+	if _, err := d.Exec(`
+INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+VALUES ($1, true, 100, 'tool_input', 'regex', $2, 'deny', $3, false, 60, 'deny')
+ON CONFLICT DO NOTHING`,
+		"[内置] 读取平台签名密钥",
+		`(?i)\.hmac-key|\.evidence-hmac-key|\.recorder-token|setup-token|\bjwt\.key\b`,
+		"禁止读取平台签名密钥 / 记录器令牌 / JWT 密钥（证据与身份凭据）",
+	); err != nil {
+		return fmt.Errorf("rule 读取平台签名密钥: %w", err)
+	}
+	return d.SetSetting("intercept_default_rules_v4", "done")
 }
 
 // seedDefaultInterceptRulesV2 migrates the two safety patterns that used to be
