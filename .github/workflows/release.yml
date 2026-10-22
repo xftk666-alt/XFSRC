@@ -53,13 +53,17 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ steps.version.outputs.tag }}
+          # 祖先判定需要完整历史：默认的 depth=1 克隆里标签提交和 local 尖端
+          # 各自是 shallow 根，merge-base 找不到共同祖先，会把合法的标签判成
+          # 「不在 local 历史中」。仓库只有十几 MB，直接拉全量。
+          fetch-depth: 0
       - name: Pin release commit
         id: commit
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Refuse to release a commit that is not on local
         # 标签可能打在任意提交上：只有位于 local 分支历史里的提交才是被审过的代码。
         run: |
-          git fetch --no-tags --depth=1 origin local
+          git fetch --no-tags origin local
           if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
             echo "标签提交不在 origin/local 历史中，拒绝发布：$(git rev-parse --short HEAD)" >&2
             exit 1
