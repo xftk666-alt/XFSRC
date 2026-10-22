@@ -176,6 +176,11 @@ jobs:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
     steps:
+      # 发布说明从 CHANGELOG.md 截取，所以这个 job 必须拿到工作区；
+      # 之前这里没有 checkout，release #14 的 awk 直接 "cannot open CHANGELOG.md"。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: pkg-*
@@ -237,25 +242,32 @@ jobs:
           echo "release body 长度: $(wc -c < /tmp/release-body.md) 字节"
 
       - name: Replace release only when the tag moved to a new commit
+        id: existing
         env:
           RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
+          skip=false
           if gh release view "$RELEASE_TAG" --json isDraft,targetCommitish > /tmp/rel.json 2>/tmp/rel.err; then
             draft=$(jq -r .isDraft /tmp/rel.json)
             target=$(jq -r '.targetCommitish // empty' /tmp/rel.json)
             if [[ "$draft" != "true" ]]; then
               if [[ "$target" == "$RELEASE_COMMIT" ]]; then
-                echo "该版本已发布且已指向当前提交，拒绝重复发布" >&2
-                exit 1
+                # 同一个提交重复触发（重跑、或标签被删后重推）：已发布的 Release
+                # 就是想要的结果。之前这里 exit 1，导致每次重跑都亮红灯。
+                echo "::notice::$RELEASE_TAG 已发布且指向 $RELEASE_COMMIT，无需重建"
+                skip=true
+              else
+                echo "标签已移动到新提交，删除旧 Release 后重新创建 $RELEASE_TAG"
+                gh release delete "$RELEASE_TAG" --yes
               fi
-              echo "标签已移动到新提交，删除旧 Release 后重新创建 $RELEASE_TAG"
-              gh release delete "$RELEASE_TAG" --yes
             fi
           elif ! grep -qi 'release not found\|HTTP 404' /tmp/rel.err; then
             cat /tmp/rel.err >&2
             exit 1
           fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        if: steps.existing.outputs.skip != 'true'
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: "${{ needs.prepare.outputs.tag }} — XFSRC 本地修订"
@@ -267,4 +279,5 @@ jobs:
             dist/SHA256SUMS
           body_path: /tmp/release-body.md
       - name: Publish complete release
+        if: steps.existing.outputs.skip != 'true'
         run: gh release edit "$RELEASE_TAG" --draft=false --latest
