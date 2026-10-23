@@ -138,7 +138,9 @@ type Interceptor struct {
 	db           *db.DB
 	mu           sync.RWMutex
 	cached       []compiledRule  // sorted by priority DESC; nil means not loaded yet
-	enabledTools map[string]bool // nil means not loaded yet
+	enabledTools    map[string]bool // explicit allow-list; used when enabledToolsAll is false
+	enabledToolsAll bool            // true = gate every tool except interceptExemptTools
+	toolsLoaded     bool            // the two fields above have been populated
 	pending      *pendingManager
 	reviewer     Reviewer // nil = LLM fallback judge not wired
 }
@@ -158,6 +160,58 @@ var defaultEnabledTools = []string{
 	"Write", "Edit", "MultiEdit",
 }
 
+// interceptExemptTools are the tools the rule layer never inspects when no
+// explicit allow-list has been saved. They either only read state or only touch
+// the platform's own stores, so a destructive-command/exfil rule cannot fire on
+// them, and scanning their text arguments produced false positives (a
+// record_fact note that merely mentions a hostname was blocked).
+//
+// Everything else is gated — including delete_assets_by_host, spawn_task,
+// create_custom_tool, create_mcp and mcp__* tool calls. A tool that gains a
+// side effect must be removed from this map.
+var interceptExemptTools = func() map[string]bool {
+	m := map[string]bool{}
+	for _, n := range []string{
+		"list_assets", "count_assets", "list_findings", "list_companies", "list_tasks",
+		"list_task_findings", "list_llm_profiles", "list_untested_assets",
+		"list_task_worker_traces", "search_task_worker_traces", "search_finding_duplicates",
+		"get_task_graph", "get_task_node_detail", "get_task_worker_trace",
+		"get_finding_traffic", "get_finding_retest_context", "get_finding_case",
+		"node_detail", "read_task_hint", "todo_write", "todo_read",
+		"record_fact", "add_intent", "set_goals", "set_constraints", "prove_goal",
+	} {
+		m[n] = true
+	}
+	return m
+}()
+
+// allGatedTools lists every tool the layer currently gates, for the settings UI.
+func (i *Interceptor) allGatedTools() ([]string, error) {
+	rows, err := i.db.ListTools()
+	if err != nil {
+		// Keep the UI honest rather than showing an empty coverage set.
+		out := make([]string, len(defaultEnabledTools))
+		copy(out, defaultEnabledTools)
+		return out, nil
+	}
+	// SDK-provided tools have no row in the tools table, but they are gated like
+	// everything else, so the UI must still list them.
+	seen := map[string]bool{}
+	out := make([]string, 0, len(rows)+len(defaultEnabledTools))
+	for _, n := range defaultEnabledTools {
+		seen[n] = true
+		out = append(out, n)
+	}
+	for _, t := range rows {
+		if t == nil || seen[t.Key] || interceptExemptTools[t.Key] {
+			continue
+		}
+		seen[t.Key] = true
+		out = append(out, t.Key)
+	}
+	return out, nil
+}
+
 // New creates an Interceptor backed by d. The rule cache is lazy-loaded on
 // first use.
 func New(d *db.DB) *Interceptor {
@@ -171,6 +225,8 @@ func (i *Interceptor) Invalidate() {
 	i.mu.Lock()
 	i.cached = nil
 	i.enabledTools = nil
+	i.enabledToolsAll = false
+	i.toolsLoaded = false
 	i.mu.Unlock()
 }
 
@@ -202,26 +258,25 @@ func (i *Interceptor) loadLocked() error {
 	}
 	i.cached = out
 
-	// Load enabled-tools set from settings, falling back to hard-coded defaults.
+	// Load enabled-tools set from settings. With no saved setting the layer now
+	// covers EVERY tool except a small read-only exempt set: the previous
+	// hard-coded 8-name list left delete_assets_by_host, spawn_task,
+	// create_custom_tool and create_mcp completely ungoverned, which is the
+	// opposite of what a safety layer should default to.
 	val, ok, _ := i.db.GetSetting("intercept_enabled_tools")
+	i.toolsLoaded = true
 	if !ok {
-		m := make(map[string]bool, len(defaultEnabledTools))
-		for _, n := range defaultEnabledTools {
-			m[n] = true
-		}
-		i.enabledTools = m
+		i.enabledToolsAll = true
+		i.enabledTools = nil
 	} else {
 		var names []string
 		if json.Unmarshal([]byte(val), &names) != nil {
 			// Corrupt JSON previously cached an empty set, which disabled the
 			// whole intercept layer until someone repaired the setting. Fall
 			// back to the built-in defaults instead.
-			log.Printf("[intercept] intercept_enabled_tools 无法解析，回退内置默认列表")
-			m := make(map[string]bool, len(defaultEnabledTools))
-			for _, n := range defaultEnabledTools {
-				m[n] = true
-			}
-			i.enabledTools = m
+			log.Printf("[intercept] intercept_enabled_tools 无法解析，回退「除只读工具外全部启用」")
+			i.enabledToolsAll = true
+			i.enabledTools = nil
 		} else {
 			m := make(map[string]bool, len(names))
 			for _, n := range names {
@@ -258,8 +313,8 @@ func (i *Interceptor) rules() ([]compiledRule, error) {
 // pattern as rules().
 func (i *Interceptor) IsToolEnabled(name string) bool {
 	i.mu.RLock()
-	if i.enabledTools != nil {
-		v := i.enabledTools[name]
+	if i.toolsLoaded {
+		v := i.toolEnabledLocked(name)
 		i.mu.RUnlock()
 		return v
 	}
@@ -267,7 +322,7 @@ func (i *Interceptor) IsToolEnabled(name string) bool {
 
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.enabledTools == nil {
+	if !i.toolsLoaded {
 		if err := i.loadLocked(); err != nil {
 			// A failed load is not "no tools are gated": treating it that way
 			// skipped every rule (including the destructive-command denies) for
@@ -276,8 +331,14 @@ func (i *Interceptor) IsToolEnabled(name string) bool {
 			return true
 		}
 	}
-	if i.enabledTools == nil {
-		return true
+	return i.toolEnabledLocked(name)
+}
+
+// toolEnabledLocked answers the enabled question for an already-loaded cache.
+// Caller holds at least a read lock.
+func (i *Interceptor) toolEnabledLocked(name string) bool {
+	if i.enabledToolsAll {
+		return !interceptExemptTools[name]
 	}
 	return i.enabledTools[name]
 }
@@ -291,9 +352,10 @@ func (i *Interceptor) GetEnabledTools() ([]string, error) {
 		return nil, err
 	}
 	if !ok {
-		out := make([]string, len(defaultEnabledTools))
-		copy(out, defaultEnabledTools)
-		return out, nil
+		// Report what the runtime actually gates: every known tool except the
+		// read-only exempt set, so the UI shows the real coverage instead of the
+		// old 8-name list.
+		return i.allGatedTools()
 	}
 	var names []string
 	if err := json.Unmarshal([]byte(val), &names); err != nil {

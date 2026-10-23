@@ -56,6 +56,11 @@ type ToolSet struct {
 	cs              *db.CompanyStore // company store (optional)
 	ts              *db.ExplorationStore
 	worker          string
+	// operatorText is the task description + goal as the operator wrote them.
+	// The goal decomposer may only register scope that appears verbatim here:
+	// it reads untrusted-in-principle text, and a decoded/derived hostname is
+	// exactly what prompt injection would smuggle into a trusted scope row.
+	operatorText string
 	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the

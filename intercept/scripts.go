@@ -162,6 +162,13 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 		}
 		refs = append(refs, scriptReference{path: absolute, direct: direct})
 	}
+	// nested analyzes a fragment that another construct will execute: a sourced
+	// file's body, eval's argument, or the command behind xargs/find -exec.
+	// depth bounds self-referential scripts; remaining is shared so a chain of
+	// nested fragments cannot exceed the parse budget.
+	nested := func(code, baseDir string) []scriptReference {
+		return scriptReferencesBounded(code, baseDir, depth+1, remaining)
+	}
 	// Walking the AST visits calls inside command substitutions as well, but not
 	// string literals, comments or heredoc bodies. Function bodies/conditional cd
 	// cannot establish a reliable working directory for subsequent calls.
@@ -262,9 +269,35 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 					}
 					refs[index] = ref
 					sourceInputs[call] = reviewSourceInput{ref: ref}
+					// A sourced file is itself a script: `source a.sh` where a.sh
+					// does `source b.sh` or `python3 evil.py` left b.sh and evil.py
+					// uncaptured, so the target inside them was invisible to both
+					// the judge and the authorization gate.
+					if ref.content != "" {
+						refs = append(refs, nested(ref.content, filepath.Dir(ref.path))...)
+					}
 				}
 			} else {
 				refs = append(refs, scriptReference{problem: "source 缺少脚本路径"})
+			}
+			return true
+		}
+		// eval evaluates its arguments as shell code in the current shell, so the
+		// text has to be treated as a script rather than as opaque arguments.
+		if base == "eval" && len(args) > 1 {
+			if code, ok := staticWord(args[1]); ok && code != "" {
+				refs = append(refs, nested(code, dir)...)
+			} else {
+				refs = append(refs, scriptReference{problem: "eval 的参数含动态展开，无法确定实际执行的代码"})
+			}
+			return true
+		}
+		// xargs and `find -exec` run another program with arguments they build.
+		// Recurse on the tail so the inner command is analyzed like a top-level
+		// one; a dynamic tail still fails closed through the usual path.
+		if base == "xargs" || (base == "find" && hasExecFlag(args)) {
+			if tail := commandTail(args); tail != "" {
+				refs = append(refs, nested(tail, dir)...)
 			}
 			return true
 		}
@@ -440,12 +473,20 @@ func captureScripts(workingDir, tool string, arguments json.RawMessage) ([]Revie
 	if strings.TrimSpace(command) == "" {
 		return nil, "not_applicable"
 	}
-	refs := scriptReferences(command, workingDir, 0)
+	// Work queue: a script file's body is itself a script, so anything it sources
+	// or launches has to be captured too. `sh a.sh` where a.sh does
+	// `source b.sh` / `python3 evil.py` used to leave b.sh and evil.py invisible
+	// to both the judge and the authorization gate.
+	queue := scriptReferences(command, workingDir, 0)
+	expanded := map[string]bool{}
+	expansions := 0
 	var files []ReviewScript
 	seen := map[string]bool{}
 	status := "complete"
 	total := 0
-	for _, ref := range refs {
+	for len(queue) > 0 {
+		ref := queue[0]
+		queue = queue[1:]
 		key := ref.path + ref.problem
 		if ref.inline {
 			hash := sha256.Sum256([]byte(ref.content))
@@ -520,6 +561,20 @@ func captureScripts(workingDir, tool string, arguments json.RawMessage) ([]Revie
 		file.Complete = true
 		total += len(content)
 		files = append(files, file)
+		// Expand this body once, with a hard cap so a self-referential script
+		// cannot spin. The path key keeps `a.sh` sourcing `a.sh` to one pass.
+		// Only a shell body can be re-parsed as shell. Treating a Python/JS body
+		// as shell produced a parse error and a fail-closed "incomplete" verdict
+		// for perfectly ordinary scripts; their text is already captured above and
+		// scanned for network targets by the authorization gate.
+		// Generated entries are this command's own output (e.g. sed rewriting a
+		// file): their content is already captured and re-parsing it as shell
+		// would invent a "dynamic entry point" failure for ordinary data.
+		if !ref.generated && isShellScriptPath(ref.path) && !expanded[ref.path] && expansions < 16 && ref.path != "" {
+			expanded[ref.path] = true
+			expansions++
+			queue = append(queue, scriptReferences(string(content), filepath.Dir(ref.path), 1)...)
+		}
 	}
 	if len(files) == 0 {
 		return nil, "not_applicable"
@@ -543,4 +598,73 @@ func readScript(path string) ([]byte, error) {
 	}
 	defer f.Close()
 	return io.ReadAll(io.LimitReader(f, maxReviewScriptBytes+1))
+}
+
+// hasExecFlag reports whether a find invocation uses -exec/-execdir/-ok, i.e.
+// runs another program whose arguments this analysis would otherwise miss.
+func hasExecFlag(args []*syntax.Word) bool {
+	for _, a := range args[1:] {
+		if v, ok := staticWord(a); ok {
+			switch v {
+			case "-exec", "-execdir", "-ok", "-okdir":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// commandTail rebuilds the command that xargs/find -exec will run: the first
+// non-flag word after the tool's own flags, plus everything after it.
+func commandTail(args []*syntax.Word) string {
+	words := make([]string, 0, len(args))
+	for _, a := range args[1:] {
+		v, ok := staticWord(a)
+		if !ok {
+			return ""
+		}
+		words = append(words, v)
+	}
+	for i, w := range words {
+		if w == "-exec" || w == "-execdir" || w == "-ok" || w == "-okdir" {
+			rest := words[i+1:]
+			// The terminator is a literal ';' or '+'.
+			for len(rest) > 0 && (rest[len(rest)-1] == ";" || rest[len(rest)-1] == "+") {
+				rest = rest[:len(rest)-1]
+			}
+			return strings.Join(rest, " ")
+		}
+	}
+	// xargs: skip its own flags (and the values of the ones that take one).
+	i := 0
+	for i < len(words) {
+		w := words[i]
+		if !strings.HasPrefix(w, "-") {
+			return strings.Join(words[i:], " ")
+		}
+		if xargsValueFlag[w] && i+1 < len(words) {
+			i += 2
+			continue
+		}
+		i++
+	}
+	return ""
+}
+
+// xargsValueFlag lists xargs flags whose value is not part of the command.
+var xargsValueFlag = map[string]bool{
+	"-a": true, "--arg-file": true, "-E": true, "-e": true, "-I": true,
+	"-L": true, "-n": true, "-P": true, "-s": true, "-d": true, "--delimiter": true,
+	"--max-args": true, "--max-procs": true, "--max-chars": true, "--replace": true,
+}
+
+// isShellScriptPath reports whether a file body should be parsed as shell. An
+// extensionless file is included: `source ./lib` and shebang-only scripts are
+// normal. Anything with a known non-shell extension is not.
+func isShellScriptPath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case "", ".sh", ".bash", ".zsh", ".ksh", ".ash", ".dash", ".bashrc", ".profile":
+		return true
+	}
+	return false
 }
