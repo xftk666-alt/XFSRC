@@ -179,14 +179,55 @@ func (d Database) buildDSN() string {
 
 // String is a redacted view of the resolved DSN (password masked) for logging.
 func Redact(dsn string) string {
+	// libpq keyword/value form (`host=db password=s3cret dbname=x`) parses as a
+	// URL with the whole string in Path and no User, so the URI handling below
+	// returned it verbatim — password included — straight into the startup error
+	// message. Redact by key first.
+	if !strings.Contains(dsn, "://") {
+		return redactKeywordDSN(dsn)
+	}
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return dsn
+		// Unparseable is not safe to echo: a malformed port or escape is exactly
+		// what an operator typo produces, and the string still holds the password.
+		return redactKeywordDSN(dsn)
 	}
 	if u.User != nil {
 		if _, hasPw := u.User.Password(); hasPw {
 			u.User = url.UserPassword(u.User.Username(), "****")
 		}
 	}
-	return fmt.Sprintf("%s", u.String())
+	// A password may also ride in the query (`?password=...`), which libpq accepts
+	// for URI DSNs.
+	if q := u.Query(); q.Get("password") != "" {
+		q.Set("password", "****")
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
+
+// redactKeywordDSN masks password= values in a libpq keyword/value DSN, and in
+// anything that failed to parse as a URI.
+func redactKeywordDSN(dsn string) string {
+	fields := strings.Fields(dsn)
+	changed := false
+	for i, f := range fields {
+		if !strings.HasPrefix(strings.ToLower(f), "password=") {
+			continue
+		}
+		if eq := strings.IndexByte(f, '='); eq >= 0 {
+			fields[i] = f[:eq+1] + "****"
+			changed = true
+		}
+	}
+	if changed {
+		return strings.Join(fields, " ")
+	}
+	// Nothing looked like a key/value pair: mask any userinfo-looking span.
+	if at := strings.LastIndex(dsn, "@"); at >= 0 {
+		if colon := strings.Index(dsn, ":"); colon >= 0 && colon < at {
+			return dsn[:colon+1] + "****" + dsn[at:]
+		}
+	}
+	return dsn
 }

@@ -79,7 +79,6 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 		_ = json.Unmarshal(ev.Input, &in)
 		cmd = in.Text
 	}
-	g.record(ev.ToolName, "allow", "", cmd)
 	// Authorization boundary first: it is the one gate that must never be
 	// bypassed by a rule/judge configuration change.
 	if g.scope != nil {
@@ -93,7 +92,15 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 			return g.block(ev.ToolName, systemBlockMessage(reason), cmd)
 		}
 	}
-	return g.applyIntercept(ctx, ev)
+	res := g.applyIntercept(ctx, ev)
+	// The allow row is written only after every gate has passed. Recording it
+	// up-front left an "allow" row next to the "block" row for every blocked
+	// call, so any consumer aggregating by Action counted blocked calls as
+	// allowed.
+	if res.Decision == "" {
+		g.record(ev.ToolName, "allow", "", cmd)
+	}
+	return res
 }
 
 // applyIntercept evaluates user-configured intercept rules against the tool call.

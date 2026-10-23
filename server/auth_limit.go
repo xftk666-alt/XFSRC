@@ -74,12 +74,17 @@ func (l *loginLimiter) evictSoonestLocked(now time.Time) {
 			delete(l.buckets, k)
 		}
 	}
+	// Evict the bucket that expires LAST, i.e. the newest one. `reset` is
+	// createdAt+window, so the earliest reset belongs to the oldest bucket — and
+	// the oldest bucket is the one that has already reached max and is doing the
+	// throttling. Dropping it (as the previous smallest-reset scan did) cleared
+	// the attacker's own saturated counter, the opposite of the intent above.
 	for len(l.buckets) > maxLoginBuckets {
 		var victim string
 		var victimReset time.Time
 		first := true
 		for k, v := range l.buckets {
-			if first || v.reset.Before(victimReset) {
+			if first || v.reset.After(victimReset) {
 				victim, victimReset, first = k, v.reset, false
 			}
 		}
@@ -151,11 +156,10 @@ func forwardedClientIP(r *http.Request) string {
 			return ""
 		}
 	}
-	if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {
-		if ip := net.ParseIP(real); ip != nil {
-			return ip.String()
-		}
-	}
+	// X-Real-IP is deliberately NOT consulted. It is a second, independent header
+	// that a proxy may or may not overwrite, so trusting it after an absent or
+	// malformed X-Forwarded-For let any client choose its own throttle bucket (and
+	// its own first-run loopback status). Deployments must set X-Forwarded-For.
 	return ""
 }
 

@@ -193,12 +193,24 @@ func (s *Server) addCompanyScope(w http.ResponseWriter, r *http.Request) {
 		Scope  companyScopeInputs `json:"scope"`
 		Reason string             `json:"reason"`
 		Reset  bool               `json:"reset"` // if true, replace existing scope
+		// ConfirmEmpty must be set explicitly to clear a scope with an empty
+		// list; see the guard below.
+		ConfirmEmpty bool `json:"confirm_empty"`
 	}
 	if !decodeCompanyMutationRequest(w, r, &req) {
 		return
 	}
 	if err := db.ValidateCompanyScopeInputBounds(req.Scope); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// A reset with an empty list wipes the company's entire authorization scope
+	// (UpdateScopeInputsChecked deletes every row before re-adding). Requiring an
+	// explicit confirmation turns a truncated or mistyped request into a 400
+	// instead of a silent loss of the operator's scope.
+	if req.Reset && len(req.Scope) == 0 && !req.ConfirmEmpty {
+		writeErr(w, http.StatusBadRequest,
+			"reset 且 scope 为空会清空该企业的全部授权范围；如确需清空，请传 confirm_empty:true")
 		return
 	}
 	var added, skipped, invalid int

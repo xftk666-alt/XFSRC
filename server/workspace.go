@@ -46,6 +46,16 @@ var wsSensitiveNames = map[string]bool{
 }
 
 func (s *Server) wsResolve(rel string) (string, bool) {
+	return s.wsResolveIn(rel, true)
+}
+
+// wsResolveIn is wsResolve with the runtime-secret denylist made optional.
+//
+// Chat attachments legitimately live under <dataDir>/sessions/<id>/uploads and
+// draft staging under <dataDir>/drafts/<id>/uploads, i.e. inside subtrees the
+// file manager must never expose. Those callers need the containment and symlink
+// resolution without the denylist, or every upload is rejected.
+func (s *Server) wsResolveIn(rel string, denySensitive bool) (string, bool) {
 	base := filepath.Clean(s.m.dir)
 	rel = strings.TrimPrefix(strings.TrimSpace(rel), "/")
 	clean := filepath.Clean("/" + rel) // e.g. "/a/../../etc" → "/etc" (still rooted at "/")
@@ -55,7 +65,7 @@ func (s *Server) wsResolve(rel string) (string, bool) {
 	}
 	// Deny the runtime-secret subtrees outright (checked on the cleaned relative
 	// path so neither "." nor a trailing slash can slip through).
-	if wsDeniedSegments(base, abs) {
+	if denySensitive && wsDeniedSegments(base, abs) {
 		return "", false
 	}
 	// Lexical confinement is not enough: a symlink inside the work dir can point
@@ -79,7 +89,7 @@ func (s *Server) wsResolve(rel string) (string, bool) {
 			if real != realBase && !strings.HasPrefix(real, realBase+string(os.PathSeparator)) {
 				return "", false
 			}
-			if wsDeniedSegments(realBase, real) {
+			if denySensitive && wsDeniedSegments(realBase, real) {
 				return "", false
 			}
 			// Return the RESOLVED path, not the lexical one. Callers reopen what
@@ -269,6 +279,14 @@ func (s *Server) wsWrite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "目标是目录")
 		return
 	}
+	// The denylist only inspects path segments, so an existing file has to be
+	// rejected here as well: an agent can `ln <dataDir>/jwt.key notes.txt` and
+	// then have the operator "edit" notes.txt through this route, overwriting the
+	// signing key through the hard link.
+	if err := checkWorkspaceFile(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -309,7 +327,15 @@ func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	if abs == filepath.Clean(s.m.dir) {
+	// wsResolve returns the symlink-RESOLVED path, so the root comparison has to
+	// use the resolved root too. Comparing against the lexical dir left this guard
+	// inert whenever the data dir (or an ancestor) is a symlink: the request for ""
+	// then deleted the entire workspace.
+	root := filepath.Clean(s.m.dir)
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	if abs == root {
 		writeErr(w, 400, "不能删除工作区根目录")
 		return
 	}

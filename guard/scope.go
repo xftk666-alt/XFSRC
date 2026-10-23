@@ -64,10 +64,42 @@ var hostOnlyFiles = map[string]bool{
 	"svg": true, "ico": true, "woff": true, "woff2": true, "ttf": true, "map": true,
 }
 
+// nonNetworkTools never open a network connection. Their arguments are data the
+// agent wants to store or read back, so scanning them for hostnames produced
+// false blocks: `record_fact` describing "bar.localhost:9317" was rejected as an
+// out-of-scope target, and the model learned to obfuscate hostnames to get its
+// own notes written. A tool that later gains network capability must be removed
+// from this set.
+var nonNetworkTools = map[string]bool{
+	"record_fact": true, "add_intent": true, "set_goals": true, "set_constraints": true,
+	"prove_goal": true, "node_detail": true, "list_assets": true, "count_assets": true,
+	"insert_assets": true, "add_company_scope": true, "list_findings": true,
+	"report_finding": true, "update_finding_report": true, "get_task_node_detail": true,
+	"get_task_graph": true, "list_tasks": true, "list_task_findings": true,
+	"add_hint": true, "add_task_hint": true, "list_companies": true,
+	"set_skill_state": true, "Skill": true, "skill_close": true,
+	"todo_write": true, "todo_read": true,
+}
+
 // ExtractHosts pulls candidate network targets out of a tool call. It is
 // intentionally conservative: URLs, IPv4 literals and dotted hostnames are
 // collected; quoted file paths with ordinary extensions are ignored.
+//
+// It cannot report "I could not tell", so a call whose target is undeterminable
+// looks identical to one with no target. Authorization paths must use
+// ExtractHostsChecked.
 func ExtractHosts(tool string, input []byte) []string {
+	hosts, _ := ExtractHostsChecked(tool, input)
+	return hosts
+}
+
+// ExtractHostsChecked is ExtractHosts plus a fail-closed reason. A non-empty
+// reason means the call must be blocked: the input named a network target in a
+// form the extractor could not resolve, so "no hosts found" would be a guess.
+func ExtractHostsChecked(tool string, input []byte) (hosts []string, blockReason string) {
+	if nonNetworkTools[tool] {
+		return nil, ""
+	}
 	var raw string
 	switch tool {
 	case "Bash", "shell_open":
@@ -95,7 +127,7 @@ func ExtractHosts(tool string, input []byte) []string {
 		raw = strings.Join(jsonStrings(input), "\n")
 	}
 	if strings.TrimSpace(raw) == "" {
-		return nil
+		return nil, ""
 	}
 
 	seen := map[string]bool{}
@@ -122,7 +154,15 @@ func ExtractHosts(tool string, input []byte) []string {
 		return false
 	}
 	for _, span := range urlSpans {
-		add(hostFromURL(raw[span[0]:span[1]]))
+		h, ok := hostFromURL(raw[span[0]:span[1]])
+		if !ok {
+			// A URL the Go parser rejects is still a URL the tool will fetch:
+			// libcurl accepts percent-encoded host labels that net/url rejects
+			// outright (`http://host%2e:80/`), so treating a parse error as "no
+			// target" made the gate optional.
+			return out, "URL 无法解析，无法确认目标，已按 fail-closed 阻止：" + truncateForError(raw[span[0]:span[1]])
+		}
+		add(h)
 	}
 	for _, ip := range ipv4Pattern.FindAllString(raw, -1) {
 		add(ip)
@@ -142,30 +182,44 @@ func ExtractHosts(tool string, input []byte) []string {
 			add(ip)
 		}
 	}
-	// Single-label targets ("juice-shop:3000", "localhost:3000", "localhost").
-	// Only consulted when the command actually names a network tool, so
-	// `docker run -p 8080:80` is not mistaken for a target.
-	if mentionsNetworkTool(raw) {
-		// The regexp is applied to raw text, so `api.example.com:8443` also
-		// matches `com:8443` at the dot boundary (Go's RE2 has no lookbehind).
-		// Accept a match only when the character before it is not part of a
-		// hostname — otherwise every port-qualified URL grew a bogus TLD target
-		// that no scope entry could ever contain, blocking all of them.
-		for _, m := range singleLabelHostPort.FindAllStringSubmatchIndex(raw, -1) {
-			start := m[2] // group 1 (host) start
-			if start > 0 && isHostByte(raw[start-1]) {
-				continue
-			}
-			port := raw[m[4]:m[5]]
-			if p, ok := atoiPort(port); !ok || p == 0 {
-				continue
-			}
-			host := strings.ToLower(raw[m[2]:m[3]])
-			if host == "http" || host == "https" || host == "ftp" || host == "file" {
-				continue
-			}
-			add(host)
+	// Single-label targets ("juice-shop:3000", "localhost:3000"). This used to
+	// run only when the command named a tool from the networkTools list, which
+	// made every client outside that list invisible: `openssl s_client -connect
+	// juice-shop:3000`, `redis-cli -h juice-shop`, `socat - TCP:juice-shop:3000`
+	// and `grpcurl juice-shop:443 list` all reached the network with no host
+	// extracted. Position is the evidence now, not the tool name.
+	//
+	// The regexp runs on raw text, so `api.example.com:8443` also matches
+	// `com:8443` at the dot boundary (Go's RE2 has no lookbehind); accept a match
+	// only when the character before it is not part of a hostname.
+	for _, m := range singleLabelHostPort.FindAllStringSubmatchIndex(raw, -1) {
+		start := m[2] // group 1 (host) start
+		if start > 0 && isHostByte(raw[start-1]) {
+			continue
 		}
+		port := raw[m[4]:m[5]]
+		if p, ok := atoiPort(port); !ok || p == 0 {
+			continue
+		}
+		host := strings.ToLower(raw[m[2]:m[3]])
+		if host == "http" || host == "https" || host == "ftp" || host == "file" {
+			continue
+		}
+		// An all-numeric label is a port mapping or a clock time
+		// (`docker run -p 8080:80`, `12:30`), never a hostname.
+		if isAllDigits(host) {
+			continue
+		}
+		add(host)
+	}
+	// A host given as a flag value (`redis-cli -h juice-shop`,
+	// `openssl s_client -connect juice-shop:443`) carries no port in the common
+	// case, so the host:port regexp above cannot see it and the tool name is not
+	// in any list the gate consults. The flag name is the evidence here.
+	for _, h := range hostFlagValues(raw) {
+		add(h)
+	}
+	if mentionsNetworkTool(raw) {
 		// Operand pass: a network tool's non-flag arguments are targets even when
 		// they carry no port and look like filenames ("curl localhost",
 		// "nmap evil.zip", "nmap Evil1234567890.com"). The dotted-host regexp
@@ -175,7 +229,53 @@ func ExtractHosts(tool string, input []byte) []string {
 			add(op)
 		}
 	}
+	return out, ""
+}
+
+// hostFlagFlags are flags whose value is a network target rather than a
+// payload, a header, or a file.
+var hostFlagFlags = map[string]bool{
+	"-h": true, "--host": true, "--hostname": true,
+	"-connect": true, "--connect": true, "--connect-to": true,
+	"--server": true, "--address": true, "--target-host": true,
+}
+
+// hostFlagValues returns the target operands of host-taking flags. Both
+// `-h host` and `--host=host` forms are handled.
+func hostFlagValues(raw string) []string {
+	tokens := shellTokens(raw)
+	var out []string
+	for i, tok := range tokens {
+		flag, value, hasValue := splitAttachedFlag(tok)
+		if !hostFlagFlags[flag] {
+			continue
+		}
+		if hasValue {
+			if h := operandHost(value); h != "" {
+				out = append(out, h)
+			}
+			continue
+		}
+		if i+1 < len(tokens) && !strings.HasPrefix(tokens[i+1], "-") {
+			if h := operandHost(tokens[i+1]); h != "" {
+				out = append(out, h)
+			}
+		}
+	}
 	return out
+}
+
+// isAllDigits reports whether s is a non-empty run of ASCII digits.
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // isHostByte reports whether b can be part of a hostname label. Used to reject
@@ -276,7 +376,8 @@ func operandHost(tok string) string {
 		return ""
 	}
 	if strings.Contains(tok, "://") {
-		return hostFromURL(tok)
+		h, _ := hostFromURL(tok)
+		return h
 	}
 	// Drop userinfo the way a URL parser would.
 	if at := strings.LastIndexByte(tok, '@'); at >= 0 {
@@ -414,7 +515,8 @@ func extractFromText(text string) []string {
 	for _, line := range strings.Split(text, "\n") {
 		// URLs and IPs are unambiguous wherever they appear.
 		for _, u := range urlPattern.FindAllString(line, -1) {
-			add(hostFromURL(u))
+			h, _ := hostFromURL(u)
+			add(h)
 		}
 		for _, ip := range ipv4Pattern.FindAllString(line, -1) {
 			add(ip)
@@ -691,11 +793,20 @@ func normalizeHost(h string) string {
 // "http://allowed.com:pw@internal/x" targets "internal", not "allowed.com".
 // Returning the userinfo (as the old hand-rolled split did) let a call target an
 // out-of-scope host while the gate only ever checked an in-scope one.
-func hostFromURL(raw string) string {
+func hostFromURL(raw string) (string, bool) {
 	raw = strings.TrimSpace(raw)
 	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		return ""
+	if err != nil {
+		return "", false
 	}
-	return u.Hostname()
+	if u.Host == "" {
+		// No authority at all: nothing to judge, but also nothing unparseable
+		// (the regexp can catch a bare word).
+		return "", true
+	}
+	h := u.Hostname()
+	if h == "" {
+		return "", false
+	}
+	return h, true
 }

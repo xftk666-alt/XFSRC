@@ -168,6 +168,7 @@ func ParseVerdict(text string) Verdict {
 	// Unknown keys are ignored rather than rejected: a model that adds
 	// `confidence` still gave an unambiguous verdict.
 	seen := map[string]bool{}
+	unknownKey := false
 	var action, reason string
 	for dec.More() {
 		tok, err := dec.Token()
@@ -179,20 +180,28 @@ func ParseVerdict(text string) Verdict {
 			return Verdict{}
 		}
 		seen[key] = true
-		var value *string
-		if err := dec.Decode(&value); err != nil {
+		// Decode into RawMessage, not *string: a model that adds
+		// `"confidence": 0.95` or `"extra": true` would otherwise fail the whole
+		// decode, and the discarded verdict fell through to the model-failure
+		// action (allow by default) — the opposite of what the model said.
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
 			return Verdict{}
 		}
 		switch key {
 		case "decision":
-			if value == nil {
+			var v string
+			if err := json.Unmarshal(raw, &v); err != nil {
 				return Verdict{}
 			}
-			action = *value
+			action = v
 		case "comment":
-			if value != nil {
-				reason = strings.TrimSpace(*value)
+			var v string
+			if err := json.Unmarshal(raw, &v); err == nil {
+				reason = strings.TrimSpace(v)
 			}
+		default:
+			unknownKey = true
 		}
 	}
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
@@ -209,8 +218,22 @@ func ParseVerdict(text string) Verdict {
 	if action != "allow" && action != "ask" && action != "deny" {
 		return Verdict{}
 	}
+	// An unexpected key means the reply is not the schema we asked for, so a
+	// permissive verdict is refused. On deny/ask it is tolerated: refusing it
+	// would send the caller to its model-failure action, which is `allow` by
+	// default.
+	if unknownKey && action == "allow" {
+		return Verdict{}
+	}
 	if len(reason) > maxVerdictCommentBytes {
-		return Verdict{} // unbounded explanations are refused, not truncated
+		// Bound the text, never the decision. Refusing a verbose deny/ask sent
+		// the caller to that same default-allow path. An over-long `allow` is
+		// still refused below by completeExplanation, which is the permissive
+		// direction and must not be accepted on a truncated justification.
+		if action == "allow" {
+			return Verdict{}
+		}
+		reason = reason[:maxVerdictCommentBytes]
 	}
 	if !completeExplanation(reason) {
 		// A deny/ask with a sloppy explanation is still the safe direction, so it

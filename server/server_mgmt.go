@@ -2232,14 +2232,35 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build HTTP client with optional proxy.
+	// Build HTTP client with optional proxy. The proxy address is user input and
+	// used to go to the transport unchecked: it is a second SSRF surface (the dial
+	// goes wherever it names, and the request URL is handed to that proxy), so it
+	// gets the same validation as base_url.
 	transport := &http.Transport{}
 	if p := strings.TrimSpace(req.Proxy); p != "" {
-		if pu, err := url.Parse(p); err == nil {
-			transport.Proxy = http.ProxyURL(pu)
+		if err := validateProbeURL(p); err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": "代理地址无效: " + err.Error()})
+			return
 		}
+		pu, err := url.Parse(p)
+		if err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": "代理地址无效"})
+			return
+		}
+		transport.Proxy = http.ProxyURL(pu)
 	}
-	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+		// Without this Go follows up to 10 redirects to any destination, so a
+		// validated base_url could bounce the probe to an internal address.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return errors.New("重定向次数过多")
+			}
+			return validateProbeURL(req.URL.String())
+		},
+	}
 
 	// Try each candidate; return the first that yields a non-empty model list.
 	var lastErr string

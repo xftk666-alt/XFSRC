@@ -3,11 +3,13 @@ package server
 import (
 	"crypto/rand"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -220,6 +222,10 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			writeErr(w, 401, "未授权")
 			return
 		}
+		if !s.tokenGenerationKnown() {
+			writeErr(w, 503, "令牌代数不可用，请稍后重试")
+			return
+		}
 		if !verifyJWT(tok, s.jwtKey, s.tokenVersion()) {
 			writeErr(w, 401, "token 无效或已过期")
 			return
@@ -254,6 +260,13 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
+		return
+	}
+	// CSRF: this route is unauthenticated by necessity, so the browser's own
+	// cross-origin markers are the only thing separating the operator from a page
+	// the operator is visiting.
+	if isBrowserCrossSite(r) {
+		writeErr(w, 403, "拒绝跨站请求：请在服务器本机或直接访问本站完成初始化")
 		return
 	}
 	existing, _, err := pg.GetSetting(authPassKey)
@@ -423,10 +436,17 @@ func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
 // tokenVersion returns the current JWT generation (0 when the DB has none yet).
 func (s *Server) tokenVersion() int64 { return s.tokenVer.Load() }
 
+// tokenGenerationKnown reports whether the persisted generation was read
+// successfully. While it is false every token is rejected: an unknown generation
+// cannot be matched, and assuming 0 would un-revoke tokens.
+func (s *Server) tokenGenerationKnown() bool { return !s.tokenVerUnknown.Load() }
+
 // bumpTokenVersion persists and publishes the next generation.
 func (s *Server) bumpTokenVersion() (int64, error) {
 	if s.m.pg == nil {
-		return s.tokenVer.Load(), nil
+		// Reporting success here made logout and password change silent no-ops
+		// while every previously issued token kept verifying.
+		return 0, errors.New("数据库不可用，无法递增令牌代数")
 	}
 	tx, err := s.m.pg.Begin()
 	if err != nil {
@@ -469,12 +489,31 @@ func (s *Server) loadTokenVersion() {
 		return
 	}
 	raw, ok, err := s.m.pg.GetSetting(authTokenVersionKey)
-	if err != nil || !ok {
+	if err != nil {
+		// A transient read failure must not be mistaken for "generation 0":
+		// that value is what every token issued before the first logout or
+		// password change carries, so a restart during a DB blip would make
+		// revoked tokens valid again. Refuse to verify until a later reload
+		// succeeds.
+		log.Printf("[auth] 读取令牌代数失败，已暂停令牌校验（fail-closed）: %v", err)
+		s.tokenVerUnknown.Store(true)
 		return
 	}
-	if v, perr := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); perr == nil {
-		s.tokenVer.Store(v)
+	if !ok {
+		// No row yet: this instance has never bumped, so generation 0 is the
+		// real value, not a guess.
+		s.tokenVer.Store(0)
+		s.tokenVerUnknown.Store(false)
+		return
 	}
+	v, perr := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if perr != nil {
+		log.Printf("[auth] 令牌代数无法解析（%q），已暂停令牌校验（fail-closed）: %v", raw, perr)
+		s.tokenVerUnknown.Store(true)
+		return
+	}
+	s.tokenVer.Store(v)
+	s.tokenVerUnknown.Store(false)
 }
 
 // ensureSetupToken generates (and persists + logs) the first-run setup token when
@@ -546,7 +585,30 @@ func isLoopbackRequest(r *http.Request) bool {
 		fip := net.ParseIP(fwd)
 		return fip != nil && fip.IsLoopback()
 	}
-	return true
+	// A browser is never "the operator at the machine", whatever address the
+	// request appears to come from. Without this, the documented nginx block
+	// (which sets no X-Forwarded-For) makes every remote caller look local, and a
+	// cross-site form POST to /api/auth/init could claim a fresh instance.
+	return !isBrowserCrossSite(r)
+}
+
+// isBrowserCrossSite reports whether a browser made this request from another
+// origin. Browsers always attach Origin to a cross-origin POST and Sec-Fetch-Site
+// to every request; a command-line client attaches neither.
+func isBrowserCrossSite(r *http.Request) bool {
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))) {
+	case "cross-site", "same-site":
+		return true
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return true
+	}
+	return !strings.EqualFold(u.Host, r.Host)
 }
 
 // POST /api/auth/login — validates username/password and returns a JWT.

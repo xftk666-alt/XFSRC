@@ -49,7 +49,12 @@ type Server struct {
 	loginLimit *loginLimiter
 	jwtKey     []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
 	// tokenVer is the JWT generation: bumping it revokes every issued token.
-	tokenVer  atomic.Int64
+	tokenVer atomic.Int64
+	// tokenVerUnknown is set when the generation could not be read at startup.
+	// Leaving tokenVer at its zero value instead would accept every token issued
+	// at generation 0 — resurrecting exactly the tokens a logout or password
+	// change had revoked — so verification fails closed while this is set.
+	tokenVerUnknown atomic.Bool
 	basicAuth basicAuthGate
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a

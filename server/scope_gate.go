@@ -33,7 +33,13 @@ func scopeGateFor(pg *db.DB, taskID int64) guard.ScopeChecker {
 		if !pg.GetBool(settingScopeGateEnabled, true) {
 			return nil, ""
 		}
-		hosts := guard.ExtractHosts(tool, input)
+		// A call whose targets cannot be determined is blocked, not allowed:
+		// "extraction returned nothing" and "the extractor could not parse what
+		// it saw" must not produce the same verdict.
+		hosts, parseReason := guard.ExtractHostsChecked(tool, input)
+		if parseReason != "" {
+			return hosts, parseReason
+		}
 		// Targets can also live in a file (`cat targets.txt | httpx`,
 		// `nuclei -l targets.txt`). Scan those too, and fail closed when the
 		// list cannot be read.

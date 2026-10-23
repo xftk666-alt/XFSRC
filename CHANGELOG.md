@@ -2,6 +2,140 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## v0.3.23-fix4 — 授权闸间接引用修复（实测 4 条绕过已关闭）
+
+**建议立即升级。** 本版修的是上一轮审计遗留的一条主线问题：**授权闸只认命令行里的
+字面主机名，认不出「间接引用」**。目标藏在目标清单文件、`sh -c` 的引号里、或者
+`$(cat file)` 里时，闸提取不到任何主机，于是放行 —— 而请求照常发出。
+
+这不是理论推导。用平台自己的 planner/worker 跑（deepseek-v4.1-flash），任务授权
+范围只给 `allowed.example`，越权目标只写在磁盘文件里，模型自己执行了四条命令，
+监听器每次都收到了连接：
+
+| 命令 | 修复前 | 修复后 |
+|---|---|---|
+| `wget -i /tmp/v1.txt` | 连上监听器 | 拦截：目标不在本任务授权范围内 |
+| `sh -c "wget -i /tmp/v1.txt"` | 连上 | 拦截 |
+| `curl "$(cat /tmp/v2.txt)"` | 连上 | 拦截 |
+| `wget -i "$(echo /tmp/v1.txt)"` | 连上 | 拦截 |
+
+修复后同一批命令 0 次连接。
+
+### 授权闸
+
+- **`wget -i` / `--input-file` 未登记为目标清单标志**，`wget` 读到的主机从未被检查。
+  已加入（仅限 wget：`curl -i` 是「包含响应头」，不能当成清单）。
+- **目标行整行取 `@` 后半段当主机**：`https://evil.example/?to=@in-scope.example`
+  被读成 in-scope.example，实际连的是 evil.example。改为只在 authority 段取 userinfo。
+- **`sh -c` / `bash -c` 的引号内容被当成一个 token**，里面的 `nuclei -l targets.txt`
+  永远读不到清单文件。现在递归重新分词（深度上限 4）。
+- **`$(cat FILE)` / `` `cat FILE` `` / `$(echo FILE)`** 不解析，命令替换出来的目标
+  完全不可见。现在递归解析替换内容并读取其中的文件。
+- **单标签目标只认硬编码工具名**：`openssl s_client -connect juice-shop:3000`、
+  `redis-cli -h juice-shop`、`socat - TCP:juice-shop:3000`、`grpcurl juice-shop:443`
+  全部放行。改为按位置判断，并新增 `-h/--host/-connect/--server` 等主机型标志提取。
+- **URL 解析失败被当成「没有目标」**：`net/url` 拒绝但 libcurl 接受的写法（如
+  `http://host%2e/`）直接放行。`hostFromURL` 改为返回 `(host, ok)`，解析失败时
+  `ExtractHostsChecked` 给出 fail-closed 理由，`scopeGateFor` 据此阻断。
+- **`-il` 被 GNU 短选项拆分逻辑打散**成 `-l` + `ist`，合法调用被误阻断；已修，
+  且结果不再依赖 map 迭代顺序。
+- **`> out.txt; cat out.txt`** 这种「先写再读自己的输出」被当成读取目标清单而误拦；
+  重定向写入目标现在从清单候选里排除。
+
+### 误伤修复（可用性）
+
+上一版闸会把**任何**工具调用里的字符串都扫一遍，导致：
+
+- `record_fact` 描述「bar.localhost:9317」被当成越权目标拦截，模型被迫把主机名写成
+  `bar[.]localhost` 才能写回自己的笔记；
+- `cat /etc/hosts` 被当成「读取目标清单」而 fail-closed。
+
+新增 `nonNetworkTools` 白名单（`record_fact`/`add_intent`/`list_assets`/`set_goals`
+等 25 个不发起网络请求的工具），这些工具的文本参数不再参与主机提取。
+
+### 审批与审计
+
+- **裁判判定被畸形回复整条丢弃**：模型回 `{"decision":"deny","comment":"...","confidence":0.95}`
+  或多一个键，解码失败 → 空判定 → 落到默认 `allow`。改为 `json.RawMessage` 解码，
+  deny/ask 一律保留；超长解释只截断不丢动作；`allow` 遇未知键或超长仍拒绝
+  （安全方向单向放宽）。
+- **审计日志把拦截记成放行**：`allow` 行原先写在所有判定之前，每次拦截都会同时留下
+  一条 `allow` 和一条 `block`。现在 `allow` 只在全部闸通过后写入。
+
+### 认证
+
+- **首启接管（实测）**：全新实例上 `POST /api/auth/init` 带
+  `Origin: https://evil.example` + `Content-Type: text/plain`，无需 setup token 即
+  返回 200，攻击者密码可直接登录。原因是 `isLoopbackRequest` 把「环回 peer 且无
+  转发头」当成本机，而 README 的 nginx 配置恰好不设 `X-Forwarded-For`。
+  新增 `isBrowserCrossSite`：浏览器带 `Origin`/`Sec-Fetch-Site` 的跨站请求一律拒绝；
+  命令行初始化不受影响。
+- **登录限流可绕过**：伪造 `X-Real-IP` 每次换桶，14 次错误密码全 401。不再信任该头；
+  同时修掉淘汰策略——原先淘汰的是「最老的桶」，而最老的桶正是已经饱和、正在限流的
+  那个，等于把攻击者的计数器清零。现在淘汰最新桶。
+- **令牌代数 fail-closed**：读失败时不再让 `tokenVer` 停在 0（0 正是首次登出/改密
+  之前所有令牌的代数，重启期 DB 抖动会复活已撤销令牌），改为 `tokenVerUnknown` +
+  503；`bumpTokenVersion` 在无 DB 时返回错误，不再让登出静默变成空操作。
+
+### 资产与数据
+
+- **DSL 的 OR 缺整体括号**：`(a) OR (b)` 之后调用方直接拼 `AND type=$N`，AND 优先级
+  更高，过滤只作用于最后一个分支。`list_assets` 的 `dsl="domain=a OR domain=b"` 因此
+  能返回**任务范围外**的资产（真实 PG 18 上验证过）。顶层子句现在整体加括号。
+- **DSL 运算符被静默丢弃**：`task_id>5` 生成 `= ANY(task_ids)`，`company_id>5` 变成
+  `= 5`，用户以为过滤生效了。现在只接受 `=`/`==`/`!=`，其余报错。
+- **资产拦截规则可被等价写法绕过**：`exact_ip` 用字符串比较，`::FFFF:203.0.113.5`
+  拦不住 `203.0.113.5`；`fuzzy_domain` 用子串匹配，白名单 `example.com` 会放行
+  `example.com.evil.net` 和 `notexample.com`。改为按解析后的地址比较 + 标签边界匹配。
+- **`toggle` 传 `{}` 会静默禁用内置拦截规则**：`Enabled bool` 无法区分「没传」和
+  `false`。改为 `*bool`，缺失即 400；创建默认启用，部分更新保留原值。
+- **公司范围 `{"reset":true}` 空列表清空全部授权**：需要显式 `confirm_empty:true`。
+- **DSN 脱敏泄漏密码**：libpq 关键字形式、解析失败的 URI、`?password=` 三种情形都
+  原样返回含密码的串，而它唯一的调用方就是启动错误日志。已全部打码。
+
+### 工作区隔离
+
+- **数据目录是符号链接时能删掉整个工作区**：`wsResolve` 返回解析后的真实路径，护栏
+  却拿它和词法路径比较，永远不相等。实测返回 200 并删光（含 `jwt.key`）。
+- **聊天附件上传跟随符号链接**：`filepath.Join` 不校验祖先，agent 可把
+  `sessions/<id>` 指向 `../../evidence`，操作员下次传附件就写进证据目录。
+  现在走 `wsResolveIn`（保留包含性校验、按需关闭机密子树黑名单）。
+- **工作区写入未做硬链接检查**：`ln jwt.key notes.txt` 后「编辑 notes.txt」会覆盖
+  签名密钥。
+
+### 通知与出站
+
+- **云元数据地址可达**：`100.100.100.200`（阿里云，在 100.64/10 里）和
+  `fd00:ec2::254`（AWS IPv6）不在拦截范围，实测能建成投递渠道。
+- **设了 `HTTP_PROXY` 就绕过 SSRF 守卫**：`Clone()` 保留 `ProxyFromEnvironment`，
+  拨号校验只看到代理 IP，目标 URL 由代理转发，URL 里的 token 也发给代理。已置空。
+- **https → http 降级重定向被放行**，凭据头会跟着走明文。现在同时比较 scheme。
+- **`/api/llm/models` 的 `proxy` 参数未校验**（第二处 SSRF 面），且客户端不限制
+  重定向。已按 `base_url` 同一套规则校验，并限制跳转次数与目标。
+
+### 任务收尾
+
+- **终局判定轮被压到 1 秒**：该轮只在 deadline 已过之后才跑，却仍携带过期的
+  `DeadlineUnix`，`clampMaxDuration` 把它压到 1s，harness 立刻以超时打断 ——
+  本已完成的任务被判成 timeout。终局轮不再携带 deadline。
+
+### 验证
+
+- 19 个文件，+739 / −86；新增 6 个回归测试文件（每个修复点都有断言）。
+- `go vet ./...` 干净；`go test ./...` 15 个包全绿（需 DB 的用例跑在真实 PostgreSQL 18.6）。
+- 端到端：真实服务 + 真实 LLM，四条绕过命令全部被拦，监听器 0 次连接；
+  接口级 8 项（首启 CSRF、限流、toggle、reset、附件符号链接、LLM proxy、
+  通知元数据、根删除）全部按预期拒绝，正常路径未受影响。
+
+### 已知未修（需运维决策）
+
+1. 拦截规则默认只覆盖 8 个工具名；`delete_assets_by_host`、`spawn_task`、
+   `create_custom_tool`、`create_mcp` 不在规则面内。
+2. 目标拆解器可以把主机写进 `goals` 来源的 scope（实测观察到一次）。这是设计上的
+   信任假设——拆解器读的是操作员写的任务描述；若描述可能被注入，这里就是扩权入口。
+3. `intercept` 的 shell 静态分析仍有 20+ 条理论绕过（`nameref`、`IFS`、`hash -p`
+   等），未逐条构造真实命令验证，不纳入本版。
+
 ## v0.3.23-fix3 — 第二轮安全审计（74 项修复）
 
 **建议立即升级。** 本版交付第二轮安全审计的全部修复：**6 Critical / 47 High /

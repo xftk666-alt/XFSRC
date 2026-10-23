@@ -74,10 +74,28 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		defer s.engine.decInflight(id)
 	}
-	dir := filepath.Join(s.m.dir, sub, id, "uploads")
+	// Route the directory through wsResolve so the workspace containment rules
+	// apply: a plain filepath.Join follows symlinked ancestors, so an agent (which
+	// has Bash) could point sessions/<id> at ../../evidence and have the
+	// operator's next upload land inside the sealed-evidence tree.
+	// Denylist off: sessions/ and drafts/ are exactly where these uploads belong.
+	dir, ok := s.wsResolveIn(filepath.Join(sub, id, "uploads"), false)
+	if !ok {
+		writeErr(w, 400, "非法上传目录")
+		return
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		writeErr(w, 500, "建目录失败: "+err.Error())
 		return
+	}
+	// wsResolve resolves symlinks, so re-check the final path is still inside the
+	// workspace now that the directory exists.
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		root, rerr := filepath.EvalSymlinks(s.m.dir)
+		if rerr == nil && resolved != root && !strings.HasPrefix(resolved, root+string(os.PathSeparator)) {
+			writeErr(w, 400, "非法上传目录")
+			return
+		}
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxChatUpload)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {

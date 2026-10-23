@@ -29,6 +29,10 @@ var targetFileFlag = map[string]map[string]bool{
 	"-list":        {"httpx": true, "nuclei": true, "katana": true, "naabu": true},
 	"-il":          {"nmap": true},
 	"-dl":          {"subfinder": true},
+	// wget's short form of --input-file. Tool-scoped on purpose: `curl -i` means
+	// "include headers", so an unrestricted -i would read the URL after it as a
+	// target list and fail closed on legitimate curl calls.
+	"-i": {"wget": true},
 	"-input":       nil,
 	"-inputlist":   nil,
 	"-targets":     nil,
@@ -101,9 +105,45 @@ func jsonField(input []byte, key string) (string, bool) {
 // targetFilesIn extracts file paths passed to target-list flags, plus files fed
 // through `cat FILE |`, `< FILE`, and `xargs ... < FILE`.
 func targetFilesIn(command string) []string {
+	return targetFilesInDepth(command, 0)
+}
+
+// nestedShells are interpreters whose `-c` argument is a script to run. Without
+// re-parsing that argument the whole sub-command stays one opaque token, so
+// `sh -c "nuclei -l targets.txt"` never reached the target-list reader.
+var nestedShells = map[string]bool{
+	"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true, "ash": true,
+}
+
+// substitutionReaders are commands whose operand is a file path, used when they
+// appear inside `$(...)`: `curl "$(cat targets.txt)"`.
+var substitutionReaders = map[string]bool{
+	"cat": true, "tac": true, "echo": true, "printf": true, "head": true, "tail": true,
+}
+
+func targetFilesInDepth(command string, depth int) []string {
+	if depth > 4 {
+		return nil
+	}
 	tokens := shellTokens(command)
 	var out []string
 	for i, tok := range tokens {
+		// Nested shell: `sh -c "<script>"`. The quoted script is a single token,
+		// so it has to be re-parsed or every target inside it is invisible.
+		if strings.EqualFold(tok, "-c") && i > 0 && i+1 < len(tokens) {
+			if nestedShells[strings.ToLower(filepath.Base(tokens[i-1]))] {
+				out = append(out, targetFilesInDepth(tokens[i+1], depth+1)...)
+				continue
+			}
+		}
+		// Command substitution inside a token: `$(cat FILE)`, `` `cat FILE` ``.
+		// The substituted text is what the tool actually receives.
+		for _, sub := range substitutionCommands(tok) {
+			out = append(out, targetFilesInDepth(sub, depth+1)...)
+			if p := substitutionReaderFile(sub); p != "" {
+				out = append(out, p)
+			}
+		}
 		name := strings.ToLower(tok)
 		// Attached forms: `-l=targets.txt`, `--targets=targets.txt`, and GNU short
 		// `-ltargets.txt`. Without these the flag never matched, so the file was
@@ -143,7 +183,122 @@ func targetFilesIn(command string) []string {
 	// `< targets.txt` / `0< targets.txt`. The tokenizer treats '<' as a word
 	// separator, so the operator is gone by now — scan the raw text instead.
 	out = append(out, redirectSources(command)...)
+	// `cmd > out.txt; cat out.txt` is a normal capture-and-read pattern: the file
+	// is this command's own output, so it cannot be a pre-existing target list and
+	// reading it at gate time fails closed for no reason.
+	out = removeAll(out, redirectDestinations(command))
 	return dedupe(out)
+}
+
+// redirectDestinations returns the files written by `> FILE` / `>> FILE`.
+func redirectDestinations(command string) []string {
+	var out []string
+	for i := 0; i < len(command); i++ {
+		if command[i] != '>' {
+			continue
+		}
+		// Skip `2>&1`, `>&2` and here-strings.
+		if i+1 < len(command) && (command[i+1] == '&' || command[i+1] == '>' && i+2 < len(command) && command[i+2] == '&') {
+			continue
+		}
+		j := i + 1
+		if j < len(command) && command[j] == '>' {
+			j++
+		}
+		for j < len(command) && (command[j] == ' ' || command[j] == '\t') {
+			j++
+		}
+		end := strings.IndexAny(command[j:], " \t\n|&;()<>")
+		if end < 0 {
+			end = len(command) - j
+		}
+		if p := cleanPathToken(command[j : j+end]); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// removeAll drops every element of in that appears in drop.
+func removeAll(in, drop []string) []string {
+	if len(drop) == 0 {
+		return in
+	}
+	skip := make(map[string]bool, len(drop))
+	for _, d := range drop {
+		skip[d] = true
+	}
+	out := in[:0]
+	for _, v := range in {
+		if !skip[v] {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// substitutionCommands returns the inner command of every `$(...)` and
+// `` `...` `` span in tok. Deeper nesting is handled by the depth limit in
+// targetFilesInDepth.
+func substitutionCommands(tok string) []string {
+	var out []string
+	for i := 0; i < len(tok); i++ {
+		if tok[i] == '$' && i+1 < len(tok) && tok[i+1] == '(' {
+			depth := 1
+			for j := i + 2; j < len(tok); j++ {
+				switch tok[j] {
+				case '(':
+					depth++
+				case ')':
+					depth--
+					if depth == 0 {
+						if inner := strings.TrimSpace(tok[i+2 : j]); inner != "" {
+							out = append(out, inner)
+						}
+					}
+				}
+				if depth == 0 {
+					break
+				}
+			}
+			continue
+		}
+		if tok[i] == '`' {
+			if j := strings.IndexByte(tok[i+1:], '`'); j >= 0 {
+				if inner := strings.TrimSpace(tok[i+1 : i+1+j]); inner != "" {
+					out = append(out, inner)
+				}
+				i += j + 1
+			}
+		}
+	}
+	return out
+}
+
+// substitutionReaderFile returns the file operand when the substituted command is
+// a plain reader (`cat FILE`, `echo FILE`). `echo` is not a target-list flag, so
+// the recursive pass alone would not surface the file.
+func substitutionReaderFile(cmd string) string {
+	tokens := shellTokens(cmd)
+	if len(tokens) < 2 {
+		return ""
+	}
+	if !substitutionReaders[strings.ToLower(filepath.Base(tokens[0]))] {
+		return ""
+	}
+	for _, tok := range tokens[1:] {
+		if strings.HasPrefix(tok, "-") {
+			continue
+		}
+		p := cleanPathToken(tok)
+		if p == "" || strings.Contains(p, "://") {
+			continue
+		}
+		if looksLikePath(p) {
+			return p
+		}
+	}
+	return ""
 }
 
 // redirectSources finds `FILE` in `< FILE` and `0< FILE`.
@@ -180,12 +335,22 @@ func splitAttachedFlag(tok string) (flag, value string, hasValue bool) {
 	if eq := strings.IndexByte(tok, '='); eq > 0 {
 		return strings.ToLower(tok[:eq]), tok[eq+1:], true
 	}
-	// GNU short option with an attached value: only for flags we know take one.
 	lower := strings.ToLower(tok)
+	// An exact flag name never carries an attached value: `-il` is nmap's
+	// target-list flag, not `-i` with the value "l".
+	if _, ok := targetFileFlag[lower]; ok {
+		return lower, "", false
+	}
+	// GNU short option with an attached value (`-ltargets.txt`). Longest match
+	// first so the result does not depend on map iteration order.
+	best := ""
 	for known := range targetFileFlag {
-		if len(known) == 2 && strings.HasPrefix(lower, known) && len(tok) > 2 {
-			return known, tok[2:], true
+		if len(known) == 2 && len(tok) > 2 && strings.HasPrefix(lower, known) && len(known) > len(best) {
+			best = known
 		}
+	}
+	if best != "" {
+		return best, tok[len(best):], true
 	}
 	return lower, "", false
 }
@@ -208,6 +373,12 @@ func cleanPathToken(tok string) string {
 	tok = strings.TrimPrefix(tok, "<")
 	tok = strings.TrimPrefix(tok, ">")
 	if tok == "" || strings.HasPrefix(tok, "-") || strings.ContainsAny(tok, "|&;") {
+		return ""
+	}
+	// A substitution is resolved by targetFilesInDepth, which reads the file it
+	// expands to. Returning the raw `$(cat x)` text here would make the caller
+	// stat a path that does not exist and fail closed on a legitimate call.
+	if strings.Contains(tok, "$(") || strings.Contains(tok, "`") || strings.Contains(tok, "${") {
 		return ""
 	}
 	return tok
@@ -296,12 +467,22 @@ func truncateForError(s string) string {
 
 // parseTargetLine accepts URL / host[:port] / IP / CIDR lines.
 func parseTargetLine(line string) (string, bool) {
+	// A URL's authority ends at the first path/query/fragment delimiter, and
+	// userinfo only means something inside that authority. Applying the '@' split
+	// to the whole line let a path or query decide the "host":
+	// `https://evil.example/?to=@in-scope.example` was read as in-scope.example
+	// while the tool actually fetched evil.example.
+	//
+	// Lines without a scheme are not cut at '/', because a bare CIDR
+	// (`10.0.0.0/8`) uses the same character.
 	if i := strings.Index(line, "://"); i >= 0 {
-		line = line[i+3:]
+		rest := line[i+3:]
+		if j := strings.IndexAny(rest, "/?#"); j >= 0 {
+			rest = rest[:j]
+		}
+		line = rest
 	}
-	// Keep the part AFTER the last '@': that is the host. Keeping the left side
-	// (the old strings.Cut behaviour) made "https://in-scope@evil.example/"
-	// authorize the in-scope userinfo while the tool talked to evil.example.
+	// Keep the part AFTER the last '@' inside the authority: that is the host.
 	if at := strings.LastIndexByte(line, '@'); at >= 0 {
 		line = line[at+1:]
 	}
