@@ -35,6 +35,10 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 		s.seedFirstIntent(t)
 	}
 	s.engine.decInflight(t.ID)
+	// Surface an empty authorization boundary at start: with no trusted scope
+	// every outbound request is refused by the egress gate, and an operator
+	// looking at a task that "cannot reach anything" needs to know why.
+	s.warnIfNoTaskScope(t)
 	if _, err := s.admitTask(t, "bootstrap"); err != nil {
 		log.Printf("[concurrency] task %s 启动失败: %v", t.ID, err)
 	}

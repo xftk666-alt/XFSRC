@@ -22,7 +22,11 @@ type scriptReference struct {
 	direct        bool
 	inline        bool
 	generated     bool
-	content       string
+	// opaque marks an execution whose targets cannot be read (a compiled binary
+	// or `go run`). The authorization gate denies such a call when it names no
+	// target of its own.
+	opaque  bool
+	content string
 }
 
 // Only statically resolvable shell words are used. No environment expansion,
@@ -295,6 +299,18 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 		// xargs and `find -exec` run another program with arguments they build.
 		// Recurse on the tail so the inner command is analyzed like a top-level
 		// one; a dynamic tail still fails closed through the usual path.
+		// `go run ./cmd/recon` compiles a package and executes it. The targets can
+		// live anywhere in that package's source, so the call is opaque: the gate
+		// denies it unless the command line names a target it can check.
+		if base == "go" && len(args) > 1 {
+			if sub, ok := staticWord(args[1]); ok && (sub == "run" || sub == "generate") {
+				refs = append(refs, scriptReference{
+					opaque: true,
+					path:   "go " + sub + " " + strings.Join(staticArgs(args[2:]), " "),
+				})
+				return true
+			}
+		}
 		if base == "xargs" || (base == "find" && hasExecFlag(args)) {
 			if tail := commandTail(args); tail != "" {
 				refs = append(refs, nested(tail, dir)...)
@@ -323,11 +339,22 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 					} else if shell {
 						refs = append(refs, scriptReference{problem: "Shell 内联执行缺少命令内容"})
 					} else if i+1 < len(args) {
-						// `python3 -c "…"`, `node -e "…"`: the inline text itself is
-						// already part of ReviewInput.Arguments, so the judge sees it
-						// without a separate script entry. Only flag it when the text
-						// cannot be resolved statically.
-						if _, known := staticWord(args[i+1]); !known {
+						// `python3 -c "…"`, `node -e "…"`, `ruby -e "…"`: the inline
+						// text is the program. It used to be left uncaptured on the
+						// assumption that the judge sees it inside
+						// ReviewInput.Arguments — but the AUTHORIZATION gate only
+						// looks at the scripts CaptureScripts returns, so
+						// `python3 -c "import urllib.request;urlopen('http://x')"`
+						// carried its target invisibly and the scope gate allowed
+						// it. Capture the literal text as an inline script so both
+						// the gate and the judge see what will actually run.
+						if inlineText, known := staticWord(args[i+1]); known && strings.TrimSpace(inlineText) != "" {
+							refs = append(refs, scriptReference{
+								inline:  true,
+								content: inlineText,
+								path:    "<" + base + " 内联代码>",
+							})
+						} else {
 							refs = append(refs, scriptReference{problem: "内联执行内容无法静态解析"})
 						}
 					} else {
@@ -496,7 +523,7 @@ func captureScripts(workingDir, tool string, arguments json.RawMessage) ([]Revie
 			continue
 		}
 		seen[key] = true
-		file := ReviewScript{Path: ref.path, ReadError: ref.problem}
+		file := ReviewScript{Path: ref.path, ReadError: ref.problem, Opaque: ref.opaque}
 		if ref.generated {
 			file.Source = "command"
 		} else if ref.path != "" {
@@ -504,6 +531,13 @@ func captureScripts(workingDir, tool string, arguments json.RawMessage) ([]Revie
 		}
 		if file.Path == "" {
 			file.Path = "<无法确定的脚本>"
+		}
+		// An opaque execution carries no readable body; its verdict is decided by
+		// the gate (deny when the call names no target), not by the script scan.
+		if ref.opaque {
+			file.Complete = true
+			files = append(files, file)
+			continue
 		}
 		if ref.problem != "" {
 			file.Truncated = strings.Contains(ref.problem, "超过")
@@ -531,9 +565,16 @@ func captureScripts(workingDir, tool string, arguments json.RawMessage) ([]Revie
 			continue
 		}
 		file.Bytes = int64(len(content))
-		// A directly invoked native binary is not a script. Interpreters, however,
-		// must never be permitted to execute an opaque/non-text file automatically.
+		// A directly invoked native binary is not a script, and its targets are
+		// not readable. Record it as OPAQUE instead of dropping it: dropping it
+		// made `./recon` — a locally compiled tool with hardcoded targets — look
+		// like a call with no network targets at all, so the scope gate allowed
+		// it. The gate now denies that shape unless the command line names a
+		// target the caller can see.
 		if ref.direct && (bytes.HasPrefix(content, []byte{0x7f, 'E', 'L', 'F'}) || bytes.HasPrefix(content, []byte{'M', 'Z'})) {
+			file.Opaque = true
+			file.Complete = true
+			files = append(files, file)
 			continue
 		}
 		if tool == "shell_send" {
@@ -570,7 +611,11 @@ func captureScripts(workingDir, tool string, arguments json.RawMessage) ([]Revie
 		// Generated entries are this command's own output (e.g. sed rewriting a
 		// file): their content is already captured and re-parsing it as shell
 		// would invent a "dynamic entry point" failure for ordinary data.
-		if !ref.generated && isShellScriptPath(ref.path) && !expanded[ref.path] && expansions < 16 && ref.path != "" {
+		// Inline code (python -c / node -e) is likewise not shell: parsing
+		// `urllib.request.urlopen('http://x')` as shell fails on the `(` and used
+		// to downgrade the whole call to a fail-closed "incomplete" verdict. Its
+		// text is already captured above for the gate to scan.
+		if !ref.generated && !ref.inline && isShellScriptPath(ref.path) && !expanded[ref.path] && expansions < 16 && ref.path != "" {
 			expanded[ref.path] = true
 			expansions++
 			queue = append(queue, scriptReferences(string(content), filepath.Dir(ref.path), 1)...)
@@ -612,6 +657,19 @@ func hasExecFlag(args []*syntax.Word) bool {
 		}
 	}
 	return false
+}
+
+// staticArgs renders the statically-known words of a command, dropping any that
+// would need expansion. Used only to label an opaque execution for the audit
+// trail, so a partial rendering is acceptable.
+func staticArgs(args []*syntax.Word) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if v, ok := staticWord(a); ok {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // commandTail rebuilds the command that xargs/find -exec will run: the first

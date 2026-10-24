@@ -463,6 +463,11 @@ func ScriptHosts(ctx context.Context, tool string, input []byte) (hosts []string
 		if s.Content != "" {
 			out = append(out, extractFromText(s.Content)...)
 		}
+		if s.Opaque {
+			// Handled by OpaqueExecs: the gate decides based on whether the call
+			// named any target of its own.
+			continue
+		}
 		if s.ReadError != "" || !s.Complete || s.Truncated {
 			detail := s.ReadError
 			if detail == "" {
@@ -476,6 +481,28 @@ func ScriptHosts(ctx context.Context, tool string, input []byte) (hosts []string
 		return nil, "脚本内容无法完整读取，无法确认其中的目标，已按 fail-closed 阻止"
 	}
 	return out, ""
+}
+
+// OpaqueExecs returns the paths of compiled binaries this call would execute
+// directly. Their network targets cannot be read, so a call that runs one
+// without naming any target of its own has an unknowable blast radius.
+func OpaqueExecs(ctx context.Context, tool string, input []byte) []string {
+	scripts, _ := intercept.CaptureScripts(intercept.WorkingDir(ctx), tool, input)
+	var out []string
+	for _, s := range scripts {
+		if s.Opaque {
+			out = append(out, s.Path)
+		}
+	}
+	return out
+}
+
+// OpaqueBlockReason explains why a call that runs a compiled binary with no
+// target of its own cannot be authorized.
+func OpaqueBlockReason(paths []string) string {
+	return "执行的编译产物无法读取内部目标，且本次调用未在命令行声明任何目标，已按 fail-closed 阻止：" +
+		strings.Join(paths, ", ") +
+		"（请改用脚本，或把目标显式写在命令行上）"
 }
 
 // scriptNetworkIndicators are tokens that mean "this line talks to the network".

@@ -1,0 +1,45 @@
+# 代码索引归 codegraph（.codegraph/），graphify 只负责文档层。
+# 理由：两者 AST 解析能力重叠约 80%，但 codegraph 在 Go receiver 方法解析
+# （实测 8/8 vs 1/8）、HTTP 路由节点（301 vs 0）、影响面分析（144 个受影响
+# 测试 vs 无）上全面更强，且增量同步是秒级。两边同时索引代码只会产生矛盾答案。
+
+# ---- Go 代码 ----
+/server/
+/db/
+/agent/
+/traffic/
+/intercept/
+/evidence/
+/guard/
+/notify/
+/llmrec/
+/llmpool/
+/mcphttp/
+/selfupdate/
+/sidequestion/
+/enrich/
+/report/
+/cmd/
+
+# ---- 前端代码 ----
+/web/
+
+# ---- 部署与脚本（都是代码，归 codegraph） ----
+/deploy/
+/config/
+/scripts/
+/*.sh
+/*.mjs
+/*.mod
+
+# ---- 构建产物与运行时数据 ----
+/web/.next/
+/web/out/
+/server/webui/dist/
+/data/
+/bin/
+
+# ---- skill 脚本（codegraph 已索引 26 个，避免重复） ----
+/skills/**/*.py
+/skills/**/*.js
+/skills/**/*.sh
