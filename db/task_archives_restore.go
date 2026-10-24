@@ -644,7 +644,16 @@ func restoreTaskScopes(tx *sql.Tx, raw json.RawMessage) ([]string, error) {
 		return warnings, nil
 	}
 	encoded, _ := json.Marshal(kept)
-	_, err = tx.Exec(`INSERT INTO task_scope SELECT * FROM json_populate_recordset(NULL::task_scope,$1::json) ON CONFLICT DO NOTHING`, string(encoded))
+	// Columns are listed explicitly and defaulted: archives written before
+	// `excluded`/`source_ref` existed carry neither key, and json_populate_recordset
+	// yields NULL for a missing field — which violates excluded's NOT NULL. Restoring
+	// such an archive used to fail outright.
+	_, err = tx.Exec(`
+INSERT INTO task_scope(task_id, kind, company_id, domain, net, value, source, source_ref, excluded, reason, created_at)
+SELECT task_id, kind, company_id, domain, net, value, source,
+       COALESCE(source_ref, ''), COALESCE(excluded, false), reason, COALESCE(created_at, now())
+FROM json_populate_recordset(NULL::task_scope, $1::json)
+ON CONFLICT DO NOTHING`, string(encoded))
 	return warnings, err
 }
 
