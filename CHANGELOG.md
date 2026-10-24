@@ -2,6 +2,90 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## 未发布 — 出站闸门补全、数组转义、平台 scope 导入
+
+本批解决的是「闸门看不见的目标」和「人手工抄 scope」两类问题。所有改动都有回归测试，
+并在真实实例上验证过。
+
+### 修复：目标流量不再绕过授权闸门
+
+`ProxyAddr()` 把「记录流量」和「经过闸门」绑在同一个开关上：`traffic_capture` 关闭时
+它直接把全局出口代理交给 agent，内置 MITM 完全不经过。本机部署正是这个状态——
+`traffic/_index/exchanges` 为 0 条，说明闸门跑了一周，一次请求都没看到。
+
+录制是观测选择，过闸门是安全选择。现在只要授权闸开着就一律走 MITM，是否落盘由
+`recordGate` 单独决定。`ProxyCACert()` 同步调整（MITM 两种模式下都重签证书，agent
+必须信任它），因此 `caCert` 不再能当作「是否录制」的信号——`workerSystem` 改为显式
+接收 `recording`，否则会给 agent 列出并不存在的 traffic 工具。
+
+实测（两项均为默认值：`scope_gate_enabled=true`、`traffic_capture` 未设置）：
+
+```
+范围内   http://127.0.0.1:18099  → 200
+范围外   http://example.com      → 403「请求未发出」
+落盘条数                          → 0
+```
+
+### 修复：内联程序与编译产物不再隐身
+
+- `python3 -c` / `node -e` / `ruby -e` 的内联正文此前不被捕获，理由是「judge 能从
+  Arguments 看到」；但授权闸只扫描 capture 返回的内容。现在正文作为内联脚本捕获。
+  顺带修掉一个连带误判：内联 Python 曾被当 shell 重新解析，`urlopen(` 触发语法错误，
+  导致每次 `python3 -c` 都被 fail-closed 误拦。
+- 直接执行的编译产物此前被静默丢弃，`./recon` 与「不碰网络」无法区分。8.7MB 的二进制
+  因超出快照上限被拦，15KB 的却一路放行——这个不对称是实测发现的。现在标记为
+  `Opaque`，未在命令行声明目标时拒绝。
+- `go run` 此前完全未建模，现按 opaque 处理。
+
+### 修复：PostgreSQL 数组字面量吞掉反斜杠
+
+`marshalStringArray` 只转义双引号，不转义反斜杠，而 PG 的数组解析器把 `\` 当转义符：
+
+```
+写入 {"a\b"}  →  存储结果 ab
+```
+
+影响 `bound_domains` / `record_value` / `technologies` 三个字段。同文件 13 行之前的
+`marshalJSONBArray` 早已正确转义，属漏改。现在两者共用 `quotePGArrayElement`。
+**已被吞掉的历史值无法反推**，需从上游重导。
+
+### 修复：5 个可达的 HTTP/2 DoS
+
+`golang.org/x/net v0.58.0 → v0.60.0`（连带 crypto/sys/text/mod/sync）。可达路径包括
+`traffic.Traffic.Start → http2.Server.ServeConn`。`govulncheck` 可达漏洞 5 → 0。
+
+### 新增：平台 scope 导入
+
+scope 此前只能手工录入。三个平台都发布机器可读的清单，手工转抄本身就是法律风险——
+抄错一个字符就授权了没人提供的主机。
+
+新增 `scopesync` 包解析 HackerOne / Bugcrowd / Intigriti 的导出，以及
+`POST /api/tasks/{id}/scope/import`：事务性替换，只动 `source='platform'` 的行，
+人工录入与目标拆解产生的内容原样保留。
+
+**排除规则优先于包含规则。** 三个平台都同时给出 in/out 两份清单，OR 起来等于把对方
+明确排除的主机重新授权。`excluded` 因此成为 `task_scope` 的一等字段。
+
+解析只做保守解释：仅当平台标注为 `DOMAIN` / `WILDCARD` 时才扩成域名树，裸主机保持
+精确匹配——放宽会授权平台从未提供的主机。无法识别的条目直接报错，不静默跳过。
+
+**只做了解析，没做请求。** 三个平台的端点契约未经核实，猜测的 URL 比没有更糟。
+实现方式是接收平台导出的 JSON。
+
+### 修复：旧归档恢复失败
+
+给 `task_scope` 加列时破坏了归档恢复：`json_populate_recordset` 对缺失字段返回 NULL，
+而 `excluded` 是 NOT NULL，任何加列之前写的归档都会恢复失败。改为显式列 + COALESCE。
+
+### 未启用：网络层强制
+
+`deploy/egress-lockdown.sh` 提供 uid 级 iptables REDIRECT：agent 命令降权到非 root
+uid 后，其 TCP 被强制送入 MITM，无视 `HTTP_PROXY` 也出不去。机制已在隔离容器验证
+（uid 10001 的直连被重定向，root 不受影响），但**未在部署环境启用**——需要改镜像
+（装 iptables/setpriv）、加 `CAP_NET_ADMIN`、并解决工作目录属主与 DNS 解析器地址。
+
+---
+
 ## v0.3.23-fix5 — 拦截面默认收紧、拆解器扩权封堵、脚本嵌套解析
 
 **建议立即升级。** 本版交付两批修复：**27 项安全与正确性修复**（原计划作为
