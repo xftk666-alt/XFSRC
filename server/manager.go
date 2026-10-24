@@ -420,6 +420,12 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 				if !pg.GetBool(settingScopeGateEnabled, true) {
 					return true
 				}
+				// The platform's own destinations (LLM endpoints, self-update) are
+				// allowed before task scope, so network-layer enforcement does not
+				// sever the product from its own providers.
+				if infraHostAllowed(pg, host) {
+					return true
+				}
 				ok, err := pg.AllowedHostsAcrossActiveTasks(host, nil)
 				if err != nil {
 					log.Printf("[egress] 授权范围查询失败，按 fail-closed 拒绝 %s: %v", host, err)

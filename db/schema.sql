@@ -756,16 +756,21 @@ CREATE TABLE IF NOT EXISTS task_scope (
 );
 -- 旧库升级：扩展任务范围，使其与企业范围的单文本框识别能力一致。
 ALTER TABLE task_scope ADD COLUMN IF NOT EXISTS value TEXT;
+-- excluded 标记"明确不在授权范围内"的条目（三个漏洞平台都区分 in/out of scope）。
+-- 排除优先于包含：命中任一条排除即视为越界，即使同时被某条包含命中。
+ALTER TABLE task_scope ADD COLUMN IF NOT EXISTS excluded BOOLEAN NOT NULL DEFAULT false;
+-- source_ref 记录该条来自哪个平台/程序/版本，供审计追溯。
+ALTER TABLE task_scope ADD COLUMN IF NOT EXISTS source_ref TEXT;
 ALTER TABLE task_scope DROP CONSTRAINT IF EXISTS task_scope_source_check;
 ALTER TABLE task_scope ADD CONSTRAINT task_scope_source_check
-    CHECK (source IN ('auto','agent','manual','goals'));
+    CHECK (source IN ('auto','agent','manual','goals','platform'));
 ALTER TABLE task_scope DROP CONSTRAINT IF EXISTS task_scope_kind_check;
 ALTER TABLE task_scope ADD CONSTRAINT task_scope_kind_check
     CHECK (kind IN ('company','root_domain','subdomain','ip','cidr','icp','keyword'));
 -- 去重：同一 task 的同一条范围只存一次（自动填批量插入靠它幂等）。
 DROP INDEX IF EXISTS uq_task_scope;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_task_scope_v2 ON task_scope(
-    task_id, kind, COALESCE(domain,''), COALESCE(net::text,''), COALESCE(company_id,0), COALESCE(value,''));
+    task_id, kind, COALESCE(domain,''), COALESCE(net::text,''), COALESCE(company_id,0), COALESCE(value,''), excluded);
 CREATE INDEX IF NOT EXISTS idx_ts_domain  ON task_scope(domain) WHERE kind IN ('root_domain','subdomain');
 CREATE INDEX IF NOT EXISTS idx_ts_net     ON task_scope USING GIST(net inet_ops) WHERE kind IN ('ip','cidr');
 CREATE INDEX IF NOT EXISTS idx_ts_company ON task_scope(company_id) WHERE kind = 'company';
