@@ -139,6 +139,12 @@ type Traffic struct {
 	// keeps listening (it may still serve as the egress hop) but stores nothing
 	// while capture is disabled.
 	recordGate func() bool
+	// egressGate, when set, decides whether a request may leave the machine at
+	// all. It is the last line of defense: the command-line gate in guard/ reads
+	// a tool call's text, which a compiled binary or an obfuscated command can
+	// step around, but a request that reaches this proxy still has to name a
+	// host. nil = allow everything (standalone proxies and tests).
+	egressGate func(host string) bool
 	dir   string
 	addr  string
 	db    *sql.DB
@@ -407,6 +413,28 @@ type sink struct {
 	t *Traffic
 }
 
+// Request runs before the proxy dials the target. A request whose host nobody
+// authorized is answered locally with 403: the target is never contacted, so the
+// only thing recorded is the refusal.
+func (s *sink) Request(f *mproxy.Flow) {
+	if f.Request == nil || f.Response != nil {
+		return
+	}
+	host := ""
+	if f.Request.URL != nil {
+		host = f.Request.URL.Host
+	}
+	if !s.t.egressDenied(host) {
+		return
+	}
+	log.Printf("[egress] 拒绝越界请求：%s %s（目标不在任何活动任务的授权范围内）", f.Request.Method, host)
+	f.Response = &mproxy.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+		Body: []byte("XFSRC 平台管控：目标不在授权范围内，请求未发出。\n"),
+	}
+}
+
 func (s *sink) Response(f *mproxy.Flow) {
 	if f.Request == nil || f.Response == nil {
 		return
@@ -420,6 +448,20 @@ func (s *sink) Response(f *mproxy.Flow) {
 // SetRecordingGate installs the capture toggle consulted before each write.
 // nil restores unconditional recording (used by tests and standalone proxies).
 func (t *Traffic) SetRecordingGate(fn func() bool) { t.recordGate = fn }
+
+// SetEgressGate installs the outbound allow-list. Returning false makes the
+// proxy answer 403 without dialing the target, so an unauthorized host is never
+// contacted. nil allows everything.
+func (t *Traffic) SetEgressGate(fn func(host string) bool) { t.egressGate = fn }
+
+// egressDenied reports whether host must be refused at the proxy. A nil gate
+// allows everything so standalone use keeps working.
+func (t *Traffic) egressDenied(host string) bool {
+	if t.egressGate == nil {
+		return false
+	}
+	return !t.egressGate(hostOnly(host))
+}
 
 // RequestError fires when a request through an established MITM tunnel fails. If
 // the failure looks proxy/protocol-caused (h2 quirks, HEAD-with-body, protocol

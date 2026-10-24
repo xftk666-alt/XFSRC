@@ -32,6 +32,11 @@ type ReviewScript struct {
 	Complete  bool   `json:"complete"`
 	Truncated bool   `json:"truncated,omitempty"`
 	ReadError string `json:"read_error,omitempty"`
+	// Opaque marks a directly executed local file whose contents cannot be
+	// inspected (a compiled ELF/PE binary). Its network targets are invisible to
+	// the authorization gate, so a call that runs one and names no target
+	// explicitly is denied rather than guessed at.
+	Opaque bool `json:"opaque_binary,omitempty"`
 }
 
 // ReviewInput contains only the current call and explicitly selected background.

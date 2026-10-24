@@ -196,3 +196,117 @@ func hostFromURL(raw string) string {
 	}
 	return strings.ToLower(strings.Trim(raw, "[]"))
 }
+
+// AllowedHostsAcrossActiveTasks reports whether host is authorized by any task
+// that is currently running. The recording proxy is a single global listener and
+// cannot tell which task a request came from, so the egress allow-list is the
+// union of every active task's trusted scope. A host nobody authorized is
+// refused at the proxy, which is the only enforcement point a compiled binary
+// or an obfuscated command line cannot step around.
+//
+// Fail-closed: a database error returns false.
+func (d *DB) AllowedHostsAcrossActiveTasks(host string, trustedSources []string) (bool, error) {
+	if host == "" {
+		return false, nil
+	}
+	if len(trustedSources) == 0 {
+		trustedSources = DefaultTrustedScopeSources
+	}
+	ph := make([]string, len(trustedSources))
+	args := make([]any, 0, len(trustedSources)+1)
+	for i, s := range trustedSources {
+		ph[i] = fmt.Sprintf("$%d", i+1)
+		args = append(args, s)
+	}
+	// Only tasks that can still make requests: a done/archived task's scope must
+	// not keep a host reachable forever.
+	rows, err := d.Query(`
+SELECT s.kind, COALESCE(s.domain,''), COALESCE(s.net::text,''), COALESCE(s.value,''), COALESCE(s.company_id,0)
+FROM task_scope s
+JOIN tasks t ON t.id = s.task_id
+WHERE s.source IN (`+strings.Join(ph, ",")+`)
+  AND t.deleted_at IS NULL
+  AND COALESCE(t.status,'') NOT IN ('done','failed','timeout','archived')`, args...)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var entries []scopeEntry
+	var companyIDs []int64
+	for rows.Next() {
+		var kind, domain, netText, value string
+		var companyID int64
+		if err := rows.Scan(&kind, &domain, &netText, &value, &companyID); err != nil {
+			return false, err
+		}
+		e := scopeEntry{kind: strings.ToLower(kind), domain: strings.ToLower(strings.TrimSuffix(domain, ".")), value: strings.TrimSpace(value)}
+		if netText != "" {
+			if _, n, err := net.ParseCIDR(netText); err == nil {
+				e.net = n
+			}
+		}
+		entries = append(entries, e)
+		if companyID > 0 {
+			companyIDs = append(companyIDs, companyID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	cph := make([]string, len(trustedSources))
+	cargs := make([]any, 0, len(trustedSources)+1)
+	for i, s := range trustedSources {
+		cph[i] = fmt.Sprintf("$%d", i+2)
+		cargs = append(cargs, s)
+	}
+	for _, id := range companyIDs {
+		crows, err := d.Query(`SELECT kind, COALESCE(domain,''), COALESCE(net::text,'')
+FROM company_scope WHERE company_id=$1 AND source IN (`+strings.Join(cph, ",")+`)`, append([]any{id}, cargs...)...)
+		if err != nil {
+			continue
+		}
+		for crows.Next() {
+			var kind, domain, netText string
+			if err := crows.Scan(&kind, &domain, &netText); err != nil {
+				continue
+			}
+			kind = strings.ToLower(kind)
+			if kind == "domain" {
+				kind = "root_domain"
+			}
+			e := scopeEntry{kind: kind, domain: strings.ToLower(strings.TrimSuffix(domain, "."))}
+			if netText != "" {
+				if _, n, err := net.ParseCIDR(netText); err == nil {
+					e.net = n
+				}
+			}
+			entries = append(entries, e)
+		}
+		crows.Close()
+	}
+	return hostInScope(host, entries), nil
+}
+
+// CountTrustedScopeRows reports how many trusted scope rows a task has, without
+// expanding company rows. Used to refuse starting a task whose authorization
+// boundary is empty: such a task can contact nothing, and letting it run only
+// produces a stream of blocked calls.
+func (d *DB) CountTrustedScopeRows(taskID int64, trustedSources []string) (int, error) {
+	if taskID <= 0 {
+		return 0, nil
+	}
+	if len(trustedSources) == 0 {
+		trustedSources = DefaultTrustedScopeSources
+	}
+	ph := make([]string, len(trustedSources))
+	args := make([]any, 0, len(trustedSources)+1)
+	args = append(args, taskID)
+	for i, s := range trustedSources {
+		ph[i] = fmt.Sprintf("$%d", i+2)
+		args = append(args, s)
+	}
+	var n int
+	err := d.QueryRow(`SELECT count(*) FROM task_scope WHERE task_id=$1 AND source IN (`+
+		strings.Join(ph, ",")+`)`, args...).Scan(&n)
+	return n, err
+}

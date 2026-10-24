@@ -409,6 +409,24 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 			// still be reachable (or reused as an egress hop), but nothing is
 			// persisted while capture is off.
 			tr.SetRecordingGate(m.TrafficEnabled)
+			// Outbound allow-list: the last gate a compiled binary or an
+			// obfuscated command line cannot step around, because a request that
+			// reaches this proxy still has to name a host. Consulted per request
+			// against the union of every active task's trusted scope.
+			tr.SetEgressGate(func(host string) bool {
+				if host == "" {
+					return true // CONNECT with no host: nothing to authorize
+				}
+				if !pg.GetBool(settingScopeGateEnabled, true) {
+					return true
+				}
+				ok, err := pg.AllowedHostsAcrossActiveTasks(host, nil)
+				if err != nil {
+					log.Printf("[egress] 授权范围查询失败，按 fail-closed 拒绝 %s: %v", host, err)
+					return false
+				}
+				return ok
+			})
 			go func() {
 				log.Printf("[traffic] recording proxy on %s (set HTTP_PROXY=%s + trust _ca CA)", proxyAddr, tr.ProxyAddr())
 				if err := tr.Start(); err != nil {

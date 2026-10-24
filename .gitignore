@@ -36,3 +36,7 @@
 /Dockerfile.bench
 /Dockerfile.bench.v2
 *-events.csv
+
+# local code-graph indexes
+.codegraph/
+graphify-out/

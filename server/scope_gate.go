@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"log"
+	"strconv"
 	"strings"
 
 	"github.com/Autumn-27/artex/db"
@@ -56,7 +57,14 @@ func scopeGateFor(pg *db.DB, taskID int64) guard.ScopeChecker {
 			return append(hosts, scriptHosts...), scriptReason
 		}
 		hosts = append(hosts, scriptHosts...)
+		// A compiled binary executes code the gate cannot read. If the call named
+		// no target of its own, its blast radius is unknowable, so deny it. When
+		// the call does name targets, those are already in hosts and get the
+		// normal scope check — the binary is assumed to act on them.
 		if len(hosts) == 0 {
+			if opaque := guard.OpaqueExecs(ctx, tool, input); len(opaque) > 0 {
+				return nil, guard.OpaqueBlockReason(opaque)
+			}
 			return nil, ""
 		}
 		trusted := parseTrustedSources(pg)
@@ -88,4 +96,34 @@ func parseTrustedSources(pg *db.DB) []string {
 		return []string{"manual", "goals"}
 	}
 	return out
+}
+
+// warnIfNoTaskScope records a visible activity when a task starts with an empty
+// authorization boundary. It does NOT block: a task may legitimately make no
+// network requests (analysis-only work, a wiring self-test). Blocking would
+// break that, while staying silent leaves the operator with a task that
+// mysteriously cannot reach anything — every request is refused at the proxy.
+func (s *Server) warnIfNoTaskScope(task *Task) {
+	if task == nil || s.m == nil || s.m.pg == nil {
+		return
+	}
+	if !s.m.pg.GetBool(settingScopeGateEnabled, true) {
+		return
+	}
+	id, err := strconv.ParseInt(task.ID, 10, 64)
+	if err != nil || id <= 0 {
+		return
+	}
+	n, err := s.m.pg.CountTrustedScopeRows(id, parseTrustedSources(s.m.pg))
+	if err != nil {
+		log.Printf("[scope] task %s 授权范围查询失败: %v", task.ID, err)
+		return
+	}
+	if n == 0 {
+		s.engine.emitActivity(task, db.Activity{
+			Worker:  "system",
+			Kind:    "text",
+			Summary: "⚠ 本任务没有授权范围（task_scope 为空）：任何网络请求都会被出站闸门拒绝。请先录入 in-scope 目标。",
+		})
+	}
 }
