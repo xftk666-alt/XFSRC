@@ -43,14 +43,13 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	}
 
 	// worker dual-text via {{if .ProxyAddr}} in a user template, plus the code tail:
-	// [B] trafficTool present only when RECORDING (caCert set — the MITM is on, so
-	// the traffic_* tools exist), [C] artifact spec always present. The trafficTool
-	// block is gated on the CA (arg 2), NOT on ProxyAddr — a global egress proxy
-	// with capture off routes traffic but records nothing.
+	// [B] trafficTool present only when RECORDING, [C] artifact spec always present.
+	// Recording is its own argument now: the CA is present whenever traffic passes
+	// through the MITM, which also happens when only the authorization gate is on.
 	PromptOverride = func(k string) (string, bool) {
 		return "{{if .ProxyAddr}}走代理 {{.ProxyAddr}}{{else}}手动{{end}}", true
 	}
-	recording := workerSystem("127.0.0.1:8080", "/ca.pem", "/data", "/data")
+	recording := workerSystem("127.0.0.1:8080", "/ca.pem", true, "/data", "/data")
 	if !strings.HasPrefix(recording, "走代理 127.0.0.1:8080") {
 		t.Fatalf("worker proxy branch body: %q", recording)
 	}
@@ -63,16 +62,23 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	if !strings.Contains(recording, "中间产物输出规约") {
 		t.Fatalf("worker missing artifact tail: %q", recording)
 	}
-	// Egress proxy set but capture OFF (no CA): the ProxyAddr template branch still
-	// renders, but the trafficTool block must NOT — those tools are not registered.
-	egressOnly := workerSystem("127.0.0.1:8080", "", "/data", "/data")
+	// Proxy set but capture OFF: the ProxyAddr template branch still renders, but
+	// the trafficTool block must NOT — those tools are not registered.
+	egressOnly := workerSystem("127.0.0.1:8080", "", false, "/data", "/data")
 	if !strings.HasPrefix(egressOnly, "走代理 127.0.0.1:8080") {
 		t.Fatalf("worker egress-only branch body: %q", egressOnly)
 	}
 	if strings.Contains(egressOnly, "traffic_search") {
 		t.Fatalf("worker without recording must NOT inject trafficTool: %q", egressOnly)
 	}
-	noProxy := workerSystem("", "", "/data", "/data")
+	// Gate-only routing: the MITM is in the path (so a CA exists) but nothing is
+	// recorded. Advertising traffic_search here would promise tools the agent does
+	// not have — the regression that made the CA an unreliable signal.
+	gateOnly := workerSystem("127.0.0.1:8080", "/ca.pem", false, "/data", "/data")
+	if strings.Contains(gateOnly, "traffic_search") {
+		t.Fatalf("gate-only routing (CA present, recording off) must NOT inject trafficTool: %q", gateOnly)
+	}
+	noProxy := workerSystem("", "", false, "/data", "/data")
 	if !strings.HasPrefix(noProxy, "手动") {
 		t.Fatalf("worker no-proxy branch body: %q", noProxy)
 	}

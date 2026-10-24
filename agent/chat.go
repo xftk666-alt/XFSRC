@@ -65,7 +65,9 @@ func (c *ChatAgent) maxTokens() int {
 
 // SetProxy points the chat agent's WebFetch/Bash at the recording proxy plus the
 // CA cert it trusts (empty addr = direct). Kept for parity with the other agents.
-func (c *ChatAgent) SetProxy(addr, caCert string) { c.proxyAddr, c.proxyCACert = addr, caCert }
+// SetProxy routes target traffic through the egress proxy. recording is accepted
+// for signature symmetry with Worker; chat exposes no traffic tools.
+func (c *ChatAgent) SetProxy(addr, caCert string, _ bool) { c.proxyAddr, c.proxyCACert = addr, caCert }
 
 // SetWebSearch selects the web_search backend for the chat agent (off by default).
 func (c *ChatAgent) SetWebSearch(o WebSearchOpts) { c.webSearch = o }

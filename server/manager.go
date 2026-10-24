@@ -781,15 +781,24 @@ func (m *Manager) PG() *pgdb.DB              { return m.pg }
 func (m *Manager) Traffic() *traffic.Traffic { return m.traffic }
 
 // ProxyAddr returns the egress proxy address agents route target traffic through:
-//   - capture ON  → the recording MITM proxy (which itself exits via the global
-//     proxy when one is set); agents also get its CA (see ProxyCACert).
-//   - capture OFF → the global egress proxy directly (empty CA — real target
-//     certs), or "" when no global proxy is set (direct, no recording).
+//   - gate ON  → the MITM proxy (which exits via the global proxy when one is
+//     set), so every target request passes the authorization gate. Recording is
+//     independent: with capture off the MITM forwards without persisting.
+//   - gate OFF and capture OFF → the global egress proxy directly (empty CA —
+//     real target certs), or "" when no global proxy is set.
+//   - capture ON always implies the MITM.
 //
-// So the global proxy takes effect in both modes: at the MITM's upstream when
-// capturing, in the agent's own bash env / WebFetch when not.
+// The two toggles are deliberately separate. Recording is an observability
+// choice; routing through the gate is a safety one, and coupling them meant
+// "capture off" handed agents a proxy the gate never saw.
 func (m *Manager) ProxyAddr() string {
-	if m.traffic != nil && m.TrafficEnabled() {
+	// The authorization gate needs every target request to pass through the MITM,
+	// whether or not the operator wants them RECORDED. Recording is an
+	// observability choice; routing through the gate is a safety one. Tying them
+	// to the same toggle meant "capture off" silently handed agents the raw egress
+	// proxy, so the gate never saw a request and a compiled binary could reach any
+	// host. Route through the MITM whenever the gate is on.
+	if m.traffic != nil && (m.TrafficEnabled() || m.scopeGateOn()) {
 		return m.traffic.ProxyAddr()
 	}
 	m.mu.RLock()
@@ -797,13 +806,26 @@ func (m *Manager) ProxyAddr() string {
 	return m.globalProxy
 }
 
+// scopeGateOn reports whether the pre-request authorization gate is enabled. It
+// decides routing in ProxyAddr: the gate can only enforce what passes through
+// the MITM.
+func (m *Manager) scopeGateOn() bool {
+	if m.pg == nil {
+		return false
+	}
+	return m.pg.GetBool(settingScopeGateEnabled, true)
+}
+
 // ProxyCACert returns the CA cert path agents must trust to verify HTTPS through
-// the egress proxy. Non-empty ONLY when traffic capture is on (the MITM re-signs
-// certs): the global proxy used directly (capture off) is a plain forwarder that
-// preserves real target certs, so no custom CA is needed there. Its emptiness is
-// also the worker's "recording off" signal (see workerSystem).
+// the egress proxy. Non-empty whenever traffic is routed through the MITM — that
+// includes gate-on/capture-off, because the MITM re-signs certs either way.
+// It is NOT a "recording is on" signal: pass that explicitly where it matters
+// (see Worker.SetProxy).
 func (m *Manager) ProxyCACert() string {
-	if m.traffic == nil || !m.TrafficEnabled() {
+	// Mirrors ProxyAddr: whenever agents are routed through the MITM they must
+	// trust its CA, even with recording off — otherwise every HTTPS request fails
+	// certificate validation instead of being checked.
+	if m.traffic == nil || !(m.TrafficEnabled() || m.scopeGateOn()) {
 		return ""
 	}
 	return m.traffic.CACertPath()

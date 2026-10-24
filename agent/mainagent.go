@@ -88,7 +88,9 @@ func (m *MainAgent) compactionWindow() int {
 
 // SetProxy points the main agent's WebFetch at the recording proxy plus the CA
 // cert it trusts to verify HTTPS through it (empty addr = direct).
-func (m *MainAgent) SetProxy(addr, caCert string) { m.proxyAddr, m.proxyCACert = addr, caCert }
+// SetProxy routes target traffic through the egress proxy. recording is accepted
+// for signature symmetry with Worker; this agent exposes no traffic tools.
+func (m *MainAgent) SetProxy(addr, caCert string, _ bool) { m.proxyAddr, m.proxyCACert = addr, caCert }
 
 // SetWebSearch selects the web_search backend for the main agent (off by default).
 func (m *MainAgent) SetWebSearch(o WebSearchOpts) { m.webSearch = o }

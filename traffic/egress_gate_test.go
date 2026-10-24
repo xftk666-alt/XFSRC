@@ -110,3 +110,42 @@ func TestEgressGateAbsentAllowsEverything(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 }
+
+// The gate must sit BETWEEN the agent and the configured egress proxy, not
+// beside it. With capture on, agents get the MITM address and the global proxy
+// becomes its upstream; a request refused here must never reach that upstream.
+func TestEgressGateSitsInFrontOfUpstream(t *testing.T) {
+	var upstreamHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+
+	tr, err := Open(t.TempDir(), "127.0.0.1:18791")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tr.Close() })
+	if err := tr.SetUpstreamProxy(upstream.URL); err != nil {
+		t.Fatal(err)
+	}
+	tr.SetEgressGate(func(host string) bool { return host == "allowed.example" })
+	go func() { _ = tr.Start() }()
+	time.Sleep(200 * time.Millisecond)
+
+	pu, _ := url.Parse(tr.ProxyAddr())
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: http.ProxyURL(pu)}}
+
+	resp, err := client.Get("http://denied.example/x")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("upstream was contacted %d time(s): the gate is not in front of it", upstreamHits)
+	}
+}

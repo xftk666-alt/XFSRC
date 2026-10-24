@@ -107,7 +107,10 @@ func (p *Planner) compactionWindow() int {
 
 // SetProxy points the planner's WebFetch at the recording proxy plus the CA cert
 // it trusts to verify HTTPS through it (empty addr = direct).
-func (p *Planner) SetProxy(addr, caCert string) { p.proxyAddr, p.proxyCACert = addr, caCert }
+// SetProxy routes target traffic through the egress proxy. recording is accepted
+// for signature symmetry with Worker; the planner exposes no traffic tools, so it
+// only needs the CA.
+func (p *Planner) SetProxy(addr, caCert string, _ bool) { p.proxyAddr, p.proxyCACert = addr, caCert }
 
 // SetWebSearch selects the web_search backend for the planner (off by default).
 func (p *Planner) SetWebSearch(o WebSearchOpts) { p.webSearch = o }

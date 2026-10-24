@@ -57,7 +57,8 @@ type Worker struct {
 	model           string
 	workDir         string
 	proxyAddr       string
-	proxyCACert     string            // recording proxy's CA cert path (for WebFetch HTTPS verify)
+	proxyCACert     string // MITM CA cert path, set whenever traffic is routed through it
+	recording       bool   // traffic capture on: the traffic_* tools exist and recordings persist
 	webSearch       WebSearchOpts     // web_search tool backend selection (off by default)
 	tx              *transcript.Store // raw LLM conversation persistence (nil = off)
 	window          int               // context window in tokens (for compaction)
@@ -186,7 +187,14 @@ func (w *Worker) compactionWindow() int {
 // SetProxy configures the recording proxy address that workers route target
 // traffic through, plus the CA cert path WebFetch trusts to verify HTTPS through
 // that MITM proxy. Empty addr disables the hint.
-func (w *Worker) SetProxy(addr, caCert string) { w.proxyAddr, w.proxyCACert = addr, caCert }
+// SetProxy routes target traffic through the egress proxy. caCert is set
+// whenever traffic passes through the MITM — including when recording is off but
+// the authorization gate is on, because the MITM re-signs certs either way.
+// recording is reported separately: the CA alone no longer implies that traffic
+// is being persisted, so the prompt must not infer tool availability from it.
+func (w *Worker) SetProxy(addr, caCert string, recording bool) {
+	w.proxyAddr, w.proxyCACert, w.recording = addr, caCert, recording
+}
 
 // SetWebSearch selects the web_search backend for this worker (off by default).
 func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
@@ -285,12 +293,13 @@ func ensureRunDir(base string, taskID, intentID int64) string {
 // cmdOutDir is the SDK large-tool-output spill dir under an agent's run dir.
 func cmdOutDir(dir string) string { return filepath.Join(dir, "cmd-output") }
 
-func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
+func workerSystem(proxyAddr, caCert string, recording bool, dataDir, runDir string) string {
 	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
-	// caCert is present only when the recording MITM is on, which is exactly when
-	// the traffic_* tools are registered — so it gates the traffic-tool note.
+	// recording — not caCert — gates the traffic-tool note. caCert is now also
+	// present when only the authorization gate is on (no recording), and inferring
+	// tool availability from it would advertise tools that do not exist.
 	// Optional finding guidance is added for every role after tool resolution.
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
+	return body + workerTrafficBlock(recording) + workerArtifactSpec(runDir)
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -393,7 +402,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.recording, w.workDir, runDir)
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
