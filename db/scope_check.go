@@ -7,18 +7,25 @@ import (
 )
 
 // DefaultTrustedScopeSources are the task_scope sources that may authorize a
-// request. Only operator-confirmed scope (manual UI entry, or the goal
-// decomposer working from the operator's own task description) is trusted.
+// request. Only operator-confirmed scope is trusted: manual UI entry, the goal
+// decomposer working from the operator's own task description, and a list
+// imported from the bug-bounty platform ('platform') through the authenticated
+// import endpoint.
+//
 // Rows written by planner/worker tools ('agent') and auto-added discovered
 // assets ('auto') are deliberately NOT authoritative: otherwise an agent could
 // widen its own authorization boundary.
-var DefaultTrustedScopeSources = []string{"manual", "goals"}
+var DefaultTrustedScopeSources = []string{"manual", "goals", "platform"}
 
 type scopeEntry struct {
 	kind   string
 	domain string
 	net    *net.IPNet
 	value  string
+	// excluded marks an explicit "out of scope" rule. Exclusions are checked
+	// first and win over every inclusion: a platform that lists example.com and
+	// also lists admin.example.com as out of scope means exactly that.
+	excluded bool
 }
 
 // CheckTaskScopeHosts returns the subset of hosts NOT covered by the task's
@@ -41,7 +48,7 @@ func (d *DB) CheckTaskScopeHosts(taskID int64, hosts, trustedSources []string) (
 		args = append(args, s)
 	}
 	rows, err := d.Query(`
-SELECT kind, COALESCE(domain,''), COALESCE(net::text,''), COALESCE(value,''), COALESCE(company_id,0)
+SELECT kind, COALESCE(domain,''), COALESCE(net::text,''), COALESCE(value,''), COALESCE(company_id,0), excluded
 FROM task_scope
 WHERE task_id=$1 AND source IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if err != nil {
@@ -54,10 +61,11 @@ WHERE task_id=$1 AND source IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	for rows.Next() {
 		var kind, domain, netText, value string
 		var companyID int64
-		if err := rows.Scan(&kind, &domain, &netText, &value, &companyID); err != nil {
+		var excluded bool
+		if err := rows.Scan(&kind, &domain, &netText, &value, &companyID, &excluded); err != nil {
 			return append([]string(nil), hosts...), err
 		}
-		e := scopeEntry{kind: strings.ToLower(kind), domain: strings.ToLower(strings.TrimSuffix(domain, ".")), value: strings.TrimSpace(value)}
+		e := scopeEntry{kind: strings.ToLower(kind), domain: strings.ToLower(strings.TrimSuffix(domain, ".")), value: strings.TrimSpace(value), excluded: excluded}
 		if netText != "" {
 			if _, n, err := net.ParseCIDR(netText); err == nil {
 				e.net = n
@@ -123,14 +131,27 @@ FROM company_scope WHERE company_id=$1 AND source IN (`+strings.Join(cPlaceholde
 }
 
 // hostInScope reimplements the matching rules used by the operator-facing
-// scope_check.py: CIDR containment first, then URL/domain/value matching.
+// scope_check.py: CIDR containment first, then URL/domain/value matching, with
+// explicit out-of-scope rules taking precedence over any in-scope rule.
 func hostInScope(host string, entries []scopeEntry) bool {
+	if hostMatchesEntries(host, entries, true) {
+		return false
+	}
+	return hostMatchesEntries(host, entries, false)
+}
+
+// hostMatchesEntries reports whether host matches an entry of the given kind
+// (excluded or not).
+func hostMatchesEntries(host string, entries []scopeEntry, excluded bool) bool {
 	h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 	if h == "" {
 		return false
 	}
 	ip := net.ParseIP(h)
 	for _, e := range entries {
+		if e.excluded != excluded {
+			continue
+		}
 		if e.net != nil && ip != nil && e.net.Contains(ip) {
 			return true
 		}
@@ -221,7 +242,7 @@ func (d *DB) AllowedHostsAcrossActiveTasks(host string, trustedSources []string)
 	// Only tasks that can still make requests: a done/archived task's scope must
 	// not keep a host reachable forever.
 	rows, err := d.Query(`
-SELECT s.kind, COALESCE(s.domain,''), COALESCE(s.net::text,''), COALESCE(s.value,''), COALESCE(s.company_id,0)
+SELECT s.kind, COALESCE(s.domain,''), COALESCE(s.net::text,''), COALESCE(s.value,''), COALESCE(s.company_id,0), s.excluded
 FROM task_scope s
 JOIN tasks t ON t.id = s.task_id
 WHERE s.source IN (`+strings.Join(ph, ",")+`)
@@ -236,10 +257,11 @@ WHERE s.source IN (`+strings.Join(ph, ",")+`)
 	for rows.Next() {
 		var kind, domain, netText, value string
 		var companyID int64
-		if err := rows.Scan(&kind, &domain, &netText, &value, &companyID); err != nil {
+		var excluded bool
+		if err := rows.Scan(&kind, &domain, &netText, &value, &companyID, &excluded); err != nil {
 			return false, err
 		}
-		e := scopeEntry{kind: strings.ToLower(kind), domain: strings.ToLower(strings.TrimSuffix(domain, ".")), value: strings.TrimSpace(value)}
+		e := scopeEntry{kind: strings.ToLower(kind), domain: strings.ToLower(strings.TrimSuffix(domain, ".")), value: strings.TrimSpace(value), excluded: excluded}
 		if netText != "" {
 			if _, n, err := net.ParseCIDR(netText); err == nil {
 				e.net = n

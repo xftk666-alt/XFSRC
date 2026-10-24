@@ -19,9 +19,15 @@ const (
 	// authorize a request. Agent-written ('agent') and auto-discovered ('auto')
 	// rows are excluded by default so an agent cannot widen its own boundary.
 	settingScopeTrustedSources = "scope_trusted_sources"
+	// settingEgressInfraAllowlist lists hosts the platform itself needs when the
+	// egress gate is enforced at the network layer: LLM endpoints, the self-update
+	// source. Comma-separated, `*.example.com` matches subdomains. Without it,
+	// forcing every outbound connection through the proxy would also block the
+	// platform's own API calls.
+	settingEgressInfraAllowlist = "egress_infra_allowlist"
 )
 
-const defaultScopeTrustedSources = "manual,goals"
+const defaultScopeTrustedSources = "manual,goals,platform"
 
 // scopeGateFor builds the guard.ScopeChecker for one task. The enabled flag and
 // trusted sources are read per call so changing them in settings takes effect
@@ -126,4 +132,33 @@ func (s *Server) warnIfNoTaskScope(task *Task) {
 			Summary: "⚠ 本任务没有授权范围（task_scope 为空）：任何网络请求都会被出站闸门拒绝。请先录入 in-scope 目标。",
 		})
 	}
+}
+
+// infraHostAllowed reports whether host is on the platform's own allow-list.
+// These are destinations the product must reach regardless of task scope (LLM
+// providers, the self-update source), checked before the task scope so an
+// operator does not have to add them to every engagement.
+func infraHostAllowed(pg *db.DB, host string) bool {
+	raw, _, err := pg.GetSetting(settingEgressInfraAllowlist)
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return false
+	}
+	h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	for _, entry := range strings.Split(raw, ",") {
+		e := strings.ToLower(strings.TrimSpace(entry))
+		if e == "" {
+			continue
+		}
+		if strings.HasPrefix(e, "*.") {
+			suffix := strings.TrimPrefix(e, "*")
+			if strings.HasSuffix(h, suffix) && len(h) > len(suffix) {
+				return true
+			}
+			continue
+		}
+		if h == e {
+			return true
+		}
+	}
+	return false
 }

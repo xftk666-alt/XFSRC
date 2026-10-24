@@ -204,11 +204,7 @@ func marshalJSONBArray(items []map[string]any) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		// PostgreSQL array literal for jsonb[]: each element must be
-		// double-quoted with internal backslashes and double-quotes escaped.
-		s := strings.ReplaceAll(string(b), `\`, `\\`)
-		s = strings.ReplaceAll(s, `"`, `\"`)
-		parts[i] = `"` + s + `"`
+		parts[i] = quotePGArrayElement(string(b))
 	}
 	return "{" + strings.Join(parts, ",") + "}", nil
 }
@@ -219,9 +215,20 @@ func marshalStringArray(items []string) string {
 	}
 	escaped := make([]string, len(items))
 	for i, s := range items {
-		escaped[i] = `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+		escaped[i] = quotePGArrayElement(s)
 	}
 	return "{" + strings.Join(escaped, ",") + "}"
+}
+
+// quotePGArrayElement renders one element of a PostgreSQL text[] / jsonb[]
+// literal. The array parser treats a backslash as an escape character, so it
+// must be doubled BEFORE the quote is escaped: without that, `a\b` is stored as
+// `ab` — the backslash and the character after it are consumed. Both encoders in
+// this file go through here so the two cannot drift apart again.
+func quotePGArrayElement(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
 }
 
 func marshalPortServices(ps []PortService) (string, error) {

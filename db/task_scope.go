@@ -666,3 +666,76 @@ ORDER BY t.id LIMIT $`+limPos+` OFFSET $`+offPos, pageArgs...)
 	}
 	return out, total, rows.Err()
 }
+
+// PlatformScopeRule is one authorization entry, already normalised by a platform
+// parser. (db.ScopeRule is the company_scope row shape and carries an ID.)
+type PlatformScopeRule struct {
+	Kind     string // root_domain | subdomain | ip | cidr | icp | keyword
+	Value    string
+	Excluded bool
+	Note     string
+}
+
+// ReplacePlatformScope replaces every platform-sourced scope row for a task with
+// the supplied rules, in one transaction. Manual and goal-derived rows are left
+// alone: an import must never silently delete something the operator typed in.
+//
+// sourceRef records where the list came from (program handle + fetched-at) so an
+// audit can answer "which version of the policy authorised this run".
+func (s *AssetStore) ReplacePlatformScope(taskID int64, rules []PlatformScopeRule, sourceRef string) (added, removed int64, err error) {
+	if taskID <= 0 {
+		return 0, 0, fmt.Errorf("需要 task_id")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	res, err := tx.Exec(`DELETE FROM task_scope WHERE task_id=$1 AND source='platform'`, taskID)
+	if err != nil {
+		return 0, 0, err
+	}
+	removed, _ = res.RowsAffected()
+	for _, r := range rules {
+		var domain, netVal, value any
+		switch r.Kind {
+		case "root_domain", "subdomain":
+			domain = r.Value
+		case "ip":
+			if ip := net.ParseIP(r.Value); ip != nil {
+				if ip.To4() != nil {
+					netVal = ip.String() + "/32"
+				} else {
+					netVal = ip.String() + "/128"
+				}
+			} else {
+				return 0, 0, fmt.Errorf("非法 IP：%q", r.Value)
+			}
+		case "cidr":
+			if _, _, e := net.ParseCIDR(r.Value); e != nil {
+				return 0, 0, fmt.Errorf("非法 CIDR：%q", r.Value)
+			}
+			netVal = r.Value
+		case "icp", "keyword":
+			value = r.Value
+		default:
+			return 0, 0, fmt.Errorf("未知 scope 类型：%q", r.Kind)
+		}
+		if _, e := tx.Exec(`
+INSERT INTO task_scope(task_id, kind, domain, net, value, source, source_ref, excluded, reason)
+VALUES ($1,$2,$3,$4::cidr,$5,'platform',$6,$7,NULLIF($8,''))
+ON CONFLICT DO NOTHING`,
+			taskID, r.Kind, domain, netVal, value, sourceRef, r.Excluded, r.Note); e != nil {
+			return 0, 0, e
+		}
+		added++
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return added, removed, nil
+}
