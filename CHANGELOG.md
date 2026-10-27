@@ -2,6 +2,28 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## v0.3.24-fix1 — 同步上游 v0.3.24（Repeater / Worker 池 / 发现归并）
+
+### 上游同步
+- 合并 `RuoJi6/ARTEX` v0.3.24（620ca5d..e740334，47 个提交）：Burp 风格 Repeater 请求
+  重放工作区、多模型 Worker 池（按 LLM 配置分配并发会话）、任务与模板备注及 Worker
+  运行数量配置、发现重复上报分组归并与候选排序、情报面板、发现严重度筛选与排序、
+  Go 升级至 1.26.10（拦截泄露的 eMudhra 中间 CA）。
+- `main` 分支同步快进至 `e740334`，重新与上游保持一致（此前停在 `620ca5d`，落后 47 个提交）。
+- 冲突只有 3 个文件，全部是「双方在同一处各加各的功能」，按保留双方语义处理：
+  - `server/manager.go`：上游新增 `WorkerCount`，本 fork 的 `Guard: g`（带 scope 闸的
+    guard）保留 —— 若直接取上游的 `guard.NewWithInterceptor(ic)`，授权闸会被静默摘掉。
+  - `server/task_llm.go`：上游新增 `pinnedWorkers`，本 fork 的 `guard` 字段同时保留，
+    `taskAgentBundle` 两者都带。
+  - `server/server.go`：上游新增 `worker_pools` 优先级逻辑，本 fork 的
+    `scope_gate_enabled` / `scope_trusted_sources` 处理保留，两段在同一个 PUT 里串联。
+- 上游把 `Worker.SetProxy` 扩为三参（新增 `recording`），上游新增的 pinned worker 路径
+  仍按两参调用会导致编译失败；已补 `s.m.TrafficEnabled()`，与本 fork 其余 5 处调用一致。
+
+### 验证
+- `go build ./...`、`go vet ./...` 通过。
+- `go test ./...` 在 PostgreSQL 16 上全绿（16 个包，含 `server` 与 `db` 集成测试）。
+
 ## v0.3.23-fix6 — 出站闸门补全、数组转义、平台 scope 导入
 
 本批解决的是「闸门看不见的目标」和「人手工抄 scope」两类问题。所有改动都有回归测试，
