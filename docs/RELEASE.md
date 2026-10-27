@@ -21,11 +21,15 @@
 
 ### 一键
 
+新上游版本的第一次发布必须显式指定 `<上游版本>-fix1`；脚本不带版本参数时只会在现有 tag 上递增 fix 号，不能自动识别上游基线已变化。
+
 ```bash
 cd /home/xiaofan/xfsrc
-./scripts/release.sh                # 自动在最新标签上 +1
-./scripts/release.sh 0.3.24-fix1    # 或显式指定
+git checkout local
+./scripts/release.sh 0.3.24-fix1
 ```
+
+同一上游版本的后续修订依次使用 `0.3.24-fix2`、`0.3.24-fix3` 等。
 
 脚本做四件事：提交 → 打标签 → 推送分支与标签 → 提示 Actions 地址。
 

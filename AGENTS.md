@@ -67,7 +67,7 @@ AGPL-3.0。
 
 ## 开发约定
 
-- 构建需要 Go 1.26.3（`/tmp/goroot`，可能需重新下载 `https://dl.google.com/go/`）。
+- 构建需要 Go 1.26.10 或更高版本（`go.mod` 声明 `go 1.26.10`；本机可使用 `/tmp/goroot`，可能需重新下载 `https://dl.google.com/go/`）。
 - 依赖走官方 `proxy.golang.org`，本机需经代理：`HTTPS_PROXY=http://127.0.0.1:3067`。
 - 仓库根存在 `data/`（700 权限）时，`go test ./...` 会因目录遍历失败；
   用显式包列表（见 `README.md` 的「本地运行与测试」）。
@@ -77,9 +77,11 @@ AGPL-3.0。
 ## 发版
 
 ```bash
-./scripts/release.sh              # 自动 +1
-./scripts/release.sh 0.3.22-fix13 # 指定
+./scripts/release.sh 0.3.24-fix1 # 当前上游版本的首次发布
+./scripts/release.sh 0.3.24-fix2 # 同一上游版本的后续修订
 ```
+
+上游版本变化时，必须显式传入新上游版本的 `-fix1`；不要依赖脚本从旧 tag 自动递增。
 
 推送标签 → GitHub Actions 自动构建 5 平台并发布 Release（约 2.5 分钟）。
 详见 `docs/RELEASE.md`。

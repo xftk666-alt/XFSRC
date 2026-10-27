@@ -208,6 +208,7 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 
 ```bash
 cd XFSRC
+git checkout local
 ./scripts/release.sh 0.3.24-fix1
 ```
 
