@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -62,6 +63,17 @@ func WithTaskContext(ctx context.Context, taskID, agentName string, emit func(db
 		ctx = context.WithValue(ctx, taskEmitCtxKey, emit)
 	}
 	return ctx
+}
+
+// TaskIDFromContext returns the numeric task id bound by WithTaskContext, or 0
+// when the call is not running inside a task.
+func TaskIDFromContext(ctx context.Context) int64 {
+	id, _ := taskInfoFromCtx(ctx)
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func taskInfoFromCtx(ctx context.Context) (taskID, agentName string) {
@@ -126,7 +138,9 @@ type Interceptor struct {
 	db           *db.DB
 	mu           sync.RWMutex
 	cached       []compiledRule  // sorted by priority DESC; nil means not loaded yet
-	enabledTools map[string]bool // nil means not loaded yet
+	enabledTools    map[string]bool // explicit allow-list; used when enabledToolsAll is false
+	enabledToolsAll bool            // true = gate every tool except interceptExemptTools
+	toolsLoaded     bool            // the two fields above have been populated
 	pending      *pendingManager
 	reviewer     Reviewer // nil = LLM fallback judge not wired
 }
@@ -146,6 +160,58 @@ var defaultEnabledTools = []string{
 	"Write", "Edit", "MultiEdit",
 }
 
+// interceptExemptTools are the tools the rule layer never inspects when no
+// explicit allow-list has been saved. They either only read state or only touch
+// the platform's own stores, so a destructive-command/exfil rule cannot fire on
+// them, and scanning their text arguments produced false positives (a
+// record_fact note that merely mentions a hostname was blocked).
+//
+// Everything else is gated — including delete_assets_by_host, spawn_task,
+// create_custom_tool, create_mcp and mcp__* tool calls. A tool that gains a
+// side effect must be removed from this map.
+var interceptExemptTools = func() map[string]bool {
+	m := map[string]bool{}
+	for _, n := range []string{
+		"list_assets", "count_assets", "list_findings", "list_companies", "list_tasks",
+		"list_task_findings", "list_llm_profiles", "list_untested_assets",
+		"list_task_worker_traces", "search_task_worker_traces", "search_finding_duplicates",
+		"get_task_graph", "get_task_node_detail", "get_task_worker_trace",
+		"get_finding_traffic", "get_finding_retest_context", "get_finding_case",
+		"node_detail", "read_task_hint", "todo_write", "todo_read",
+		"record_fact", "add_intent", "set_goals", "set_constraints", "prove_goal",
+	} {
+		m[n] = true
+	}
+	return m
+}()
+
+// allGatedTools lists every tool the layer currently gates, for the settings UI.
+func (i *Interceptor) allGatedTools() ([]string, error) {
+	rows, err := i.db.ListTools()
+	if err != nil {
+		// Keep the UI honest rather than showing an empty coverage set.
+		out := make([]string, len(defaultEnabledTools))
+		copy(out, defaultEnabledTools)
+		return out, nil
+	}
+	// SDK-provided tools have no row in the tools table, but they are gated like
+	// everything else, so the UI must still list them.
+	seen := map[string]bool{}
+	out := make([]string, 0, len(rows)+len(defaultEnabledTools))
+	for _, n := range defaultEnabledTools {
+		seen[n] = true
+		out = append(out, n)
+	}
+	for _, t := range rows {
+		if t == nil || seen[t.Key] || interceptExemptTools[t.Key] {
+			continue
+		}
+		seen[t.Key] = true
+		out = append(out, t.Key)
+	}
+	return out, nil
+}
+
 // New creates an Interceptor backed by d. The rule cache is lazy-loaded on
 // first use.
 func New(d *db.DB) *Interceptor {
@@ -159,6 +225,8 @@ func (i *Interceptor) Invalidate() {
 	i.mu.Lock()
 	i.cached = nil
 	i.enabledTools = nil
+	i.enabledToolsAll = false
+	i.toolsLoaded = false
 	i.mu.Unlock()
 }
 
@@ -176,7 +244,13 @@ func (i *Interceptor) loadLocked() error {
 		if r.MatchType == "regex" {
 			re, err := regexp.Compile(r.Pattern)
 			if err != nil {
-				continue // skip rules with bad regex rather than crashing
+				// A rule whose pattern does not compile would never fire, so a
+				// typo in a deny rule silently removed a safety control. Keep the
+				// rule but make it fail closed: it now matches every call it is
+				// scoped to, which surfaces the misconfiguration instead of
+				// hiding it.
+				log.Printf("[intercept] 规则 %q 的正则无法编译，按始终匹配处理（fail-closed）：%v", r.Name, err)
+				re = regexp.MustCompile(`(?s).*`)
 			}
 			cr.re = re
 		}
@@ -184,18 +258,25 @@ func (i *Interceptor) loadLocked() error {
 	}
 	i.cached = out
 
-	// Load enabled-tools set from settings, falling back to hard-coded defaults.
+	// Load enabled-tools set from settings. With no saved setting the layer now
+	// covers EVERY tool except a small read-only exempt set: the previous
+	// hard-coded 8-name list left delete_assets_by_host, spawn_task,
+	// create_custom_tool and create_mcp completely ungoverned, which is the
+	// opposite of what a safety layer should default to.
 	val, ok, _ := i.db.GetSetting("intercept_enabled_tools")
+	i.toolsLoaded = true
 	if !ok {
-		m := make(map[string]bool, len(defaultEnabledTools))
-		for _, n := range defaultEnabledTools {
-			m[n] = true
-		}
-		i.enabledTools = m
+		i.enabledToolsAll = true
+		i.enabledTools = nil
 	} else {
 		var names []string
 		if json.Unmarshal([]byte(val), &names) != nil {
-			i.enabledTools = map[string]bool{}
+			// Corrupt JSON previously cached an empty set, which disabled the
+			// whole intercept layer until someone repaired the setting. Fall
+			// back to the built-in defaults instead.
+			log.Printf("[intercept] intercept_enabled_tools 无法解析，回退「除只读工具外全部启用」")
+			i.enabledToolsAll = true
+			i.enabledTools = nil
 		} else {
 			m := make(map[string]bool, len(names))
 			for _, n := range names {
@@ -232,8 +313,8 @@ func (i *Interceptor) rules() ([]compiledRule, error) {
 // pattern as rules().
 func (i *Interceptor) IsToolEnabled(name string) bool {
 	i.mu.RLock()
-	if i.enabledTools != nil {
-		v := i.enabledTools[name]
+	if i.toolsLoaded {
+		v := i.toolEnabledLocked(name)
 		i.mu.RUnlock()
 		return v
 	}
@@ -241,8 +322,23 @@ func (i *Interceptor) IsToolEnabled(name string) bool {
 
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.enabledTools == nil {
-		_ = i.loadLocked()
+	if !i.toolsLoaded {
+		if err := i.loadLocked(); err != nil {
+			// A failed load is not "no tools are gated": treating it that way
+			// skipped every rule (including the destructive-command denies) for
+			// as long as the DB stayed unhappy. Report the tool as gated so the
+			// caller proceeds to Match, which fails closed on the same error.
+			return true
+		}
+	}
+	return i.toolEnabledLocked(name)
+}
+
+// toolEnabledLocked answers the enabled question for an already-loaded cache.
+// Caller holds at least a read lock.
+func (i *Interceptor) toolEnabledLocked(name string) bool {
+	if i.enabledToolsAll {
+		return !interceptExemptTools[name]
 	}
 	return i.enabledTools[name]
 }
@@ -256,9 +352,10 @@ func (i *Interceptor) GetEnabledTools() ([]string, error) {
 		return nil, err
 	}
 	if !ok {
-		out := make([]string, len(defaultEnabledTools))
-		copy(out, defaultEnabledTools)
-		return out, nil
+		// Report what the runtime actually gates: every known tool except the
+		// read-only exempt set, so the UI shows the real coverage instead of the
+		// old 8-name list.
+		return i.allGatedTools()
 	}
 	var names []string
 	if err := json.Unmarshal([]byte(val), &names); err != nil {
@@ -315,10 +412,29 @@ const (
 
 // Judge default values.
 const (
-	defaultJudgeTimeoutSecs      = 15
-	defaultJudgeRetryCount       = 3
-	defaultJudgeFailAction       = "ask"
-	defaultJudgeAskTimeoutSecs   = 300
+	defaultJudgeTimeoutSecs = 15
+	defaultJudgeRetryCount  = 3
+	// defaultJudgeFailAction decides what happens when the fallback judge cannot
+	// produce a verdict (provider error, timeout, unparseable output).
+	//
+	// This fork runs UNATTENDED, so "ask" is the worst option here: nobody answers,
+	// every affected tool call waits the full ask timeout and is then denied
+	// — the run looks hung and then dies, with no safety gain over denying outright.
+	//
+	// "allow" is safe to default to because the judge is NOT the authorization
+	// boundary: guard.preToolUse runs the scope gate first and fails closed on its
+	// own (out-of-scope hosts, unreadable target lists), and destructive-command
+	// rules are evaluated before the judge ever runs. The judge only ever sees
+	// calls that matched no rule, so a judge outage degrades to "rules + scope
+	// gate", which is exactly the pre-upgrade behaviour.
+	//
+	// Operators who run supervised can set 系统 → 拦截审批 → 失败策略 to ask/deny.
+	defaultJudgeFailAction = "allow"
+	// defaultJudgeAskTimeoutSecs bounds how long a call waits for a human verdict.
+	// 300s meant an unattended run could stall five minutes per affected call before
+	// finally being denied; two minutes keeps a supervised operator time to react
+	// while capping the damage of "nobody is watching".
+	defaultJudgeAskTimeoutSecs   = 120
 	defaultJudgeAskTimeoutAction = "deny"
 	// DefaultIncompleteScriptAction keeps incomplete snapshots with the judge.
 	DefaultIncompleteScriptAction = "model"
@@ -444,6 +560,28 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 	return nil
 }
 
+// emitJudgeFallback surfaces a degraded judge in the session transcript. Without
+// it a judge outage is invisible: the tool call simply proceeds, and the only
+// trace is an "allowed" intercept-history row the operator has no reason to open.
+func (i *Interceptor) emitJudgeFallback(ctx context.Context, tool, action string, cause error) {
+	detail := ""
+	if cause != nil {
+		detail = cause.Error()
+	}
+	activity := db.Activity{
+		Kind:    "judge_fallback",
+		Summary: fmt.Sprintf("裁判模型不可用，按失败策略「%s」继续：%s", judgeActionLabel(action), tool),
+		Detail:  detail,
+	}
+	if convID := ConvIDFromContext(ctx); convID != 0 {
+		_, _ = i.db.AppendConvActivity(convID, activity)
+		return
+	}
+	if emit := taskEmitFromCtx(ctx); emit != nil {
+		emit(activity)
+	}
+}
+
 // Judge runs the LLM fallback judge for a tool call that matched no rule. It
 // returns (Decision, true) when the judge produced a terminal verdict, or
 // (Decision{}, false) when the fallback is disabled or not wired (caller then
@@ -482,6 +620,7 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 	}
 	if err != nil {
 		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "模型审批失败,按失败策略处理: " + err.Error()}
+		i.emitJudgeFallback(ctx, tool, cfg.FailAction, err)
 	}
 	// By default the model receives snapshot read errors and its verdict is
 	// honored. Operators may explicitly require human review when an incomplete
@@ -492,6 +631,7 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 		// valid verdict
 	default:
 		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "模型输出无法解析,按失败策略处理"}
+		i.emitJudgeFallback(ctx, tool, cfg.FailAction, err)
 	}
 	// A model verdict never carries a rule; keep RuleID 0 (→ NULL) for history.
 	out.RuleID = 0
@@ -542,9 +682,20 @@ func judgeActionLabel(action string) string {
 // Match evaluates the rule list (priority DESC) against a tool call.
 // Returns (Decision, true) for the first matching enabled rule, or
 // (Decision{}, false) if no rule matches.
+//
+// A rule-load failure returns a deny decision rather than (false): callers treat
+// "not matched" as "nothing to enforce here" and fall through to the judge or to
+// allow, so a DB hiccup would have disabled every deny rule at once.
 func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	rules, err := i.rules()
-	if err != nil || len(rules) == 0 {
+	if err != nil {
+		log.Printf("[intercept] 规则加载失败，按 fail-closed 拦截 %s：%v", toolName, err)
+		return Decision{
+			Action:  "deny",
+			Message: "拦截规则加载失败（数据源不可用），已按 fail-closed 阻止执行",
+		}, true
+	}
+	if len(rules) == 0 {
 		return Decision{}, false
 	}
 	for _, r := range rules {

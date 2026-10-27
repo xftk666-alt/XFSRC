@@ -115,7 +115,7 @@ func (s *Server) createCompany(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	id, added, skipped, invalid, scopeErrs, err := cs.CreateCompanyWithScope(req.Name, req.Logo, req.Scope, "api")
+	id, added, skipped, invalid, scopeErrs, err := cs.CreateCompanyWithScope(req.Name, req.Logo, req.Scope, "api", db.ScopeSourceManual)
 	if err != nil {
 		if errors.Is(err, db.ErrCompanyNameConflict) {
 			writeErr(w, http.StatusConflict, "企业名称已存在")
@@ -193,6 +193,9 @@ func (s *Server) addCompanyScope(w http.ResponseWriter, r *http.Request) {
 		Scope  companyScopeInputs `json:"scope"`
 		Reason string             `json:"reason"`
 		Reset  bool               `json:"reset"` // if true, replace existing scope
+		// ConfirmEmpty must be set explicitly to clear a scope with an empty
+		// list; see the guard below.
+		ConfirmEmpty bool `json:"confirm_empty"`
 	}
 	if !decodeCompanyMutationRequest(w, r, &req) {
 		return
@@ -201,13 +204,22 @@ func (s *Server) addCompanyScope(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// A reset with an empty list wipes the company's entire authorization scope
+	// (UpdateScopeInputsChecked deletes every row before re-adding). Requiring an
+	// explicit confirmation turns a truncated or mistyped request into a 400
+	// instead of a silent loss of the operator's scope.
+	if req.Reset && len(req.Scope) == 0 && !req.ConfirmEmpty {
+		writeErr(w, http.StatusBadRequest,
+			"reset 且 scope 为空会清空该企业的全部授权范围；如确需清空，请传 confirm_empty:true")
+		return
+	}
 	var added, skipped, invalid int
 	var errs []string
 	var mutationErr error
 	if req.Reset {
-		added, invalid, errs, mutationErr = cs.UpdateScopeInputsChecked(id, req.Scope, req.Reason)
+		added, invalid, errs, mutationErr = cs.UpdateScopeInputsChecked(id, req.Scope, req.Reason, db.ScopeSourceManual)
 	} else {
-		added, skipped, invalid, errs, mutationErr = cs.AddScopeInputsChecked(id, req.Scope, req.Reason)
+		added, skipped, invalid, errs, mutationErr = cs.AddScopeInputsChecked(id, req.Scope, req.Reason, db.ScopeSourceManual)
 	}
 	if mutationErr != nil {
 		if errors.Is(mutationErr, db.ErrCompanyNotFound) {
@@ -426,12 +438,24 @@ func (s *Server) deleteAssets(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IDs []int64 `json:"ids"`
 	}
+	// Bound the body and the batch. Without a limit a single request could buffer
+	// an arbitrarily large JSON array and drive one DB round-trip per element.
+	r.Body = http.MaxBytesReader(w, r.Body, maxAssetMutationBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "请求正文过大")
+			return
+		}
 		writeErr(w, 400, "invalid JSON: "+err.Error())
 		return
 	}
 	if len(req.IDs) == 0 {
 		writeErr(w, 400, "ids required")
+		return
+	}
+	if len(req.IDs) > maxAssetBatchSize {
+		writeErr(w, 400, fmt.Sprintf("单次最多处理 %d 个资产", maxAssetBatchSize))
 		return
 	}
 	deleted, err := as.DeleteByIDs(req.IDs)
@@ -446,12 +470,20 @@ func (s *Server) deleteAssets(w http.ResponseWriter, r *http.Request) {
 // POST /api/assets
 // =====================================================================
 
+// maxAssetMutationBodyBytes caps an asset mutation body; maxAssetBatchSize caps
+// how many assets one request may carry (each one costs at least one upsert).
+const (
+	maxAssetMutationBodyBytes = 2 << 20
+	maxAssetBatchSize         = 2000
+)
+
 func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 	as := s.assetStore()
 	if as == nil {
 		writeErr(w, 503, "database unavailable")
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxAssetMutationBodyBytes)
 	var req struct {
 		TaskID int64 `json:"task_id"`
 		Assets []struct {
@@ -501,6 +533,10 @@ func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 	type errEntry struct {
 		Index int    `json:"index"`
 		Error string `json:"error"`
+	}
+	if len(req.Assets) > maxAssetBatchSize {
+		writeErr(w, 400, fmt.Sprintf("单次最多提交 %d 个资产", maxAssetBatchSize))
+		return
 	}
 	var results []result
 	var errs []errEntry

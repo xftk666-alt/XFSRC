@@ -13,7 +13,7 @@ import (
 
 // Repo 是发布源。写死而不是做成配置项：更新源可配等于给任何能改配置的人一条
 // 远程代码执行通道，对一个渗透测试平台来说这个口子开不得。
-const Repo = "RuoJi6/ARTEX"
+const Repo = "xftk666-alt/XFSRC"
 
 // latestURL 是 GitHub 的"最新正式版"接口。它会自动跳过 prerelease 和 draft。
 const latestURL = "https://api.github.com/repos/" + Repo + "/releases/latest"
@@ -29,6 +29,13 @@ var allowedHosts = map[string]bool{
 	"raw.githubusercontent.com":            true,
 }
 
+// AllowedHost reports whether host may be contacted (and may receive the update
+// token). Exported so the token-injecting transport can apply the same allowlist
+// that the redirect check uses.
+func AllowedHost(host string) bool {
+	return allowedHosts[strings.ToLower(host)]
+}
+
 // Release 是 GitHub Release 里我们关心的字段。
 type Release struct {
 	TagName     string    `json:"tag_name"`
@@ -42,10 +49,23 @@ type Release struct {
 }
 
 // Asset 是 Release 上挂的一个文件。
+//
+// APIURL 是 GitHub REST 的资产地址（api.github.com/.../releases/assets/<id>）。
+// 私有仓库的 browser_download_url 需要浏览器 Cookie 认证，带 Bearer token 会
+// 返回 404；此时必须走 APIURL + Accept: application/octet-stream。
 type Asset struct {
-	Name string `json:"name"`
-	URL  string `json:"browser_download_url"`
-	Size int64  `json:"size"`
+	Name   string `json:"name"`
+	URL    string `json:"browser_download_url"`
+	APIURL string `json:"url"`
+	Size   int64  `json:"size"`
+}
+
+// DownloadURL 选择实际下载地址：配置了 token（私有仓库）时优先用 API 资产地址。
+func (a Asset) DownloadURL(useAPI bool) string {
+	if useAPI && a.APIURL != "" {
+		return a.APIURL
+	}
+	return a.URL
 }
 
 // ParseProxy validates an optional update proxy without including credentials in errors.

@@ -314,12 +314,22 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 	}
 
 	// task_id: $N = ANY(task_ids)
+	//
+	// Only `=` and `!=` are meaningful here (the column is an array). Any other
+	// operator used to be parsed and then silently dropped, so `task_id>5`
+	// returned the assets of task 5 — an answer that looks like a filter ran.
 	if f == "task_id" {
 		n, err := strconv.ParseInt(e.Value, 10, 64)
 		if err != nil {
 			return "", fmt.Errorf("task_id 需要整数值: %s", e.Value)
 		}
-		return b.next(n) + " = ANY(task_ids)", nil
+		switch e.Op {
+		case "", "=", "==":
+			return b.next(n) + " = ANY(task_ids)", nil
+		case "!=":
+			return "NOT (" + b.next(n) + " = ANY(task_ids))", nil
+		}
+		return "", fmt.Errorf("task_id 只支持 = 和 != 操作符，收到 %q", e.Op)
 	}
 
 	// company_id: exact integer
@@ -328,7 +338,13 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("company_id 需要整数值: %s", e.Value)
 		}
-		return "company_id = " + b.next(n), nil
+		switch e.Op {
+		case "", "=", "==":
+			return "company_id = " + b.next(n), nil
+		case "!=":
+			return "company_id <> " + b.next(n), nil
+		}
+		return "", fmt.Errorf("company_id 只支持 = 和 != 操作符，收到 %q", e.Op)
 	}
 
 	// numeric fields
@@ -394,6 +410,14 @@ func buildDSLWhereBase(node *astNode, base int) (string, []any, error) {
 	clause, err := b.build(node)
 	if err != nil {
 		return "", nil, err
+	}
+	// Wrap the whole clause. Every caller appends plain `AND ...` filters (type,
+	// task_ids, the in-scope target CTE), and AND binds tighter than OR, so an
+	// unwrapped `(a) OR (b)` let those filters apply to the last branch only:
+	// `dsl=domain=a OR domain=b` with typ=ip returned rows of any type, and the
+	// in-scope restriction was bypassable the same way.
+	if clause != "" {
+		clause = "(" + clause + ")"
 	}
 	return clause, b.args, nil
 }

@@ -44,7 +44,13 @@ func (s *Server) assetInterceptCreateRule(w http.ResponseWriter, r *http.Request
 		writeErr(w, 400, err.Error())
 		return
 	}
-	rule, err := pg.CreateAssetInterceptRule(req.Kind, req.Pattern, req.Note, req.Enabled)
+	// A new rule is enabled unless the request says otherwise; a missing field
+	// must never create a silently disabled safety rule.
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	rule, err := pg.CreateAssetInterceptRule(req.Kind, req.Pattern, req.Note, enabled)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -71,7 +77,20 @@ func (s *Server) assetInterceptUpdateRule(w http.ResponseWriter, r *http.Request
 		writeErr(w, 400, err.Error())
 		return
 	}
-	rule, err := pg.UpdateAssetInterceptRule(id, req.Kind, req.Pattern, req.Note, req.Enabled)
+	// A partial update keeps the stored enabled flag: omitting the field used to
+	// mean "false", so editing a rule's note disabled it.
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	} else if rules, err := pg.ListAssetInterceptRules(); err == nil {
+		for _, cur := range rules {
+			if cur.ID == id {
+				enabled = cur.Enabled
+				break
+			}
+		}
+	}
+	rule, err := pg.UpdateAssetInterceptRule(id, req.Kind, req.Pattern, req.Note, enabled)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -106,24 +125,33 @@ func (s *Server) assetInterceptToggleRule(w http.ResponseWriter, r *http.Request
 		writeErr(w, 400, "bad rule id")
 		return
 	}
+	// *bool, not bool: `{}` and a mistyped key (`{"enable":true}`) both decode
+	// successfully into a plain bool and persist enabled=false, so a malformed
+	// request disabled a block rule and still answered ok.
 	var req struct {
-		Enabled bool `json:"enabled"`
+		Enabled *bool `json:"enabled"`
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := pg.ToggleAssetInterceptRule(id, req.Enabled); err != nil {
+	if req.Enabled == nil {
+		writeErr(w, 400, "enabled 必填（true/false）")
+		return
+	}
+	if err := pg.ToggleAssetInterceptRule(id, *req.Enabled); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "enabled": req.Enabled})
+	writeJSON(w, 200, map[string]any{"ok": true, "enabled": *req.Enabled})
 }
 
 // --- helpers ---
 
 type assetInterceptRuleReq struct {
-	Enabled bool   `json:"enabled"`
+	// *bool so an omitted `enabled` on PUT is distinguishable from `false`.
+	// With a plain bool a partial update silently disabled the rule.
+	Enabled *bool  `json:"enabled"`
 	Kind    string `json:"kind"`
 	Pattern string `json:"pattern"`
 	Note    string `json:"note"`

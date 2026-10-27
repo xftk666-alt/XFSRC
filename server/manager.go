@@ -223,6 +223,7 @@ type DeleteTaskResult struct {
 // graph + config) and the in-memory set of task handles.
 type Manager struct {
 	dir         string
+	stopTasks   func() // set by Server.New; stops engine goroutines before Close
 	pg          *pgdb.DB
 	assets      *pgdb.AssetStore
 	traffic     *traffic.Traffic       // process-wide recording proxy (may be nil)
@@ -560,6 +561,35 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		}
 		if tr != nil {
 			m.traffic = tr
+			tr.HardenCAKeyFile()
+			// Respect the capture toggle at the storage layer: the listener may
+			// still be reachable (or reused as an egress hop), but nothing is
+			// persisted while capture is off.
+			tr.SetRecordingGate(m.TrafficEnabled)
+			// Outbound allow-list: the last gate a compiled binary or an
+			// obfuscated command line cannot step around, because a request that
+			// reaches this proxy still has to name a host. Consulted per request
+			// against the union of every active task's trusted scope.
+			tr.SetEgressGate(func(host string) bool {
+				if host == "" {
+					return true // CONNECT with no host: nothing to authorize
+				}
+				if !pg.GetBool(settingScopeGateEnabled, true) {
+					return true
+				}
+				// The platform's own destinations (LLM endpoints, self-update) are
+				// allowed before task scope, so network-layer enforcement does not
+				// sever the product from its own providers.
+				if infraHostAllowed(pg, host) {
+					return true
+				}
+				ok, err := pg.AllowedHostsAcrossActiveTasks(host, nil)
+				if err != nil {
+					log.Printf("[egress] 授权范围查询失败，按 fail-closed 拒绝 %s: %v", host, err)
+					return false
+				}
+				return ok
+			})
 			go func() {
 				log.Printf("[traffic] recording proxy on %s (set HTTP_PROXY=%s + trust _ca CA)", proxyAddr, tr.ProxyAddr())
 				if err := tr.Start(); err != nil {
@@ -570,7 +600,12 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	}
 	// Asset auto-completion engine (§5): HTTP probes routed through the recording
 	// proxy (via m.ProxyAddr, which honors the traffic-capture toggle).
+	// Set before the recording proxy goroutine can accept a request: the gate
+	// installed above reads this field under RLock, so writing it later (and
+	// without the lock) raced with in-flight recording decisions.
+	m.mu.Lock()
 	m.trafficOn = pg.GetBool(settingTrafficCapture, false)
+	m.mu.Unlock()
 	// LLM 录制开关（默认关）。录制器每次调用时读取此标志。
 	m.llmRecOn = pg.GetBool(settingLLMRecord, false)
 	// Load persisted web-search config (default: off, ddgs).
@@ -870,7 +905,17 @@ func decodeStrSlice(raw json.RawMessage) []string {
 func decodeStrMap(raw json.RawMessage) map[string]string {
 	out := map[string]string{}
 	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &out)
+		// JSON null unmarshals into a nil map, which would then panic on the
+		// first assignment ("assignment to entry in nil map") — syncBrowserMCPProxy
+		// writes env["NODE_EXTRA_CA_CERTS"] straight after this.
+		var decoded map[string]string
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			log.Printf("[mcp] 环境变量不是有效的字符串映射，按空处理: %v", err)
+			return out
+		}
+		if decoded != nil {
+			out = decoded
+		}
 	}
 	return out
 }
@@ -899,15 +944,24 @@ func (m *Manager) PG() *pgdb.DB              { return m.pg }
 func (m *Manager) Traffic() *traffic.Traffic { return m.traffic }
 
 // ProxyAddr returns the egress proxy address agents route target traffic through:
-//   - capture ON  → the recording MITM proxy (which itself exits via the global
-//     proxy when one is set); agents also get its CA (see ProxyCACert).
-//   - capture OFF → the global egress proxy directly (empty CA — real target
-//     certs), or "" when no global proxy is set (direct, no recording).
+//   - gate ON  → the MITM proxy (which exits via the global proxy when one is
+//     set), so every target request passes the authorization gate. Recording is
+//     independent: with capture off the MITM forwards without persisting.
+//   - gate OFF and capture OFF → the global egress proxy directly (empty CA —
+//     real target certs), or "" when no global proxy is set.
+//   - capture ON always implies the MITM.
 //
-// So the global proxy takes effect in both modes: at the MITM's upstream when
-// capturing, in the agent's own bash env / WebFetch when not.
+// The two toggles are deliberately separate. Recording is an observability
+// choice; routing through the gate is a safety one, and coupling them meant
+// "capture off" handed agents a proxy the gate never saw.
 func (m *Manager) ProxyAddr() string {
-	if m.traffic != nil && m.TrafficEnabled() {
+	// The authorization gate needs every target request to pass through the MITM,
+	// whether or not the operator wants them RECORDED. Recording is an
+	// observability choice; routing through the gate is a safety one. Tying them
+	// to the same toggle meant "capture off" silently handed agents the raw egress
+	// proxy, so the gate never saw a request and a compiled binary could reach any
+	// host. Route through the MITM whenever the gate is on.
+	if m.traffic != nil && (m.TrafficEnabled() || m.scopeGateOn()) {
 		return m.traffic.ProxyAddr()
 	}
 	m.mu.RLock()
@@ -915,13 +969,26 @@ func (m *Manager) ProxyAddr() string {
 	return m.globalProxy
 }
 
+// scopeGateOn reports whether the pre-request authorization gate is enabled. It
+// decides routing in ProxyAddr: the gate can only enforce what passes through
+// the MITM.
+func (m *Manager) scopeGateOn() bool {
+	if m.pg == nil {
+		return false
+	}
+	return m.pg.GetBool(settingScopeGateEnabled, true)
+}
+
 // ProxyCACert returns the CA cert path agents must trust to verify HTTPS through
-// the egress proxy. Non-empty ONLY when traffic capture is on (the MITM re-signs
-// certs): the global proxy used directly (capture off) is a plain forwarder that
-// preserves real target certs, so no custom CA is needed there. Its emptiness is
-// also the worker's "recording off" signal (see workerSystem).
+// the egress proxy. Non-empty whenever traffic is routed through the MITM — that
+// includes gate-on/capture-off, because the MITM re-signs certs either way.
+// It is NOT a "recording is on" signal: pass that explicitly where it matters
+// (see Worker.SetProxy).
 func (m *Manager) ProxyCACert() string {
-	if m.traffic == nil || !m.TrafficEnabled() {
+	// Mirrors ProxyAddr: whenever agents are routed through the MITM they must
+	// trust its CA, even with recording off — otherwise every HTTPS request fails
+	// certificate validation instead of being checked.
+	if m.traffic == nil || !(m.TrafficEnabled() || m.scopeGateOn()) {
 		return ""
 	}
 	return m.traffic.CACertPath()
@@ -962,6 +1029,11 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 }
 
 func (m *Manager) Close() error {
+	// Stop task goroutines before closing the pool: a planner/worker write after
+	// Close would hit "database is closed" and can keep the data dir busy.
+	if m.stopTasks != nil {
+		m.stopTasks()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.traffic != nil {
@@ -989,7 +1061,9 @@ func unixNanoOrZero(t *time.Time) int64 {
 	return t.UnixNano()
 }
 
-func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor) *Task {
+func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor, pg *pgdb.DB) *Task {
+	g := guard.NewWithInterceptor(ic)
+	g.SetScopeCheck(scopeGateFor(pg, pt.ID))
 	return &Task{
 		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
 		Name:       pt.Name,
@@ -1008,7 +1082,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled, WorkerCount: pt.WorkerCount,
 		FirstRunAt: unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
-		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
+		Store: store, Guard: g, notify: make(chan struct{}, 1),
 	}
 }
 
@@ -1060,7 +1134,7 @@ func (m *Manager) CreateTaskWithOptions(description, goal string, opts pgdb.Task
 	if err != nil {
 		return nil, err
 	}
-	t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
+	t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor, m.pg)
 	m.mu.Lock()
 	m.tasks[t.ID] = t
 	m.active = t.ID
@@ -1259,7 +1333,7 @@ func (m *Manager) LoadExisting() []*Task {
 		if _, ok := m.tasks[id]; ok {
 			continue
 		}
-		t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
+		t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor, m.pg)
 		m.tasks[id] = t
 		loaded = append(loaded, t)
 	}

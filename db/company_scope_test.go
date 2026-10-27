@@ -151,7 +151,7 @@ func TestExplicitCompanyAttributionSurvivesScopeRebuild(t *testing.T) {
 		{Kind: "icp", Value: icp},
 		{Kind: "cidr", Value: network},
 	}
-	if added, _, invalid, errs := cs.AddScopeInputs(autoCompany, rules, "test"); added != len(rules) || invalid != 0 {
+	if added, _, invalid, errs := cs.AddScopeInputs(autoCompany, rules, "test", "manual"); added != len(rules) || invalid != 0 {
 		t.Fatalf("AddScopeInputs: added=%d invalid=%d errors=%v", added, invalid, errs)
 	}
 
@@ -173,7 +173,7 @@ func TestExplicitCompanyAttributionSurvivesScopeRebuild(t *testing.T) {
 	// Replacing every matching rule detaches only the automatically-owned row.
 	if _, invalid, errs := cs.UpdateScopeInputs(autoCompany, []ScopeInput{
 		{Kind: "domain", Value: fmt.Sprintf("replacement-%d.invalid", stamp)},
-	}, "test"); invalid != 0 || len(errs) != 0 {
+	}, "test", "manual"); invalid != 0 || len(errs) != 0 {
 		t.Fatalf("UpdateScopeInputs: invalid=%d errors=%v", invalid, errs)
 	}
 	assertCompany(assetID, explicitCompany, "explicit")
@@ -198,7 +198,7 @@ func TestExplicitCompanyAttributionSurvivesScopeRebuild(t *testing.T) {
 	if _, invalid, errs := cs.UpdateScopeInputs(autoCompany, []ScopeInput{
 		{Kind: "domain", Value: domain},
 		{Kind: "icp", Value: icp},
-	}, "test"); invalid != 0 || len(errs) != 0 {
+	}, "test", "manual"); invalid != 0 || len(errs) != 0 {
 		t.Fatalf("restore fallback scope: invalid=%d errors=%v", invalid, errs)
 	}
 	if err := cs.DeleteCompany(explicitCompany); err != nil {
@@ -267,7 +267,7 @@ func TestCompanyICPAttribution(t *testing.T) {
 	added, _, invalid, errs := cs.AddScopeInputs(companyID, []ScopeInput{
 		{Kind: "icp", Value: "京 ICP备 998877号"},
 		{Kind: "keyword", Value: "ICP Scope"},
-	}, "unit test")
+	}, "unit test", "manual")
 	if added != 2 || invalid != 0 || len(errs) != 0 {
 		t.Fatalf("add structured scope: added=%d invalid=%d errors=%v", added, invalid, errs)
 	}
@@ -331,11 +331,17 @@ func TestCompanyScopeAttribution(t *testing.T) {
 		d.Close()
 	})
 
-	uniq := startMax + 1
+	// Derive the fixture from the clock, not from MAX(asset id): cleanup deletes
+	// the assets it created, so an id-based suffix repeats on the next run and the
+	// leftover company scope then attributes the "pre-scope" asset.
+	uniq := time.Now().UnixNano()
 	root := fmt.Sprintf("scopetest%d.com", uniq)
 	sub := "api." + root
-	ipIn := "198.51.100.9"
-	ipOut := "203.0.113.9"
+	// Unique per run: with fixed addresses, UpsertIP returns the asset row left by
+	// an earlier run (already attributed to another company) and the assertion
+	// below fails against a shared test database.
+	ipIn := fmt.Sprintf("10.%d.%d.9", (uniq/256)%256, uniq%256)
+	ipOut := fmt.Sprintf("10.%d.%d.9", (uniq/256+1)%256, (uniq+7)%256)
 	outDomain := fmt.Sprintf("other%d.net", uniq)
 
 	cid, _, err := cs.UpsertCompany(fmt.Sprintf("ScopeCo %d", uniq), "")
@@ -354,7 +360,8 @@ func TestCompanyScopeAttribution(t *testing.T) {
 		t.Fatalf("pre-scope asset should be unattributed, got %v", *preCompanyID)
 	}
 
-	cs.AddScope(cid, []string{root, "198.51.100.0/24"}, "unit test")
+	cs.AddScope(cid, []string{root, ipIn + "/24"}, "unit test", "manual")
+	t.Cleanup(func() { _ = cs.DeleteCompany(cid) })
 
 	mustCid := func(id int64, want int64, label string) {
 		var cID *int64

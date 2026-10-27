@@ -695,7 +695,7 @@ func TestQueryByCompany(t *testing.T) {
 	}
 	defer cleanupCompany(d, companyID)
 
-	cs.AddScope(companyID, []string{"qbc-test.io"}, "test")
+	cs.AddScope(companyID, []string{"qbc-test.io"}, "test", "manual")
 
 	id, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "qbc-test.io"})
 	if err != nil {
@@ -750,7 +750,7 @@ func TestQueryByCompanyPaging(t *testing.T) {
 	}
 	defer cleanupCompany(d, companyID)
 
-	if added, _, _, errs := cs.AddScope(companyID, []string{"qbc-paging.io"}, "test"); added != 1 {
+	if added, _, _, errs := cs.AddScope(companyID, []string{"qbc-paging.io"}, "test", "manual"); added != 1 {
 		t.Fatalf("AddScope: added=%d, errors=%v", added, errs)
 	}
 
@@ -826,7 +826,7 @@ func TestCompanyAttributionAtInsertTime(t *testing.T) {
 	}
 	defer cleanupCompany(d, companyID)
 
-	cs.AddScope(companyID, []string{"insertattr.com"}, "test")
+	cs.AddScope(companyID, []string{"insertattr.com"}, "test", "manual")
 
 	// Now insert a root domain — should be auto-attributed
 	assetID, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "insertattr.com"})
@@ -1025,11 +1025,11 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 	}
 
 	stamp := time.Now().UnixNano()
-	root := fmt.Sprintf("sc%d.invalid", stamp)           // in-scope root domain (task)
-	srcRoot := fmt.Sprintf("src%d.invalid", stamp)       // in-scope via source task
-	out := fmt.Sprintf("out%d.invalid", stamp)           // out of every scope
-	marker := fmt.Sprintf("mk%d", stamp)                 // bare-text token present in all rows
-	foreignTask := stamp + 777                           // asset produced by an unrelated task
+	root := fmt.Sprintf("sc%d.invalid", stamp)     // in-scope root domain (task)
+	srcRoot := fmt.Sprintf("src%d.invalid", stamp) // in-scope via source task
+	out := fmt.Sprintf("out%d.invalid", stamp)     // out of every scope
+	marker := fmt.Sprintf("mk%d", stamp)           // bare-text token present in all rows
+	foreignTask := stamp + 777                     // asset produced by an unrelated task
 
 	// Scope: task owns root; source task owns srcRoot; task owns an IP /24.
 	for _, sc := range []struct {
@@ -1057,7 +1057,7 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 		{"subdomain", "api." + root, root, "", "", "", marker},                        // under task root
 		{"service", "www." + root, root, "https://www." + root + "/", "", "", marker}, // service under task root
 		{"endpoint", "www." + root, root, "https://www." + root + "/a?" + marker + "=1", "GET", "", ""},
-		{"subdomain", "dev." + srcRoot, srcRoot, "", "", "", marker}, // under source-task root
+		{"subdomain", "dev." + srcRoot, srcRoot, "", "", "", marker},                                      // under source-task root
 		{"endpoint", "198.51.100.9", "198.51.100.9", "http://198.51.100.9:8080/" + marker, "GET", "", ""}, // IP-literal host, ip col empty
 		{"subdomain", "x." + out, out, "", "", "", marker},                                                // out of scope
 	}

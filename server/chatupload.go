@@ -74,10 +74,28 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		defer s.engine.decInflight(id)
 	}
-	dir := filepath.Join(s.m.dir, sub, id, "uploads")
+	// Route the directory through wsResolve so the workspace containment rules
+	// apply: a plain filepath.Join follows symlinked ancestors, so an agent (which
+	// has Bash) could point sessions/<id> at ../../evidence and have the
+	// operator's next upload land inside the sealed-evidence tree.
+	// Denylist off: sessions/ and drafts/ are exactly where these uploads belong.
+	dir, ok := s.wsResolveIn(filepath.Join(sub, id, "uploads"), false)
+	if !ok {
+		writeErr(w, 400, "非法上传目录")
+		return
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		writeErr(w, 500, "建目录失败: "+err.Error())
 		return
+	}
+	// wsResolve resolves symlinks, so re-check the final path is still inside the
+	// workspace now that the directory exists.
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		root, rerr := filepath.EvalSymlinks(s.m.dir)
+		if rerr == nil && resolved != root && !strings.HasPrefix(resolved, root+string(os.PathSeparator)) {
+			writeErr(w, 400, "非法上传目录")
+			return
+		}
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxChatUpload)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
@@ -109,15 +127,21 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 // uniqueUploadPath returns dir/name, or dir/name-1, dir/name-2… when it already exists,
 // so re-uploading the same filename never clobbers a prior attachment.
 func uniqueUploadPath(dir, name string) string {
+	// Lstat, not Stat: a symlink planted in the uploads dir must count as "taken"
+	// rather than resolve to its target (and be written through).
+	exists := func(p string) bool {
+		_, err := os.Lstat(p)
+		return err == nil
+	}
 	dest := filepath.Join(dir, name)
-	if _, err := os.Stat(dest); os.IsNotExist(err) {
+	if !exists(dest) {
 		return dest
 	}
 	ext := filepath.Ext(name)
 	stem := strings.TrimSuffix(name, ext)
 	for i := 1; ; i++ {
 		cand := filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, i, ext))
-		if _, err := os.Stat(cand); os.IsNotExist(err) {
+		if !exists(cand) {
 			return cand
 		}
 	}

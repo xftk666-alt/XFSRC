@@ -95,7 +95,7 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 					if !ok {
 						return
 					}
-					id, err := pg.InsertLog(req.ll.Level, req.ll.Tag, req.ll.Text)
+					id, err := pg.InsertLog(req.ll.Level, req.ll.Tag, db.SanitizeLogText(req.ll.Text))
 					if err != nil {
 						_, _ = os.Stderr.Write([]byte("[logsink] db write: " + err.Error() + "\n"))
 						continue
@@ -136,9 +136,16 @@ func (s *logSinkT) add(l LogLine) {
 		s.ring = s.ring[len(s.ring)-s.cap:]
 	}
 	ch := s.dbCh
-	subs := make([]chan LogLine, 0, len(s.subs))
+	// Send while still holding mu. The unsubscribe closure closes its channel
+	// under the same lock, so a subscriber can never be closed between the
+	// snapshot and the send (that interleaving was a send-on-closed-channel
+	// panic inside log.Printf, which no caller can recover). Both sends are
+	// non-blocking, so holding the lock here cannot stall a log call.
 	for sub := range s.subs {
-		subs = append(subs, sub)
+		select {
+		case sub <- l:
+		default:
+		}
 	}
 	s.mu.Unlock()
 
@@ -146,13 +153,6 @@ func (s *logSinkT) add(l LogLine) {
 	if ch != nil {
 		select {
 		case ch <- dbWriteReq{seq: l.Seq, ll: l}:
-		default:
-		}
-	}
-
-	for _, sub := range subs {
-		select {
-		case sub <- l:
 		default:
 		}
 	}
@@ -185,10 +185,12 @@ func (s *logSinkT) subscribe() (<-chan LogLine, func()) {
 	var once sync.Once
 	return ch, func() {
 		once.Do(func() {
+			// delete + close under one lock: add() sends while holding mu, so
+			// this guarantees no send can land on the closed channel.
 			s.mu.Lock()
 			delete(s.subs, ch)
-			s.mu.Unlock()
 			close(ch)
+			s.mu.Unlock()
 		})
 	}
 }

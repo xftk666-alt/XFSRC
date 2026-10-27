@@ -27,26 +27,33 @@ update_docker(){
     || die "未检测到 docker / docker compose，请先用 ./install.sh 安装部署"
   [ -f .env ] || die "未找到 .env，请先运行 ./install.sh 完成首次部署"
 
-  # 可选：升级到指定版本 tag（不填则沿用 .env 中的 ARTEX_TAG，缺省为 latest）
-  local tag; tag="$(ask '目标镜像 tag（回车沿用 .env / latest）' '')"
+  # 可选：升级到指定版本 tag（不填则沿用 .env 中的 XFSRC_TAG）
+  local tag; tag="$(ask '目标镜像 tag（回车沿用 .env 中的值）' '')"
+  local wrote_env=0
   if [ -n "$tag" ]; then
-    if grep -q '^ARTEX_TAG=' .env; then
-      sed -i.bak "s|^ARTEX_TAG=.*|ARTEX_TAG=${tag}|" .env && rm -f .env.bak
-    else
-      printf '\nARTEX_TAG=%s\n' "$tag" >> .env
-    fi
-    ok "已将 ARTEX_TAG 设为 ${tag}"
+    # tag 会写回 .env 并参与镜像名拼接：先校验，避免 "|" "&" 之类破坏文件或注入。
+    [[ "$tag" =~ ^[A-Za-z0-9._-]+$ ]] || die "tag 只能包含字母、数字、点、下划线、连字符：$tag"
   fi
 
-  # 只动 artex：postgres 是固定的 16-alpine，不需要跟着升级（拉它纯属浪费带宽，
-  # 且大版本变动还会有兼容风险）。artex 声明了 depends_on postgres，所以带服务名
-  # up 时若 pg 没起会自动拉起，已在跑的则原样保留、不重建。
-  info "拉取新镜像（仅 artex）…"
-  docker compose pull artex
-  info "重建并启动（artex 重启时自动迁移 schema）…"
-  docker compose up -d artex
+  # 本 fork 不发布公共镜像：更新 = 重新构建本仓库的镜像。
+  # 先构建，成功后才把新 tag 写进 .env —— 旧实现先改 .env 再 pull，
+  # 一旦 tag 不存在，.env 就指向一个坏 tag，下次 up 也起不来。
+  info "重建镜像…"
+  if [ -n "$tag" ]; then
+    XFSRC_TAG="$tag" docker compose build app || die "构建失败，.env 未改动"
+    wrote_env=1
+  else
+    docker compose build app || die "构建失败"
+  fi
+  if [ "$wrote_env" = 1 ]; then
+    awk -v tag="$tag" 'BEGIN{done=0} /^XFSRC_TAG=/{print "XFSRC_TAG=" tag; done=1; next} {print} END{if(!done) print "XFSRC_TAG=" tag}' .env > .env.new
+    mv .env.new .env
+    ok "已将 XFSRC_TAG 设为 ${tag}"
+  fi
+  info "重建并启动（重启时自动迁移 schema）…"
+  docker compose up -d app
   ok "更新完成 → http://localhost:8787"
-  info "查看日志：docker compose logs -f artex"
+  info "查看日志：docker compose logs -f app"
   info "清理旧镜像（可选）：docker image prune -f"
 }
 

@@ -10,6 +10,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
+	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -44,9 +45,25 @@ type Planner struct {
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
 	// session, but the shared store lets it record a serial exploit chain once and
 	// dispatch it step-by-step over rounds instead of front-loading it in parallel.
+	// hooks is the per-task Guard runner. It MUST be set for every task-bound
+	// planner: the planner holds Bash/WebFetch with ModeBypass, and its context is
+	// fed by tool output from scanned (attacker-controlled) targets, so an
+	// unguarded planner is a prompt-injection → arbitrary-command path. nil only
+	// for tests that construct a Planner without a task.
+	hooks harness.HookRunner
+
 	todoMu sync.Mutex
 	todos  map[int64]*actool.TodoStore
 }
+
+// SetHooks installs the per-task guard (authorization gate + intercept rules).
+// Passing nil disables gating and is only acceptable in tests.
+func (p *Planner) SetHooks(h harness.HookRunner) { p.hooks = h }
+
+// Hooks reports the guard attached to this planner. A task-bound planner with nil
+// hooks is unguarded: it holds Bash/WebFetch with ModeBypass, so callers must
+// treat nil as a wiring bug.
+func (p *Planner) Hooks() harness.HookRunner { return p.hooks }
 
 func NewPlanner(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int) *Planner {
 	return &Planner{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, todos: map[int64]*actool.TodoStore{}}
@@ -90,7 +107,10 @@ func (p *Planner) compactionWindow() int {
 
 // SetProxy points the planner's WebFetch at the recording proxy plus the CA cert
 // it trusts to verify HTTPS through it (empty addr = direct).
-func (p *Planner) SetProxy(addr, caCert string) { p.proxyAddr, p.proxyCACert = addr, caCert }
+// SetProxy routes target traffic through the egress proxy. recording is accepted
+// for signature symmetry with Worker; the planner exposes no traffic tools, so it
+// only needs the CA.
+func (p *Planner) SetProxy(addr, caCert string, _ bool) { p.proxyAddr, p.proxyCACert = addr, caCert }
 
 // SetWebSearch selects the web_search backend for the planner (off by default).
 func (p *Planner) SetWebSearch(o WebSearchOpts) { p.webSearch = o }
@@ -437,6 +457,10 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		Settlement:   settle,
 		NonStreaming: p.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    p.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+		// Authorization gate + intercept rules. Same guard the worker uses: the
+		// planner is fed worker output from attacker-controlled targets, so it must
+		// not be able to reach out-of-scope hosts or run destructive commands.
+		Hooks: p.hooks,
 	}
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx

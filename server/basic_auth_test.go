@@ -233,10 +233,10 @@ func TestBasicAuthGate(t *testing.T) {
 	if !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode || cookie.Path != "/" {
 		t.Fatalf("unsafe cookie: %+v", cookie)
 	}
-	if verifyJWT(cookie.Value, s.jwtKey) {
+	if verifyJWT(cookie.Value, s.jwtKey, s.tokenVersion()) {
 		t.Fatal("gate cookie accepted as admin JWT")
 	}
-	adminJWT, _ := signJWT(s.jwtKey)
+	adminJWT, _ := signJWT(s.jwtKey, s.tokenVersion())
 	for _, tc := range []struct {
 		name, path, user, pass, bearer string
 		cookie                         *http.Cookie
@@ -273,7 +273,7 @@ func TestBasicAuthGate(t *testing.T) {
 			if w.Code != tc.want {
 				t.Fatalf("status=%d want %d: %s", w.Code, tc.want, w.Body.String())
 			}
-			if w.Code == 401 && w.Header().Get("WWW-Authenticate") != `Basic realm="ARTEX", charset="UTF-8"` {
+			if w.Code == 401 && w.Header().Get("WWW-Authenticate") != `Basic realm="XFSRC", charset="UTF-8"` {
 				t.Fatal("missing browser challenge")
 			}
 		})
@@ -448,7 +448,7 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 	if err := s.basicAuth.load(m.pg); err != nil {
 		t.Fatal(err)
 	}
-	adminJWT, err := signJWT(s.jwtKey)
+	adminJWT, err := signJWT(s.jwtKey, s.tokenVersion())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +471,7 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 	if err := restarted.basicAuth.load(m.pg); err != nil {
 		t.Fatal(err)
 	}
-	loginBody := `{"username":"ARTEX","password":"admin-password"}`
+	loginBody := `{"username":"XFSRC","password":"admin-password"}`
 	r = httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(loginBody))
 	w = httptest.NewRecorder()
 	restarted.Handler().ServeHTTP(w, r)
@@ -485,7 +485,7 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 	var login struct {
 		Token string `json:"token"`
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &login); err != nil || w.Code != 200 || !verifyJWT(login.Token, s.jwtKey) {
+	if err := json.Unmarshal(w.Body.Bytes(), &login); err != nil || w.Code != 200 || !verifyJWT(login.Token, s.jwtKey, s.tokenVersion()) {
 		t.Fatalf("Basic Auth + existing login failed: %d %s", w.Code, w.Body.String())
 	}
 	cookie := w.Result().Cookies()[0]

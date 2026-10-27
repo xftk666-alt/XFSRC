@@ -56,6 +56,11 @@ type ToolSet struct {
 	cs              *db.CompanyStore // company store (optional)
 	ts              *db.ExplorationStore
 	worker          string
+	// operatorText is the task description + goal as the operator wrote them.
+	// The goal decomposer may only register scope that appears verbatim here:
+	// it reads untrusted-in-principle text, and a decoded/derived hostname is
+	// exactly what prompt injection would smuggle into a trusted scope row.
+	operatorText string
 	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the
@@ -542,6 +547,44 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 						m["pct"] = cov.Pct
 					}
 				}
+			}
+			// scope: the task's authorization boundary, expanded one level for
+			// company rows so the planner can see which rules actually authorize
+			// its targets. Inherited rows are marked and are read-only.
+			if scopes, err := t.as.ListTaskScopeWithSources(t.taskID); err == nil && len(scopes) > 0 {
+				rows := make([]map[string]any, 0, len(scopes))
+				for _, sc := range scopes {
+					row := map[string]any{
+						"task_id": sc.TaskID, "kind": sc.Kind, "domain": sc.Domain,
+						"net": sc.Net, "value": sc.Value, "source": sc.Source,
+					}
+					if sc.CompanyName != "" {
+						row["company"] = sc.CompanyName
+					}
+					if sc.TaskID != t.taskID {
+						row["inherited"] = true
+					}
+					if sc.CompanyID != nil && t.cs != nil {
+						if rules, err := t.cs.GetScope(*sc.CompanyID); err == nil {
+							expanded := make([]map[string]any, 0, len(rules))
+							keywords := make([]string, 0, 1)
+							for _, r := range rules {
+								expanded = append(expanded, map[string]any{
+									"kind": r.Kind, "domain": r.Domain, "net": r.Net, "value": r.Value,
+								})
+								if r.Kind == "keyword" {
+									keywords = append(keywords, r.Value)
+								}
+							}
+							row["company_scope"] = expanded
+							if len(keywords) > 0 {
+								row["company_keywords"] = keywords
+							}
+						}
+					}
+					rows = append(rows, row)
+				}
+				m["scope"] = rows
 			}
 			if hosts, err := t.as.HostsByTaskWithSources(t.taskID); err == nil {
 				// 只给主机总数，不再把 host 列表平铺进 graph_overview（大范围任务里那是每轮
@@ -2067,8 +2110,8 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.listAssets(),
 		// add_company_scope：规划时可把域名/IP/CIDR/ICP/关键词纳入某公司的资产范围（自动认领命中资产）。
 		t.addCompanyScope(),
-		// add_task_scope：主动把整根域/整公司/某子域/IP 纳入本任务测试范围(覆盖度分母)。
-		t.addTaskScope(),
+		// add_task_scope 刻意不给 planner：它是模型可驱动的扩权通道，只有目标拆解器
+		// （读操作员自己写的任务描述）能写可信范围，见 agent/tools_insert.go。
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
 	}

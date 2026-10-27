@@ -51,8 +51,10 @@ export function UpdateCard() {
   const [savedNetwork, setSavedNetwork] = React.useState<UpdateSettings | null>(null);
   const [savingNetwork, setSavingNetwork] = React.useState(false);
   const [networkError, setNetworkError] = React.useState("");
+  // 私有仓库的 Release 需要 Token；输入框永不回显已保存的值。
+  const [updateToken, setUpdateToken] = React.useState("");
   const streamRef = React.useRef<ReturnType<typeof openSSE> | null>(null);
-  const networkDirty = network?.proxy !== savedNetwork?.proxy;
+  const networkDirty = network?.proxy !== savedNetwork?.proxy || updateToken !== "";
 
   React.useEffect(() => {
     let active = true;
@@ -102,11 +104,12 @@ export function UpdateCard() {
     setSavingNetwork(true);
     setNetworkError("");
     try {
-      const settings = await api.saveUpdateSettings({
-        proxy: network.proxy,
-      });
+      const payload: { proxy: string; token?: string } = { proxy: network.proxy };
+      if (updateToken.trim() !== "") payload.token = updateToken.trim();
+      const settings = await api.saveUpdateSettings(payload);
       setNetwork(settings);
       setSavedNetwork(settings);
+      setUpdateToken("");
       toast.success("更新网络设置已保存");
       check();
     } catch (e) {
@@ -280,6 +283,25 @@ export function UpdateCard() {
               LLM 的代理。
             </FieldDescription>
             {networkDirty && <p className="text-xs text-muted-foreground">修改尚未保存，保存后将自动检查更新。</p>}
+            <FieldLabel htmlFor="update-token" className="mt-3 text-sm font-normal text-muted-foreground">
+              GitHub Token（私有仓库必填）
+            </FieldLabel>
+            <Input
+              id="update-token"
+              type="password"
+              autoComplete="off"
+              placeholder={
+                network?.token_set ? "已保存，留空表示不修改" : "repo 只读权限的 Fine-grained Token"
+              }
+              value={updateToken}
+              disabled={busy || restarting || savingNetwork || !network}
+              onChange={(e) => setUpdateToken(e.target.value)}
+            />
+            <FieldDescription className="text-xs">
+              仓库为 private 时，GitHub 的 releases 接口需要认证。生成 Fine-grained Token 时只需勾选本仓库的
+              <span className="font-mono"> Releases: Read-only </span>
+              权限；令牌仅保存在本机数据库，不会回显。
+            </FieldDescription>
             {networkError && (
               <p role="alert" className="text-xs text-destructive">
                 {networkError}
@@ -420,7 +442,7 @@ export function UpdateCard() {
 
         <p className="text-xs text-muted-foreground">
           一键更新依赖守护脚本重启程序。请通过 <span className="font-mono">start.sh</span>（Windows 为
-          <span className="font-mono"> start.bat</span>）启动 ARTEX；直接运行 artex 本体时，程序退出后不会被自动拉起。
+          <span className="font-mono"> start.bat</span>）启动 XFSRC；直接运行 artex 本体时，程序退出后不会被自动拉起。
         </p>
       </CardContent>
     </Card>

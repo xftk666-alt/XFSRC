@@ -22,7 +22,11 @@ type scriptReference struct {
 	direct        bool
 	inline        bool
 	generated     bool
-	content       string
+	// opaque marks an execution whose targets cannot be read (a compiled binary
+	// or `go run`). The authorization gate denies such a call when it names no
+	// target of its own.
+	opaque  bool
+	content string
 }
 
 // Only statically resolvable shell words are used. No environment expansion,
@@ -106,6 +110,12 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 	for _, stmt := range tree.Stmts {
 		markStraightLine(stmt)
 	}
+	// A `cd` inside a conditional, loop or function body may never run, and its
+	// effect on later statements is not knowable statically. When the script
+	// contains any such construct, the tracked directory is treated as unknown
+	// rather than followed — `if false; then cd /tmp; fi; python3 run.py` used to
+	// resolve run.py under /tmp even though the shell never changed directory.
+	cdUnreliable := hasConditionalControl(tree)
 	constants := shellConstants(tree, topStatements)
 	allowSed := staticSedCommandUnshadowed(tree)
 	sedAnalysisRemaining, envAnalysisRemaining := 8192, 8192
@@ -155,6 +165,13 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 			return
 		}
 		refs = append(refs, scriptReference{path: absolute, direct: direct})
+	}
+	// nested analyzes a fragment that another construct will execute: a sourced
+	// file's body, eval's argument, or the command behind xargs/find -exec.
+	// depth bounds self-referential scripts; remaining is shared so a chain of
+	// nested fragments cannot exceed the parse budget.
+	nested := func(code, baseDir string) []scriptReference {
+		return scriptReferencesBounded(code, baseDir, depth+1, remaining)
 	}
 	// Walking the AST visits calls inside command substitutions as well, but not
 	// string literals, comments or heredoc bodies. Function bodies/conditional cd
@@ -212,6 +229,14 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 					delete(generated, path)
 				}
 			}
+			// A `cd` that is not on the straight-line path (`if …; then cd …`,
+			// inside a loop, or in a function body) may never run. Following it
+			// made the analyzer resolve later relative scripts under a directory
+			// the shell never entered.
+			if cdUnreliable && !topStatements[stmt] {
+				dir = "" // unknown: cannot prove which directory later statements see
+				return true
+			}
 			if len(args) == 2 {
 				path, known := staticWord(args[1])
 				if known && path != "-" {
@@ -248,9 +273,47 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 					}
 					refs[index] = ref
 					sourceInputs[call] = reviewSourceInput{ref: ref}
+					// A sourced file is itself a script: `source a.sh` where a.sh
+					// does `source b.sh` or `python3 evil.py` left b.sh and evil.py
+					// uncaptured, so the target inside them was invisible to both
+					// the judge and the authorization gate.
+					if ref.content != "" {
+						refs = append(refs, nested(ref.content, filepath.Dir(ref.path))...)
+					}
 				}
 			} else {
 				refs = append(refs, scriptReference{problem: "source 缺少脚本路径"})
+			}
+			return true
+		}
+		// eval evaluates its arguments as shell code in the current shell, so the
+		// text has to be treated as a script rather than as opaque arguments.
+		if base == "eval" && len(args) > 1 {
+			if code, ok := staticWord(args[1]); ok && code != "" {
+				refs = append(refs, nested(code, dir)...)
+			} else {
+				refs = append(refs, scriptReference{problem: "eval 的参数含动态展开，无法确定实际执行的代码"})
+			}
+			return true
+		}
+		// xargs and `find -exec` run another program with arguments they build.
+		// Recurse on the tail so the inner command is analyzed like a top-level
+		// one; a dynamic tail still fails closed through the usual path.
+		// `go run ./cmd/recon` compiles a package and executes it. The targets can
+		// live anywhere in that package's source, so the call is opaque: the gate
+		// denies it unless the command line names a target it can check.
+		if base == "go" && len(args) > 1 {
+			if sub, ok := staticWord(args[1]); ok && (sub == "run" || sub == "generate") {
+				refs = append(refs, scriptReference{
+					opaque: true,
+					path:   "go " + sub + " " + strings.Join(staticArgs(args[2:]), " "),
+				})
+				return true
+			}
+		}
+		if base == "xargs" || (base == "find" && hasExecFlag(args)) {
+			if tail := commandTail(args); tail != "" {
+				refs = append(refs, nested(tail, dir)...)
 			}
 			return true
 		}
@@ -275,6 +338,27 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 						}
 					} else if shell {
 						refs = append(refs, scriptReference{problem: "Shell 内联执行缺少命令内容"})
+					} else if i+1 < len(args) {
+						// `python3 -c "…"`, `node -e "…"`, `ruby -e "…"`: the inline
+						// text is the program. It used to be left uncaptured on the
+						// assumption that the judge sees it inside
+						// ReviewInput.Arguments — but the AUTHORIZATION gate only
+						// looks at the scripts CaptureScripts returns, so
+						// `python3 -c "import urllib.request;urlopen('http://x')"`
+						// carried its target invisibly and the scope gate allowed
+						// it. Capture the literal text as an inline script so both
+						// the gate and the judge see what will actually run.
+						if inlineText, known := staticWord(args[i+1]); known && strings.TrimSpace(inlineText) != "" {
+							refs = append(refs, scriptReference{
+								inline:  true,
+								content: inlineText,
+								path:    "<" + base + " 内联代码>",
+							})
+						} else {
+							refs = append(refs, scriptReference{problem: "内联执行内容无法静态解析"})
+						}
+					} else {
+						refs = append(refs, scriptReference{problem: "内联执行缺少代码内容"})
 					}
 					return true
 				}
@@ -336,6 +420,8 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 					add(r.Word, false)
 					return true
 				}
+				// The heredoc body is part of ReviewInput.Arguments, so the judge
+				// already sees it; a separate script entry would only duplicate it.
 				if r.Hdoc != nil || r.Op == syntax.Hdoc || r.Op == syntax.DashHdoc || r.Op == syntax.WordHdoc {
 					return true
 				}
@@ -352,12 +438,40 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 	})
 	return refs
 }
+
+// hasConditionalControl reports whether the tree contains constructs that may
+// skip or repeat statements, making working-directory tracking unsound.
+func hasConditionalControl(tree *syntax.File) bool {
+	found := false
+	syntax.Walk(tree, func(node syntax.Node) bool {
+		if found {
+			return false
+		}
+		switch node.(type) {
+		case *syntax.IfClause, *syntax.ForClause, *syntax.WhileClause,
+			*syntax.CaseClause, *syntax.FuncDecl, *syntax.Subshell, *syntax.Block:
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
 func knownScriptExtension(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".sh", ".bash", ".zsh", ".fish", ".py", ".py3", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".rb", ".pl", ".php", ".ps1", ".lua":
 		return true
 	}
 	return false
+}
+
+// CaptureScripts returns the script bodies a tool call would execute, plus a
+// completeness status. Exported so the authorization gate can scan the same
+// bodies for network targets: a gate that only reads the command line is blind
+// to `python3 /tmp/recon.py`.
+func CaptureScripts(workingDir, tool string, arguments json.RawMessage) ([]ReviewScript, string) {
+	return captureScripts(workingDir, tool, arguments)
 }
 
 func captureScripts(workingDir, tool string, arguments json.RawMessage) ([]ReviewScript, string) {
@@ -386,12 +500,20 @@ func captureScripts(workingDir, tool string, arguments json.RawMessage) ([]Revie
 	if strings.TrimSpace(command) == "" {
 		return nil, "not_applicable"
 	}
-	refs := scriptReferences(command, workingDir, 0)
+	// Work queue: a script file's body is itself a script, so anything it sources
+	// or launches has to be captured too. `sh a.sh` where a.sh does
+	// `source b.sh` / `python3 evil.py` used to leave b.sh and evil.py invisible
+	// to both the judge and the authorization gate.
+	queue := scriptReferences(command, workingDir, 0)
+	expanded := map[string]bool{}
+	expansions := 0
 	var files []ReviewScript
 	seen := map[string]bool{}
 	status := "complete"
 	total := 0
-	for _, ref := range refs {
+	for len(queue) > 0 {
+		ref := queue[0]
+		queue = queue[1:]
 		key := ref.path + ref.problem
 		if ref.inline {
 			hash := sha256.Sum256([]byte(ref.content))
@@ -401,7 +523,7 @@ func captureScripts(workingDir, tool string, arguments json.RawMessage) ([]Revie
 			continue
 		}
 		seen[key] = true
-		file := ReviewScript{Path: ref.path, ReadError: ref.problem}
+		file := ReviewScript{Path: ref.path, ReadError: ref.problem, Opaque: ref.opaque}
 		if ref.generated {
 			file.Source = "command"
 		} else if ref.path != "" {
@@ -409,6 +531,13 @@ func captureScripts(workingDir, tool string, arguments json.RawMessage) ([]Revie
 		}
 		if file.Path == "" {
 			file.Path = "<无法确定的脚本>"
+		}
+		// An opaque execution carries no readable body; its verdict is decided by
+		// the gate (deny when the call names no target), not by the script scan.
+		if ref.opaque {
+			file.Complete = true
+			files = append(files, file)
+			continue
 		}
 		if ref.problem != "" {
 			file.Truncated = strings.Contains(ref.problem, "超过")
@@ -436,9 +565,16 @@ func captureScripts(workingDir, tool string, arguments json.RawMessage) ([]Revie
 			continue
 		}
 		file.Bytes = int64(len(content))
-		// A directly invoked native binary is not a script. Interpreters, however,
-		// must never be permitted to execute an opaque/non-text file automatically.
+		// A directly invoked native binary is not a script, and its targets are
+		// not readable. Record it as OPAQUE instead of dropping it: dropping it
+		// made `./recon` — a locally compiled tool with hardcoded targets — look
+		// like a call with no network targets at all, so the scope gate allowed
+		// it. The gate now denies that shape unless the command line names a
+		// target the caller can see.
 		if ref.direct && (bytes.HasPrefix(content, []byte{0x7f, 'E', 'L', 'F'}) || bytes.HasPrefix(content, []byte{'M', 'Z'})) {
+			file.Opaque = true
+			file.Complete = true
+			files = append(files, file)
 			continue
 		}
 		if tool == "shell_send" {
@@ -466,6 +602,24 @@ func captureScripts(workingDir, tool string, arguments json.RawMessage) ([]Revie
 		file.Complete = true
 		total += len(content)
 		files = append(files, file)
+		// Expand this body once, with a hard cap so a self-referential script
+		// cannot spin. The path key keeps `a.sh` sourcing `a.sh` to one pass.
+		// Only a shell body can be re-parsed as shell. Treating a Python/JS body
+		// as shell produced a parse error and a fail-closed "incomplete" verdict
+		// for perfectly ordinary scripts; their text is already captured above and
+		// scanned for network targets by the authorization gate.
+		// Generated entries are this command's own output (e.g. sed rewriting a
+		// file): their content is already captured and re-parsing it as shell
+		// would invent a "dynamic entry point" failure for ordinary data.
+		// Inline code (python -c / node -e) is likewise not shell: parsing
+		// `urllib.request.urlopen('http://x')` as shell fails on the `(` and used
+		// to downgrade the whole call to a fail-closed "incomplete" verdict. Its
+		// text is already captured above for the gate to scan.
+		if !ref.generated && !ref.inline && isShellScriptPath(ref.path) && !expanded[ref.path] && expansions < 16 && ref.path != "" {
+			expanded[ref.path] = true
+			expansions++
+			queue = append(queue, scriptReferences(string(content), filepath.Dir(ref.path), 1)...)
+		}
 	}
 	if len(files) == 0 {
 		return nil, "not_applicable"
@@ -489,4 +643,86 @@ func readScript(path string) ([]byte, error) {
 	}
 	defer f.Close()
 	return io.ReadAll(io.LimitReader(f, maxReviewScriptBytes+1))
+}
+
+// hasExecFlag reports whether a find invocation uses -exec/-execdir/-ok, i.e.
+// runs another program whose arguments this analysis would otherwise miss.
+func hasExecFlag(args []*syntax.Word) bool {
+	for _, a := range args[1:] {
+		if v, ok := staticWord(a); ok {
+			switch v {
+			case "-exec", "-execdir", "-ok", "-okdir":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// staticArgs renders the statically-known words of a command, dropping any that
+// would need expansion. Used only to label an opaque execution for the audit
+// trail, so a partial rendering is acceptable.
+func staticArgs(args []*syntax.Word) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if v, ok := staticWord(a); ok {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// commandTail rebuilds the command that xargs/find -exec will run: the first
+// non-flag word after the tool's own flags, plus everything after it.
+func commandTail(args []*syntax.Word) string {
+	words := make([]string, 0, len(args))
+	for _, a := range args[1:] {
+		v, ok := staticWord(a)
+		if !ok {
+			return ""
+		}
+		words = append(words, v)
+	}
+	for i, w := range words {
+		if w == "-exec" || w == "-execdir" || w == "-ok" || w == "-okdir" {
+			rest := words[i+1:]
+			// The terminator is a literal ';' or '+'.
+			for len(rest) > 0 && (rest[len(rest)-1] == ";" || rest[len(rest)-1] == "+") {
+				rest = rest[:len(rest)-1]
+			}
+			return strings.Join(rest, " ")
+		}
+	}
+	// xargs: skip its own flags (and the values of the ones that take one).
+	i := 0
+	for i < len(words) {
+		w := words[i]
+		if !strings.HasPrefix(w, "-") {
+			return strings.Join(words[i:], " ")
+		}
+		if xargsValueFlag[w] && i+1 < len(words) {
+			i += 2
+			continue
+		}
+		i++
+	}
+	return ""
+}
+
+// xargsValueFlag lists xargs flags whose value is not part of the command.
+var xargsValueFlag = map[string]bool{
+	"-a": true, "--arg-file": true, "-E": true, "-e": true, "-I": true,
+	"-L": true, "-n": true, "-P": true, "-s": true, "-d": true, "--delimiter": true,
+	"--max-args": true, "--max-procs": true, "--max-chars": true, "--replace": true,
+}
+
+// isShellScriptPath reports whether a file body should be parsed as shell. An
+// extensionless file is included: `source ./lib` and shebang-only scripts are
+// normal. Anything with a known non-shell extension is not.
+func isShellScriptPath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case "", ".sh", ".bash", ".zsh", ".ksh", ".ash", ".dash", ".bashrc", ".profile":
+		return true
+	}
+	return false
 }

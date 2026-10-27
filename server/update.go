@@ -306,7 +306,13 @@ func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
 		// 刻意用 s.ctx 而不是请求的 ctx：HTTP 响应一返回请求就结束了，
 		// 挂在它上面下载会立刻被取消。
 		defer client.CloseIdleConnections()
-		err := selfupdate.Stage(s.ctx, client, rel, current, func(ph selfupdate.Phase, pct int, msg string) {
+		stageCtx := s.ctx
+		if s.updateUsesToken() {
+			// 私有仓库：资产必须走 REST 资产地址 + octet-stream，
+			// browser_download_url 带 Bearer token 会 404。
+			stageCtx = selfupdate.WithAPIAssets(stageCtx)
+		}
+		err := selfupdate.Stage(stageCtx, client, rel, current, func(ph selfupdate.Phase, pct int, msg string) {
 			updHub.publish(ph, pct, msg)
 		})
 		updHub.finish(err)

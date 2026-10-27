@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,8 +106,8 @@ func (s *Server) toolCreateSkill() actool.CoreTool {
 			}
 			var b strings.Builder
 			b.WriteString("---\n")
-			fmt.Fprintf(&b, "name: %s\n", a.Name)
-			fmt.Fprintf(&b, "description: %s\n", a.Description)
+			fmt.Fprintf(&b, "name: %s\n", yamlScalar(a.Name))
+			fmt.Fprintf(&b, "description: %s\n", yamlScalar(a.Description))
 			b.WriteString("---\n")
 			if strings.TrimSpace(a.Instructions) != "" {
 				b.WriteString(a.Instructions)
@@ -236,7 +238,30 @@ func (s *Server) toolUpdateCustomTool() actool.CoreTool {
 			if a.Kind == "http" && !hasSchemaProps(a.Schema) {
 				return actool.Errorf("http 工具必须提供参数 JSON Schema(不能留空)"), nil
 			}
-			if err := s.m.pg.UpdateCustomTool(toDBTool(a)); err != nil {
+			// Merge onto the stored row. toDBTool builds a complete row from the
+			// request alone, so a partial update (e.g. only {key, description})
+			// would otherwise wipe kind/exec/schema/agents with zero values.
+			merged := toDBTool(a)
+			if strings.TrimSpace(merged.Description) == "" {
+				merged.Description = existing.Description
+			}
+			if len(merged.Schema) == 0 {
+				merged.Schema = existing.Schema
+			}
+			if len(merged.Agents) == 0 {
+				merged.Agents = existing.Agents
+			}
+			if strings.TrimSpace(merged.Kind) == "" {
+				merged.Kind = existing.Kind
+			}
+			if len(merged.Exec) == 0 {
+				merged.Exec = existing.Exec
+			}
+			merged.Deferred = existing.Deferred
+			if a.Enabled == nil {
+				merged.Enabled = existing.Enabled
+			}
+			if err := s.m.pg.UpdateCustomTool(merged); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			return actool.Text("custom tool updated: " + a.Key), nil
@@ -291,6 +316,27 @@ func (a mcpToolInput) toDB() *db.MCPServer {
 	}
 }
 
+// validateMCPInput rejects transport/command/URL combinations that would make
+// create_mcp (and update_mcp) persist a live endpoint the operator never
+// intended: an unknown transport, a stdio entry with no command, or an http
+// endpoint that is not a URL.
+func validateMCPInput(a mcpToolInput) error {
+	switch strings.ToLower(strings.TrimSpace(a.Transport)) {
+	case "stdio":
+		if strings.TrimSpace(a.Command) == "" {
+			return errors.New("stdio 传输需要 command")
+		}
+	case "http", "sse":
+		u, err := url.Parse(strings.TrimSpace(a.URL))
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return errors.New("http/sse 传输需要合法的 http(s) URL")
+		}
+	default:
+		return errors.New("transport 需为 stdio / http / sse")
+	}
+	return nil
+}
+
 func (s *Server) toolCreateMCP() actool.CoreTool {
 	return wrTool("create_mcp", "创建一个 MCP 服务器(stdio/http/sse)。创建后其工具需按 agent 可见性授权。",
 		mcpSchema(false),
@@ -300,6 +346,9 @@ func (s *Server) toolCreateMCP() actool.CoreTool {
 			a.ID = 0
 			if strings.TrimSpace(a.Name) == "" || strings.TrimSpace(a.Transport) == "" {
 				return actool.Errorf("name / transport 必填"), nil
+			}
+			if err := validateMCPInput(a); err != nil {
+				return actool.Errorf(err.Error()), nil
 			}
 			id, err := s.m.pg.SaveMCP(a.toDB())
 			if err != nil {
@@ -318,7 +367,43 @@ func (s *Server) toolUpdateMCP() actool.CoreTool {
 			if a.ID == 0 {
 				return actool.Errorf("id 必填"), nil
 			}
-			if _, err := s.m.pg.SaveMCP(a.toDB()); err != nil {
+			if err := validateMCPInput(a); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			// Merge onto the stored row: toDB() zero-values every field the
+			// request omitted, and SaveMCP writes all columns, so a partial update
+			// used to blank the connection config.
+			merged := a.toDB()
+			var cur *db.MCPServer
+			if all, err := s.m.pg.ListMCP(); err == nil {
+				for _, m := range all {
+					if m.ID == a.ID {
+						cur = m
+						break
+					}
+				}
+			}
+			if cur != nil {
+				if strings.TrimSpace(merged.Command) == "" {
+					merged.Command = cur.Command
+				}
+				if len(merged.Args) == 0 {
+					merged.Args = cur.Args
+				}
+				if len(merged.Env) == 0 {
+					merged.Env = cur.Env
+				}
+				if strings.TrimSpace(merged.URL) == "" {
+					merged.URL = cur.URL
+				}
+				if a.Enabled == nil {
+					merged.Enabled = cur.Enabled
+				}
+				if a.Insecure == nil {
+					merged.Insecure = cur.Insecure
+				}
+			}
+			if _, err := s.m.pg.SaveMCP(merged); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			return actool.Text(fmt.Sprintf("mcp updated: id=%d", a.ID)), nil

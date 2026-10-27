@@ -28,7 +28,7 @@ func TestAssetUpsertWaitsForCompanyScopeMutation(t *testing.T) {
 	})
 	if added, _, invalid, validationErrors, err := companies.AddScopeInputsChecked(oldCompany, []ScopeInput{
 		{Kind: "domain", Value: domain},
-	}, "test"); err != nil || added != 1 || invalid != 0 || len(validationErrors) != 0 {
+	}, "test", "manual"); err != nil || added != 1 || invalid != 0 || len(validationErrors) != 0 {
 		t.Fatalf("seed old scope: added=%d invalid=%d validation=%v err=%v", added, invalid, validationErrors, err)
 	}
 
@@ -45,7 +45,7 @@ func TestAssetUpsertWaitsForCompanyScopeMutation(t *testing.T) {
 	}
 	if _, err := insertScopeRuleTx(mutation, newCompany, ParsedScope{
 		Kind: "domain", Domain: domain, Raw: domain,
-	}, "test"); err != nil {
+	}, "test", "manual"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -119,7 +119,7 @@ func TestResolveAndRecomputeUseStableCompanyIDTieBreak(t *testing.T) {
 		{Kind: "icp", Value: icp},
 	}
 	for _, companyID := range []int64{second, first} {
-		if added, _, invalid, validationErrors, err := companies.AddScopeInputsChecked(companyID, rules, "test"); err != nil || added != len(rules) || invalid != 0 || len(validationErrors) != 0 {
+		if added, _, invalid, validationErrors, err := companies.AddScopeInputsChecked(companyID, rules, "test", "manual"); err != nil || added != len(rules) || invalid != 0 || len(validationErrors) != 0 {
 			t.Fatalf("add company %d rules: added=%d invalid=%d validation=%v err=%v", companyID, added, invalid, validationErrors, err)
 		}
 	}
@@ -199,12 +199,12 @@ func TestCompanyScopeLimitsAndCheckedErrors(t *testing.T) {
 	for i := range rules {
 		rules[i] = ScopeInput{Kind: "keyword", Value: fmt.Sprintf("limit-%d-%d", stamp, i)}
 	}
-	if added, _, _, _, err := companies.AddScopeInputsChecked(companyID, rules, "test"); err != nil || added != bulk {
+	if added, _, _, _, err := companies.AddScopeInputsChecked(companyID, rules, "test", "manual"); err != nil || added != bulk {
 		t.Fatalf("bulk scope insert: added=%d want=%d err=%v", added, bulk, err)
 	}
 	if added, _, _, _, err := companies.AddScopeInputsChecked(companyID, []ScopeInput{
 		{Kind: "keyword", Value: fmt.Sprintf("limit-%d-extra", stamp)},
-	}, "test"); added != 1 || err != nil {
+	}, "test", "manual"); added != 1 || err != nil {
 		t.Fatalf("append past the old cap: added=%d err=%v", added, err)
 	}
 	var count int
@@ -216,10 +216,10 @@ func TestCompanyScopeLimitsAndCheckedErrors(t *testing.T) {
 	}
 
 	missingID := companyID + 1_000_000_000
-	if _, _, _, _, err := companies.AddScopeInputsChecked(missingID, nil, "test"); !errors.Is(err, ErrCompanyNotFound) {
+	if _, _, _, _, err := companies.AddScopeInputsChecked(missingID, nil, "test", "manual"); !errors.Is(err, ErrCompanyNotFound) {
 		t.Fatalf("missing add error=%v want ErrCompanyNotFound", err)
 	}
-	if _, _, _, err := companies.UpdateScopeInputsChecked(missingID, nil, "test"); !errors.Is(err, ErrCompanyNotFound) {
+	if _, _, _, err := companies.UpdateScopeInputsChecked(missingID, nil, "test", "manual"); !errors.Is(err, ErrCompanyNotFound) {
 		t.Fatalf("missing update error=%v want ErrCompanyNotFound", err)
 	}
 	if _, err := companies.DeleteCompanyWithAssets(missingID, true); !errors.Is(err, ErrCompanyNotFound) {
@@ -236,7 +236,7 @@ func TestCompanyScopeCheckedReturnsSystemErrorSeparately(t *testing.T) {
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, validationErrors, err := companies.AddScopeInputsChecked(1, nil, "test")
+	_, _, _, validationErrors, err := companies.AddScopeInputsChecked(1, nil, "test", "manual")
 	if err == nil {
 		t.Fatal("closed database did not return a system error")
 	}

@@ -1,6 +1,6 @@
 ---
 name: api-recon
-description: 收集网站API接口时调用该skill。
+description: 收集网站 API 接口时调用该 skill。从前端 JS、source map、流量与历史 URL 中提取接口路径与参数，产出可测试的 API 清单。当需要枚举某目标的接口面、为 IDOR/XSS/GraphQL 等专项测试准备输入时使用。
 ---
 
 # API Recon（前端接口侦察）

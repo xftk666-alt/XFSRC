@@ -148,6 +148,30 @@ func (d *DB) ListFindingRetests(findingID int64) ([]*FindingRetest, error) {
 	return out, rows.Err()
 }
 
+// ConversationTaskID resolves the task a chat conversation belongs to, or 0 when
+// the conversation is not bound to a task. Only the retest flow has such a link
+// today (conversation → finding_retests → findings.task_id). The authorization
+// gate uses it to enforce task_scope for chat agents too; 0 means "no task", in
+// which case no scope can be enforced and the caller must decide fail-open or
+// fail-closed explicitly.
+func (d *DB) ConversationTaskID(ctx context.Context, conversationID int64) (int64, error) {
+	if conversationID <= 0 {
+		return 0, nil
+	}
+	var taskID int64
+	err := d.QueryRowContext(ctx, `
+SELECT COALESCE(f.task_id, 0)
+FROM finding_retests r
+JOIN findings f ON f.id = r.finding_id
+WHERE r.conversation_id = $1
+ORDER BY r.id DESC
+LIMIT 1`, conversationID).Scan(&taskID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return taskID, err
+}
+
 func (d *DB) FindingRetestForConversation(ctx context.Context, conversationID int64) (*FindingRetest, error) {
 	r, err := scanRetest(d.QueryRowContext(ctx, `SELECT `+retestCols+` FROM finding_retests WHERE conversation_id=$1`, conversationID))
 	if err != nil || r == nil {

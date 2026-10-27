@@ -18,7 +18,7 @@ func TestReviewInputIgnoresAuditHistoryAndPreservesCurrentCall(t *testing.T) {
 		{Kind: "tool_use", ToolUseID: "created", Tool: "Write", Text: `{"path":"prior-only.txt"}`},
 		{Kind: "tool_result", ToolUseID: "created", Text: "Created a new file"},
 		{Kind: "tool_use", ToolUseID: "denied", Tool: "Bash", Text: `{"command":"delete prior-only.txt"}`},
-		{Kind: "tool_result", ToolUseID: "denied", Text: "【ARTEX 平台管控·非目标防御】此调用被平台拦截。", IsError: true},
+		{Kind: "tool_result", ToolUseID: "denied", Text: "【XFSRC 平台管控·非目标防御】此调用被平台拦截。", IsError: true},
 		{Kind: "tool_use", ToolUseID: "partial", Tool: "Bash", Text: `{}`},
 		{Kind: "tool_result", ToolUseID: "partial", Text: strings.Repeat("部分写入", 10000), IsError: true},
 		{Kind: "tool_result", ToolUseID: "partial", Text: "conflicting result"},
@@ -155,7 +155,12 @@ func TestReviewInputShellCommandCombinations(t *testing.T) {
 		{name: "substitution", command: "echo $(pwd)", status: "not_applicable"},
 		{name: "conditional", command: `if [ -n "${TOKEN:-}" ]; then echo set; fi`, status: "not_applicable"},
 		{name: "shell_inline", command: `bash -c 'echo safe; printf ok'`, status: "not_applicable"},
-		{name: "python_inline", command: `python3 -c 'print(1)'`, status: "not_applicable"},
+		// Inline interpreter programs are captured as scripts. They used to be
+		// reported as not_applicable on the assumption that the judge sees them
+		// inside Arguments — but the authorization gate only scans what the
+		// capture returns, so `python3 -c "…urlopen('http://x')"` carried its
+		// target invisibly. Capturing the literal body is what closes that.
+		{name: "python_inline", command: `python3 -c 'print(1)'`, status: "complete"},
 		{name: "stdin_script", command: "python3 -", status: "incomplete"},
 		{name: "source_missing", command: ". ./missing.sh", status: "incomplete"},
 		{name: "wrapped_script", command: "timeout 5 env MODE=test bash ./missing.sh", status: "incomplete"},

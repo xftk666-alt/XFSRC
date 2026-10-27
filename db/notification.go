@@ -346,15 +346,22 @@ WHERE NOT fanned_out ORDER BY id FOR UPDATE SKIP LOCKED LIMIT $1`, limit)
 		}
 	}
 
-	// 标记本轮事件已分派。未命中任何渠道的事件也一起标记（见函数注释）。
-	ids := make([]string, 0, len(events))
-	markArgs := make([]any, 0, len(events))
-	for _, ev := range events {
-		markArgs = append(markArgs, ev.ID)
-		ids = append(ids, fmt.Sprintf("$%d", len(markArgs)))
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE notification_events SET fanned_out=true WHERE id IN (`+strings.Join(ids, ",")+`)`, markArgs...); err != nil {
-		return 0, 0, err
+	// 标记本轮事件已分派。
+	//
+	// 前提是「确实存在启用中的渠道」：这种情况下即使某条事件被所有渠道的过滤
+	// 条件排除，也标记为已分派，避免每轮重扫（这是原本的意图）。但如果一个渠道
+	// 都没启用，就一条都不能标记——否则在没有配置渠道期间产生的漏洞事件会被
+	// 永久丢弃，之后配好渠道也不会补推。
+	if len(channels) > 0 {
+		ids := make([]string, 0, len(events))
+		markArgs := make([]any, 0, len(events))
+		for _, ev := range events {
+			markArgs = append(markArgs, ev.ID)
+			ids = append(ids, fmt.Sprintf("$%d", len(markArgs)))
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE notification_events SET fanned_out=true WHERE id IN (`+strings.Join(ids, ",")+`)`, markArgs...); err != nil {
+			return 0, 0, err
+		}
 	}
 	return len(events), len(toInsert), tx.Commit()
 }

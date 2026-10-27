@@ -1,4 +1,4 @@
-// Command artex runs the ARTEX backend: the dual SQLite graph stores,
+// Command artex runs the XFSRC backend: the dual SQLite graph stores,
 // the event-driven exploration engine, and the JSON HTTP API consumed by the
 // shadcn/ui frontend.
 package main
@@ -27,17 +27,17 @@ import (
 var version = "dev"
 
 const banner = `
-    _    ____ _____ _______  __
-   / \  |  _ \_   _| ____\ \/ /
-  / _ \ | |_) || | |  _|  \  /
- / ___ \|  _ < | | | |___ /  \
-/_/   \_\_| \_\|_| |_____/_/\_\
+ __  __ _____ ____   ____   ____
+ \ \/ /|  ___/ ___| |  _ \ / ___|
+  \  / | |_  \___ \ | |_) | |
+  /  \ |  _|  ___) ||  _ <| |___
+ /_/\_\|_|   |____/ |_| \_\____|
 `
 
 // printBanner writes the startup banner + version/runtime info to stdout.
 func printBanner(addr string) {
 	fmt.Print(banner)
-	fmt.Println("  AI 自主渗透测试系统")
+	fmt.Println("  授权 SRC 漏洞挖掘平台 · HackerOne / Intigriti / Bugcrowd")
 	fmt.Printf("  版本 %s  ·  %s/%s  ·  %s  ·  监听 %s\n\n",
 		version, runtime.GOOS, runtime.GOARCH, runtime.Version(), addr)
 }
@@ -112,15 +112,23 @@ func run() int {
 		skillDir = abs
 	}
 	log.Printf("[config] skill 目录: %s", skillDir)
-	srv := server.New(ctx, mgr, skillDir, *dataDir, config.BaseDir())
+	// The JWT key lives next to the data dir (i.e. /app in the container), not
+	// next to the executable: the executable may be the self-updated copy in a
+	// mounted bin/ directory, and the key must not move with it.
+	srv := server.New(ctx, mgr, skillDir, *dataDir, filepath.Dir(*dataDir))
 	httpSrv := &http.Server{
 		Addr:              *addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// A slow or absent body must not hold a connection (and its goroutine)
+		// forever; API handlers additionally cap the body size themselves.
+		ReadTimeout:  5 * time.Minute,
+		WriteTimeout: 0, // SSE streams are long-lived; per-handler timeouts apply
+		IdleTimeout:  120 * time.Second,
 	}
 
 	go func() {
-		log.Printf("ARTEX %s backend listening on %s (data=%s, workers=%d)", version, *addr, *dataDir, mgr.Workers())
+		log.Printf("XFSRC %s backend listening on %s (data=%s, workers=%d)", version, *addr, *dataDir, mgr.Workers())
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("serve: %v", err)
 		}

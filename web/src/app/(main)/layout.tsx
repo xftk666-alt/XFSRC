@@ -34,7 +34,7 @@ export default function Layout({ children }: Readonly<{ children: ReactNode }>) 
   // protected UI (or its API calls) flashes for a logged-out visitor.
   const [authed, setAuthed] = React.useState(false);
   React.useEffect(() => {
-    if (auth.getToken()) {
+    if (auth.hasSession()) {
       setAuthed(true);
     } else {
       // 客户端守卫认为未登录时，必须同时清掉 cookie：否则 proxy.ts 仅凭

@@ -1,44 +1,11 @@
-# backend
+# 本地安装生成的配置（含数据库密码）
+/config.json
+
+# 本地修改版：运行时数据与构建产物不入库
 /data/
-*.db
-*.db-wal
-*.db-shm
-config.json
-scheduler_state.json
-__pycache__/
-*.pyc
-*.pyo
-
-# frontend
-web/node_modules/
-web/.next/
-web/tsconfig.tsbuildinfo
-web/next-env.d.ts
-.vercel/
-web/public/demo-version.json
-*.local
-
-# development tools
-.playwright-mcp/
-.playwright-cli/
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# docs
-/docs/
-
-# os
-.DS_Store
-Thumbs.db
-
-# claude code local state
-.claude/
-
-# 内嵌前端的单二进制产物
+/.env
+/jwt.key
 /artex
-# 一键更新在可执行文件旁留下的中间产物（暂存件 / 备份 / 失败版本 / 升级标记）
 /artex.new
 /artex.new.sha256
 /artex.old
@@ -46,17 +13,30 @@ Thumbs.db
 /artex.upgrade.json
 /server/webui/dist/
 /dist/
+/bin/
+/web/node_modules/
+/web/.next/
+/web/out/
+/web/next-env.d.ts
 
-# JWT 签名密钥（运行时生成，存项目根，绝不提交）
-/jwt.key
+# 部署定制：运行时快照与密钥
+/skills/src-retest/runtime/
+/skills/src-retest/start.sh
+/skills/src-retest/scripts/.backup-*/
+/skills/src-retest/scripts/coverage-task*.json
+/skills/**/__pycache__/
+/skills/**/*.pyc
+/skills/**/*.bak
 
-# Docker 部署生成的本地环境（含密码/密钥，不提交）
-.env
-
-# 调度器运行/模拟产生的事件日志（测试产物，不提交）
-*-events.csv
-
-# bench 基准测试相关（本地产物，不提交）
+# 本地运维产物
+/deploy/.env
+/deploy/data/
+/deploy/bin/
 /bench/
 /Dockerfile.bench
 /Dockerfile.bench.v2
+*-events.csv
+
+# local code-graph indexes
+.codegraph/
+graphify-out/

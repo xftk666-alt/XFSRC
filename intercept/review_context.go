@@ -32,6 +32,11 @@ type ReviewScript struct {
 	Complete  bool   `json:"complete"`
 	Truncated bool   `json:"truncated,omitempty"`
 	ReadError string `json:"read_error,omitempty"`
+	// Opaque marks a directly executed local file whose contents cannot be
+	// inspected (a compiled ELF/PE binary). Its network targets are invisible to
+	// the authorization gate, so a call that runs one and names no target
+	// explicitly is denied rather than guessed at.
+	Opaque bool `json:"opaque_binary,omitempty"`
 }
 
 // ReviewInput contains only the current call and explicitly selected background.
@@ -85,4 +90,14 @@ func BuildReviewInput(ctx context.Context, tool string, arguments json.RawMessag
 	}
 	in.Scripts, in.ScriptCaptureStatus = captureScripts(in.WorkingDir, tool, arguments)
 	return in, nil
+}
+
+// WorkingDir returns the per-run working directory bound to ctx, or "" when the
+// caller did not bind one. Used by the authorization gate to resolve relative
+// target-list paths the same way the shell will.
+func WorkingDir(ctx context.Context) string {
+	if env, ok := ctx.Value(reviewContextKey{}).(reviewEnvironment); ok {
+		return env.workingDir
+	}
+	return ""
 }

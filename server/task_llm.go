@@ -14,7 +14,9 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/llmrec"
+	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
 )
@@ -27,6 +29,7 @@ type taskAgentBundle struct {
 	pl             *agent.Planner
 	wk             *agent.Worker
 	main           *agent.MainAgent
+	guard          *guard.Guard // guard whose hooks are currently installed
 	pinnedWorkers  map[int64]*agent.Worker
 }
 
@@ -572,10 +575,38 @@ func (s *Server) invalidateTaskAgents() {
 	s.taskAgentMu.Unlock()
 }
 
+// applyTaskGuard wires (or clears) the per-task guard hooks on the agents that
+// store them. The worker receives its hooks per run from the engine, so it is not
+// touched here.
+func (s *Server) applyTaskGuard(b *taskAgentBundle, g *guard.Guard) {
+	if b == nil {
+		return
+	}
+	if b.guard == g {
+		return
+	}
+	var hooks harness.HookRunner
+	if g != nil {
+		hooks = g.Hooks()
+	}
+	if b.pl != nil {
+		b.pl.SetHooks(hooks)
+	}
+	if b.main != nil {
+		b.main.SetHooks(hooks)
+	}
+	b.guard = g
+}
+
 func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	s.taskAgentMu.Lock()
 	defer s.taskAgentMu.Unlock()
 	if bundle := s.taskAgents[t.ID]; bundle != nil {
+		// Re-apply the guard on a cache hit. The bundle is keyed by task id only,
+		// so a task whose Guard was replaced (or cleared) would otherwise keep
+		// serving the hooks of the guard that happened to be installed when the
+		// bundle was built — a stale gate, or none at all.
+		s.applyTaskGuard(bundle, t.Guard)
 		return bundle
 	}
 	goalRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "goals"}
@@ -591,18 +622,24 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetMaxTokens(workerRuntime.maxTokens)       // 同上,输出上限也跟随当前激活 profile
 	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)     // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	wk.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
-	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert(), s.m.TrafficEnabled())
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
+	// Authorization gate + intercept rules for the planner. It holds Bash/WebFetch
+	// with ModeBypass and its context is built from worker output captured from the
+	// target, so leaving it unguarded made the scope gate trivially bypassable.
+	if t.Guard != nil {
+		pl.SetHooks(t.Guard.Hooks())
+	}
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)
 	pl.SetNonStreaming(plannerRuntime.nonStreaming)
 	pl.SetMaxTokens(plannerRuntime.maxTokens)
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)
-	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert(), s.m.TrafficEnabled())
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
@@ -611,16 +648,21 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetCompactor(agent.NewCompactor(plannerRuntime, "task-router"))
 	main := agent.NewMainAgent(mainRuntime, "task-router", s.m.dir, tx, mainRuntime.CompactionWindow(), s.agentMaxTurns("mainagent"))
 	main.SetFindingRecorder(s.evidenceStore())
+	// Same guard as the worker/planner (see the planner note above).
+	if t.Guard != nil {
+		main.SetHooks(t.Guard.Hooks())
+	}
 	main.SetCompactionWindowResolver(mainRuntime.CompactionWindow)
 	main.SetNonStreaming(mainRuntime.nonStreaming)
 	main.SetMaxTokens(mainRuntime.maxTokens)
 	main.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
-	main.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	main.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert(), s.m.TrafficEnabled())
 	main.SetWebSearch(s.webSearchFor("mainagent"))
 	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
-		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main, pinnedWorkers: map[int64]*agent.Worker{},
+		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,
+		guard: t.Guard, pinnedWorkers: map[int64]*agent.Worker{},
 	}
 	s.taskAgents[t.ID] = bundle
 	return bundle
@@ -661,7 +703,7 @@ func (s *Server) workerForTaskSlot(t *Task, slot WorkerSlot) (*agent.Worker, err
 	worker.SetMaxTokens(runtime.maxTokens)
 	worker.SetNoaEnabled(s.m.NoaCompactionEnabled)
 	worker.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
-	worker.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	worker.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert(), s.m.TrafficEnabled())
 	worker.SetWebSearch(s.webSearchFor("worker"))
 	worker.SetConstraintInject(s.constraintInjectWorker)
 	bundle.pinnedWorkers[id] = worker

@@ -14,6 +14,10 @@ export default function SetupPage() {
   const router = useRouter();
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
+  // 远程访问一个尚未初始化的实例时，必须填服务端日志/数据目录里的初始化令牌，
+  // 否则任何人先访问就能抢占管理员账号。
+  const [setupToken, setSetupToken] = useState("");
+  const [needSetupToken, setNeedSetupToken] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [checking, setChecking] = useState(true);
@@ -24,8 +28,9 @@ export default function SetupPage() {
   useEffect(() => {
     api
       .authStatus()
-      .then(({ initialized }) => {
+      .then(({ initialized, requires_setup_token }) => {
         if (initialized) router.replace("/login");
+        setNeedSetupToken(Boolean(requires_setup_token));
       })
       .catch((err) => {
         setError(err instanceof Error ? err.message : "无法连接到后端服务");
@@ -47,7 +52,7 @@ export default function SetupPage() {
     setLoading(true);
     setError("");
     try {
-      const { token } = await api.initPassword(password);
+      const { token } = await api.initPassword(password, setupToken);
       auth.setToken(token);
       router.replace("/function/tasks");
     } catch (err) {
@@ -68,7 +73,7 @@ export default function SetupPage() {
           <div className="absolute size-60 rounded-full border border-primary-foreground/15" />
           <div className="absolute size-40 rounded-full border border-primary-foreground/20" />
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/logo.png" alt="ARTEX" width={160} height={160} className="relative brightness-0 invert" />
+          <img src="/logo.png" alt="XFSRC" width={160} height={160} className="relative brightness-0 invert" />
         </div>
       </div>
 
@@ -80,7 +85,7 @@ export default function SetupPage() {
             <p className="mx-auto max-w-xl text-muted-foreground">
               {unavailable
                 ? "后端或数据库暂时不可用。为避免覆盖实例上已有的密码，初始化入口已临时关闭——请恢复服务后重试。"
-                : "首次使用 ARTEX，请为账户设置一个登录密码（至少 8 位）"}
+                : "首次使用 XFSRC，请为账户设置一个登录密码（至少 8 位）"}
             </p>
           </div>
           {unavailable ? (
@@ -115,8 +120,25 @@ export default function SetupPage() {
                   autoComplete="new-password"
                 />
               </div>
+              {needSetupToken && (
+                <div className="space-y-1.5">
+                  <Label htmlFor="setup-token">初始化令牌</Label>
+                  <Input
+                    id="setup-token"
+                    value={setupToken}
+                    onChange={(e) => setSetupToken(e.target.value)}
+                    placeholder="服务端日志或 data/setup-token 中的值"
+                    autoComplete="off"
+                  />
+                  <p className="text-xs text-muted-foreground">远程首次初始化必须填写该令牌；本机访问可留空。</p>
+                </div>
+              )}
               {error && <p className="text-sm text-destructive">{error}</p>}
-              <Button type="submit" className="w-full" disabled={loading || !password || !confirm}>
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={loading || !password || !confirm || (needSetupToken && !setupToken)}
+              >
                 {loading ? "保存中..." : "设置密码并登录"}
               </Button>
             </form>

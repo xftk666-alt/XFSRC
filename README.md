@@ -5,11 +5,24 @@
 AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 
-🌐 **在线 Demo**： [https://artex-demo-ruoji6.vercel.app/](https://artex-demo-ruoji6.vercel.app/)
+🌐 **上游 Demo**（模拟数据，非本 fork）： [https://artex-demo-ruoji6.vercel.app/](https://artex-demo-ruoji6.vercel.app/)
 
 </div>
 
-本仓库为独立维护的 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)，保留 https://github.com/Autumn-27/ARTEX 的原始提交历史与 AGPL-3.0 许可证。程序发布包从本仓库 Releases 下载，Docker 镜像 [ruoji6/artex](https://hub.docker.com/r/ruoji6/artex) 由本仓库 GitHub Actions 构建并发布。
+> **本仓库为个人私有 fork（XFSRC）**，用于**海外正规授权的 SRC 漏洞挖掘**。
+>
+> 主要平台：[HackerOne](https://www.hackerone.com/) · [Intigriti](https://www.intigriti.com/) · [Bugcrowd](https://www.bugcrowd.com/)
+>
+> - 上游：[RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)（原始历史见 [Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX)）
+> - 许可证：AGPL-3.0（见 [LICENSE](LICENSE)）
+> - 分支：`main` 跟随上游；`local` 为本人的加固与定制
+> - 版本号：`<上游版本>-fix<N>`，例如 `0.3.23-fix1` = 基于上游 0.3.23 的第 1 次本地修订
+> - 使用场景与合规边界见 [docs/USAGE.md](docs/USAGE.md)
+>
+> 上游说明（原文）：本仓库为独立维护的 RuoJi6/ARTEX，保留 Autumn-27/ARTEX 的原始提交历史与 AGPL-3.0 许可证。
+>
+> **本 fork 的差异**：发布包与一键更新只认 `xftk666-alt/XFSRC` 自己的 GitHub Release；
+> 本 fork **不发布** Docker Hub 镜像，部署时由仓库内 `Dockerfile` 本地构建。
 
 ---
 
@@ -107,7 +120,7 @@ Demo 只运行 `web/` 前端，构建时启用 `NEXT_PUBLIC_MOCK=1`，不需要 
 ### 方式一：一键安装脚本（推荐）
 
 ```bash
-git clone https://github.com/RuoJi6/ARTEX.git
+git clone https://github.com/xftk666-alt/XFSRC.git
 cd ARTEX
 ./install.sh
 ```
@@ -122,16 +135,19 @@ cd ARTEX
 ### 方式二：Docker Compose（手动）
 
 ```bash
-git clone https://github.com/RuoJi6/ARTEX.git
+git clone https://github.com/xftk666-alt/XFSRC.git
 cd ARTEX
 cp .env.example .env          # 填 POSTGRES_PASSWORD、可选 ANTHROPIC_API_KEY
-docker compose up -d          # 拉取 ruoji6/artex 镜像 + postgres
+docker compose up -d --build  # 本地构建本 fork 镜像 + postgres
 # → http://localhost:8787
 ```
 
 镜像已含常用工具（ripgrep/curl/vim/npm/nmap…）；`./skills` 与 `./data` 以绑定挂载持久化。
 
-`.env` 中默认 `ARTEX_IMAGE=ruoji6/artex`，`ARTEX_TAG=latest` 使用最新镜像，也可固定为 `v0.3.17`（完整镜像地址 `ruoji6/artex:v0.3.17`）。镜像支持 `linux/amd64` 和 `linux/arm64`，Docker 会自动选择与宿主机匹配的架构，ARM64 Kali 无需自行编译。初次部署请修改 `POSTGRES_PASSWORD`；运行服务无需配置 Docker Hub 发布 Token。
+本 fork **不发布公共镜像**：`docker-compose.yml` 直接用仓库里的 `Dockerfile` 构建
+`${XFSRC_IMAGE:-xfsrc}:${XFSRC_TAG:-latest}`，绝不会回退到上游 `ruoji6/artex`
+（那会把授权闸、工作区隔离、限流等加固全部换掉）。构建前需先准备
+`dist/<arch>/artex`（`build.sh` 或 CI 产物）。初次部署请修改 `POSTGRES_PASSWORD`。
 
 远程 MCP 可在系统设置中选择 `http`（Streamable HTTP）或 `sse`（旧版 SSE）。
 旧版 SSE 服务通常使用 `GET /sse` 建立事件流，再通过服务返回的
@@ -196,7 +212,7 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 - **随时可回退**：上一版本保留为 `artex.old`，卡片上有「回滚到上一版本」。注意数据库结构不会回退。
 - **更新会中断正在运行的任务**——更新即重启，请在空闲时进行。
 - **开发构建不给更新**：版本号是 `dev` 或 `git describe` 带后缀时禁用，避免正式版覆盖掉本地调试的二进制。
-- **Docker 下只换程序、不换镜像**：镜像里的 playwright / nmap 等工具链不会跟着升级，且 `docker compose up -d` 重建容器后会退回镜像自带的版本。要连镜像一起升级仍请用 `docker compose pull artex && docker compose up -d artex`。
+- **Docker 下只换程序、不换镜像**：镜像里的 playwright / nmap 等工具链不会跟着升级，且 `docker compose up -d` 重建容器后会退回镜像自带的版本。要连镜像一起升级用 `./update.sh`（重新构建 `app` 服务）。
 - **更新代理（可选）**与其他代理设置使用相同的「地址输入框 + 保存」方式。填写独立更新代理后保存，例如 `http://127.0.0.1:7897`；支持 `http://`、`https://`、`socks5://`、`socks5h://` 及用户名密码认证。清空并保存即为直连，不受全局代理或 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量影响。保存后自动重新检查，检查版本、校验和下载和发布包下载使用同一个出口。更新只从 GitHub 域名下载并强制 HTTPS。
 - 代理地址由 **ARTEX 服务端**访问。Docker 内的 `127.0.0.1` 指容器自身；代理运行在宿主机时，应使用容器可达地址（Docker Desktop 通常为 `http://host.docker.internal:7897`），并允许容器访问代理端口。
 
@@ -228,8 +244,8 @@ services:
 然后只更新应用容器：
 
 ```bash
-docker compose pull artex
-docker compose up -d --no-deps artex
+docker compose build app
+docker compose up -d --no-deps app
 curl --fail http://127.0.0.1:8787/api/health
 docker compose logs --tail=50 artex
 ```
@@ -573,20 +589,21 @@ flowchart TB
 
 ---
 
-## 交流群
+## 许可证
 
-扫码关注微信公众号 **SecSentry**，在公众号后台私信即可入群交流。
+本项目基于 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)（上游原始项目 [Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX)）修改，遵循 **GNU Affero General Public License v3.0（AGPL-3.0）**。完整条款见仓库根目录的 [LICENSE](LICENSE) 文件。
 
-<div align="center">
+上游版权归其原作者所有；本 fork 的修改同样以 AGPL-3.0 发布。如果你修改本项目并通过网络向用户提供服务，需按 AGPL-3.0 向这些用户提供对应源码。
 
-<img src="screenshots/wx.png" alt="微信公众号 SecSentry" width="480" />
+## 使用范围
 
-</div>
+本 fork 面向**已获得明确授权的**海外漏洞赏金（SRC）测试：HackerOne、Intigriti、Bugcrowd。
 
----
-## 参考
+使用前请确认：
 
-https://github.com/oritera/Cairn
+- 目标在对应 program 的 in-scope 列表内，且已按 policy 登记到任务的 `task_scope`；
+- 遵守该 program 的自动化限制、速率限制与 OOB 政策（详见 [docs/USAGE.md](docs/USAGE.md)）；
+- 遵守所在国家/地区的法律法规。对未授权系统发起测试可能构成违法。
 
 
 ## 许可与免责声明
@@ -597,19 +614,18 @@ https://github.com/oritera/Cairn
 
 这意味着任何人都可以自由使用、修改和分发本项目，但**衍生作品必须同样以 AGPL-3.0 开源**；特别地，**若你修改本项目并通过网络（如部署为在线服务）向用户提供，也必须向这些用户公开对应的完整源码**。
 
-> ⚠️ **重要提示**：开源协议本身不限制软件的使用用途。以下的「使用限制」与「免责声明」是作者对使用者的额外约定与郑重声明，请务必遵守。
-
-**ARTEX 仅供个人学习、代码研究与本地技术验证使用，不得用于对任何线上系统或网站发起实际测试。**
+> ⚠️ **重要提示**：开源协议本身不限制软件的使用用途。以下的「使用限制」与「免责声明」是维护者对使用者的额外约定，请务必遵守。
 
 ### 允许使用范围
 
-- 仅可用于**阅读、学习与研究本项目源码**，以及在**本地隔离环境**中进行技术原理验证；
+- 仅可用于**已获得明确授权**的漏洞赏金测试（HackerOne / Intigriti / Bugcrowd），且目标必须在该 program 的 in-scope 列表内；
+- 仅可用于阅读、学习与研究本项目源码，以及在**本地隔离环境**中进行技术原理验证；
 - 适用于个人学习、学术研究、代码审阅等非攻击性用途。
 
 ### 禁止事项
 
-- **严禁使用本工具对任何网站、线上服务或联网系统发起扫描、探测、利用或攻击**（无论是否获得授权、是否为自有资产）；
-- 严禁将本工具用于任何实际的渗透测试、攻防对抗或生产环境；
+- **严禁使用本工具对任何未获授权的网站、线上服务或联网系统发起扫描、探测、利用或攻击**；
+- 严禁超出 program policy 允许的自动化、速率或 OOB 范围；
 - 严禁将本工具用于非法入侵、数据窃取、勒索、拒绝服务或任何破坏性、犯罪性活动；
 - 严禁利用本工具从事违反所在国家/地区法律法规的行为。
 
@@ -619,7 +635,7 @@ https://github.com/oritera/Cairn
 
 ### 免责声明
 
-本项目按“现状（AS IS）”提供，不附带任何明示或默示的担保。作者及贡献者不对使用本工具（无论使用方式是否得当）所导致的任何直接或间接损失、数据丢失、系统损坏或法律纠纷承担责任。**下载、安装或使用本项目，即表示你已阅读、理解并同意上述全部条款。**
+本项目按“现状（AS IS）”提供，不附带任何明示或默示的担保。作者、维护者及贡献者不对使用本工具（无论使用方式是否得当）所导致的任何直接或间接损失、数据丢失、系统损坏或法律纠纷承担责任。**下载、安装或使用本项目，即表示你已阅读、理解并同意上述全部条款。**
 
 ### 任务情报
 

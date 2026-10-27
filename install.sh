@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# ARTEX 安装脚本：① 全部 Docker  ② 本地编译运行
+# XFSRC 安装脚本：① 全部 Docker（本地构建本 fork 镜像）  ② 本地编译运行
 set -euo pipefail
+# 落盘的 .env / config.json 含数据库密码，整个脚本内保持 077。
+umask 077
 cd "$(cd "$(dirname "$0")" && pwd)"
 
 info(){ printf '\033[36m[*]\033[0m %s\n' "$*"; }
@@ -46,11 +48,12 @@ install_docker(){
   else
     info "沿用已存在的 .env"
   fi
-  info "拉取镜像并启动…"
-  docker compose pull
-  docker compose up -d
+  # 本 fork 不发布公共镜像：必须用仓库里的 Dockerfile 构建，绝不能再 pull 上游
+  # ruji6/artex —— 那会把授权闸、工作区隔离、限流全部换回上游版本。
+  info "构建并启动（本地构建本 fork 镜像，不拉取上游）…"
+  docker compose up -d --build
   ok "启动完成 → http://localhost:8787"
-  info "查看日志：docker compose logs -f artex"
+  info "查看日志：docker compose logs -f app"
 }
 
 # ── ② 本地编译运行 ──────────────────────────────

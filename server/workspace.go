@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -26,7 +27,35 @@ const (
 // wsResolve maps a user-supplied relative path to an absolute path INSIDE the work
 // dir. It returns ok=false if the path would escape the root. filepath.Clean on a
 // rooted copy collapses any ".." so nothing can climb above the root.
+// wsSensitiveNames are runtime secrets and internal stores that live under the
+// data dir. They must never be reachable through the workspace file manager,
+// which serves the same tree to any logged-in user.
+var wsSensitiveNames = map[string]bool{
+	"_ca":             true, // MITM CA private key
+	"evidence":        true, // HMAC key, recorder token, sealed evidence packs
+	"transcripts":     true, // raw LLM conversations
+	"sessions":        true, // raw tool input/output
+	"traffic":         true, // captured request/response bodies
+	"empty_guard":     true, // local LLM proxy config/logs
+	".delete-staging": true,
+	".tools":          true,
+	"jwt.key":         true,
+	// Grants admin to any remote caller of /api/auth/init until first-run setup
+	// completes; it must not be readable through the file manager.
+	"setup-token": true,
+}
+
 func (s *Server) wsResolve(rel string) (string, bool) {
+	return s.wsResolveIn(rel, true)
+}
+
+// wsResolveIn is wsResolve with the runtime-secret denylist made optional.
+//
+// Chat attachments legitimately live under <dataDir>/sessions/<id>/uploads and
+// draft staging under <dataDir>/drafts/<id>/uploads, i.e. inside subtrees the
+// file manager must never expose. Those callers need the containment and symlink
+// resolution without the denylist, or every upload is rejected.
+func (s *Server) wsResolveIn(rel string, denySensitive bool) (string, bool) {
 	base := filepath.Clean(s.m.dir)
 	rel = strings.TrimPrefix(strings.TrimSpace(rel), "/")
 	clean := filepath.Clean("/" + rel) // e.g. "/a/../../etc" → "/etc" (still rooted at "/")
@@ -34,8 +63,102 @@ func (s *Server) wsResolve(rel string) (string, bool) {
 	if abs != base && !strings.HasPrefix(abs, base+string(os.PathSeparator)) {
 		return "", false
 	}
-	return abs, true
+	// Deny the runtime-secret subtrees outright (checked on the cleaned relative
+	// path so neither "." nor a trailing slash can slip through).
+	if denySensitive && wsDeniedSegments(base, abs) {
+		return "", false
+	}
+	// Lexical confinement is not enough: a symlink inside the work dir can point
+	// anywhere (an agent can create one with Bash). Resolve the real path of the
+	// deepest existing ancestor, require it to stay under the real root, AND
+	// re-apply the denylist to the RESOLVED path — otherwise `ln -s traffic x`
+	// followed by `read?path=x/_ca/mitmproxy-ca.key` passes the lexical check and
+	// resolves straight into the denied subtree.
+	realBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		realBase = base
+	}
+	probe := abs
+	for {
+		resolved, resolveErr := filepath.EvalSymlinks(probe)
+		if resolveErr == nil {
+			real := resolved
+			if rest, relErr := filepath.Rel(probe, abs); relErr == nil && rest != "." {
+				real = filepath.Join(resolved, rest)
+			}
+			if real != realBase && !strings.HasPrefix(real, realBase+string(os.PathSeparator)) {
+				return "", false
+			}
+			if denySensitive && wsDeniedSegments(realBase, real) {
+				return "", false
+			}
+			// Return the RESOLVED path, not the lexical one. Callers reopen what
+			// they get back, so handing them `abs` left a window in which the
+			// agent could swap a validated symlink for one pointing elsewhere
+			// between the check and the open.
+			return real, true
+		}
+		// A path that exists but does not resolve is a dangling symlink (or a
+		// symlink loop). Writing through it would create a file at the link's
+		// destination, outside the workspace, so refuse rather than guess.
+		if fi, lerr := os.Lstat(probe); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			return "", false
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe || len(parent) < len(base) {
+			// Nothing between the target and the workspace root resolves, so the
+			// request cannot be a workspace path.
+			return "", false
+		}
+		probe = parent
+	}
 }
+
+// wsDeniedSegments reports whether any path segment between base and target is a
+// runtime-secret name. Both the lexical path and the symlink-resolved path are
+// checked, because a link can rename a denied subtree.
+func wsDeniedSegments(base, target string) bool {
+	relClean, err := filepath.Rel(base, target)
+	if err != nil || relClean == "." || relClean == "" {
+		return false
+	}
+	if strings.HasPrefix(relClean, "..") {
+		return true
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(relClean), "/") {
+		if wsSensitiveNames[seg] {
+			return true
+		}
+	}
+	return false
+}
+
+// checkWorkspaceFile rejects paths that must never be opened through the file
+// manager: non-regular files (a FIFO in the shared dir would block the request
+// goroutine forever) and multiply-linked files (a hard link makes a runtime
+// secret reachable under an innocent name, since the denylist only looks at path
+// segments).
+func checkWorkspaceFile(path string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if fi.IsDir() {
+		return nil // directories are handled by the caller
+	}
+	if !fi.Mode().IsRegular() {
+		return errNotRegularFile
+	}
+	if hasMultipleLinks(path, fi) {
+		return errHardLinkedFile
+	}
+	return nil
+}
+
+var (
+	errNotRegularFile = errors.New("不是普通文件，无法通过工作区访问")
+	errHardLinkedFile = errors.New("文件存在多个硬链接，无法通过工作区访问")
+)
 
 // wsRel renders an absolute path back as a workspace-relative path (forward slashes).
 func (s *Server) wsRel(abs string) string {
@@ -117,6 +240,10 @@ func (s *Server) wsRead(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "是目录，不能作为文件读取")
 		return
 	}
+	if err := checkWorkspaceFile(abs); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	if fi.Size() > maxWorkspaceRead {
 		writeJSON(w, 200, map[string]any{"path": s.wsRel(abs), "size": fi.Size(), "too_large": true, "binary": true})
 		return
@@ -150,6 +277,14 @@ func (s *Server) wsWrite(w http.ResponseWriter, r *http.Request) {
 	}
 	if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
 		writeErr(w, 400, "目标是目录")
+		return
+	}
+	// The denylist only inspects path segments, so an existing file has to be
+	// rejected here as well: an agent can `ln <dataDir>/jwt.key notes.txt` and
+	// then have the operator "edit" notes.txt through this route, overwriting the
+	// signing key through the hard link.
+	if err := checkWorkspaceFile(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
+		writeErr(w, 400, err.Error())
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
@@ -192,7 +327,15 @@ func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	if abs == filepath.Clean(s.m.dir) {
+	// wsResolve returns the symlink-RESOLVED path, so the root comparison has to
+	// use the resolved root too. Comparing against the lexical dir left this guard
+	// inert whenever the data dir (or an ancestor) is a symlink: the request for ""
+	// then deleted the entire workspace.
+	root := filepath.Clean(s.m.dir)
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	if abs == root {
 		writeErr(w, 400, "不能删除工作区根目录")
 		return
 	}
@@ -217,6 +360,10 @@ func (s *Server) wsDownload(w http.ResponseWriter, r *http.Request) {
 	fi, err := os.Stat(abs)
 	if err != nil || fi.IsDir() {
 		writeErr(w, 404, "文件不存在")
+		return
+	}
+	if err := checkWorkspaceFile(abs); err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
 	name := filepath.Base(abs)
@@ -271,7 +418,10 @@ func saveUpload(hdr *multipart.FileHeader, dest string) error {
 		return err
 	}
 	defer src.Close()
-	out, err := os.Create(dest)
+	// openNoFollow (per-platform): os.Create would follow a symlink the agent
+	// planted in the uploads directory, writing the uploaded bytes to that
+	// link's target.
+	out, err := openNoFollow(dest)
 	if err != nil {
 		return err
 	}

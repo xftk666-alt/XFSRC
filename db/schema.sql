@@ -141,6 +141,12 @@ ALTER TABLE company_scope ADD CONSTRAINT ck_company_scope_payload CHECK (
     OR (kind IN ('ip','cidr') AND domain IS NULL AND net IS NOT NULL AND value IS NULL)
     OR (kind IN ('icp','keyword') AND domain IS NULL AND net IS NULL AND value IS NOT NULL)
 );
+-- 来源：只有操作员（manual）与目标拆解（goals）写入的规则可以作为授权依据；
+-- 模型工具写入（agent）与自动导入（auto）只用于资产归属与覆盖度，见 db/scope_check.go。
+ALTER TABLE company_scope ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE company_scope DROP CONSTRAINT IF EXISTS company_scope_source_check;
+ALTER TABLE company_scope ADD CONSTRAINT company_scope_source_check
+    CHECK (source IN ('auto','agent','manual','goals'));
 CREATE INDEX IF NOT EXISTS idx_sv2_domain  ON company_scope(domain)   WHERE kind = 'domain';
 CREATE INDEX IF NOT EXISTS idx_sv2_net     ON company_scope USING GIST(net inet_ops) WHERE kind IN ('ip','cidr');
 CREATE UNIQUE INDEX IF NOT EXISTS uq_sv2_value ON company_scope(company_id, kind, value) WHERE kind IN ('icp','keyword');
@@ -752,19 +758,27 @@ CREATE TABLE IF NOT EXISTS task_scope (
     domain      TEXT,          -- root_domain / subdomain
     net         CIDR,          -- ip / cidr
     value       TEXT,          -- icp / keyword
-    source      TEXT NOT NULL DEFAULT 'auto' CHECK (source IN ('auto','agent','manual')),
+    source      TEXT NOT NULL DEFAULT 'auto' CHECK (source IN ('auto','agent','manual','goals')),
     reason      TEXT,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- 旧库升级：扩展任务范围，使其与企业范围的单文本框识别能力一致。
 ALTER TABLE task_scope ADD COLUMN IF NOT EXISTS value TEXT;
+-- excluded 标记"明确不在授权范围内"的条目（三个漏洞平台都区分 in/out of scope）。
+-- 排除优先于包含：命中任一条排除即视为越界，即使同时被某条包含命中。
+ALTER TABLE task_scope ADD COLUMN IF NOT EXISTS excluded BOOLEAN NOT NULL DEFAULT false;
+-- source_ref 记录该条来自哪个平台/程序/版本，供审计追溯。
+ALTER TABLE task_scope ADD COLUMN IF NOT EXISTS source_ref TEXT;
+ALTER TABLE task_scope DROP CONSTRAINT IF EXISTS task_scope_source_check;
+ALTER TABLE task_scope ADD CONSTRAINT task_scope_source_check
+    CHECK (source IN ('auto','agent','manual','goals','platform'));
 ALTER TABLE task_scope DROP CONSTRAINT IF EXISTS task_scope_kind_check;
 ALTER TABLE task_scope ADD CONSTRAINT task_scope_kind_check
     CHECK (kind IN ('company','root_domain','subdomain','ip','cidr','icp','keyword'));
 -- 去重：同一 task 的同一条范围只存一次（自动填批量插入靠它幂等）。
 DROP INDEX IF EXISTS uq_task_scope;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_task_scope_v2 ON task_scope(
-    task_id, kind, COALESCE(domain,''), COALESCE(net::text,''), COALESCE(company_id,0), COALESCE(value,''));
+    task_id, kind, COALESCE(domain,''), COALESCE(net::text,''), COALESCE(company_id,0), COALESCE(value,''), excluded);
 CREATE INDEX IF NOT EXISTS idx_ts_domain  ON task_scope(domain) WHERE kind IN ('root_domain','subdomain');
 CREATE INDEX IF NOT EXISTS idx_ts_net     ON task_scope USING GIST(net inet_ops) WHERE kind IN ('ip','cidr');
 CREATE INDEX IF NOT EXISTS idx_ts_company ON task_scope(company_id) WHERE kind = 'company';
@@ -1603,6 +1617,30 @@ CREATE TABLE IF NOT EXISTS task_schedule_history (
  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_schedule_history ON task_schedule_history(schedule_id,id DESC);
+
+-- ---------------------------------------------------------------------------
+-- LLM usage metering (also created lazily by EnsureLLMUsageTable for upgrades).
+-- Kept here so a fresh database opened by any package has the ledger.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id             BIGSERIAL PRIMARY KEY,
+    ts             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    task_id        TEXT,
+    exploration_id BIGINT,
+    worker         TEXT,
+    model          TEXT,
+    profile_name   TEXT,
+    latency_ms     INTEGER,
+    input_tokens   INTEGER NOT NULL DEFAULT 0,
+    output_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_read     INTEGER NOT NULL DEFAULT 0,
+    cache_write    INTEGER NOT NULL DEFAULT 0,
+    status         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_task ON llm_usage(task_id);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_model ON llm_usage(model);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_exp ON llm_usage(exploration_id);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts DESC);
 
 -- Task intelligence is separate from shared asset authentication and graph compaction.
 CREATE TABLE IF NOT EXISTS task_intelligence (

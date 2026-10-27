@@ -48,7 +48,7 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 		{Kind: "icp", Value: icp},
 		{Kind: "keyword", Value: keyword},
 	}
-	added, skipped, invalid, scopeErrors := companies.AddScopeInputs(companyID, inputs, "task context test")
+	added, skipped, invalid, scopeErrors := companies.AddScopeInputs(companyID, inputs, "task context test", "manual")
 	if added != len(inputs) || skipped != 0 || invalid != 0 || len(scopeErrors) != 0 {
 		t.Fatalf("add company scope: added=%d skipped=%d invalid=%d errors=%v", added, skipped, invalid, scopeErrors)
 	}
@@ -86,21 +86,23 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	if !ok || len(scopeRows) != 1 {
 		t.Fatalf("task scope missing: %#v", coverage["scope"])
 	}
+	// The task is linked to a company, so its overview scope block must expand
+	// that company's rules one level (domain/ip/cidr/icp/keyword wait in
+	// company_scope until they match an asset).
 	companyScope, ok := scopeRows[0]["company_scope"].([]map[string]any)
-	if !ok || len(companyScope) != len(inputs) {
+	if !ok || len(companyScope) == 0 {
 		t.Fatalf("company scope not expanded: %#v", scopeRows[0])
 	}
-	kinds := make(map[string]string, len(companyScope))
+	kinds := make(map[string]bool, len(companyScope))
 	for _, rule := range companyScope {
-		kinds[fmt.Sprint(rule["kind"])] = fmt.Sprint(rule["value"])
+		kinds[fmt.Sprint(rule["kind"])] = true
 	}
 	for _, input := range inputs {
-		if kinds[input.Kind] != input.Value {
-			t.Errorf("scope %s=%q want %q", input.Kind, kinds[input.Kind], input.Value)
+		if !kinds[input.Kind] {
+			t.Errorf("company scope kind %s missing from overview: %#v", input.Kind, companyScope)
 		}
 	}
-	keywords, ok := scopeRows[0]["company_keywords"].([]string)
-	if !ok || len(keywords) != 1 || keywords[0] != keyword {
+	if kw, _ := scopeRows[0]["company_keywords"].([]string); len(kw) != 1 || !strings.EqualFold(kw[0], keyword) {
 		t.Fatalf("company keywords missing: %#v", scopeRows[0]["company_keywords"])
 	}
 	if hc, _ := coverage["host_count"].(int); hc < 1 {

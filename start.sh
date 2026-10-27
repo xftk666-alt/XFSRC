@@ -20,6 +20,39 @@ set -u
 
 cd "$(dirname "$0")" || exit 1
 
+# JWT 签名密钥必须在 /app/jwt.key（keyDir = 可执行文件所在的 /app）。容器重建会
+# 丢掉镜像可写层，所以把它持久化在数据卷里，启动时恢复；首次启动则生成一个
+# 32 字节（64 hex）的密钥。注意：/app 下的 jwt.key 绝不能是目录——Docker 对不存在
+# 的绑定挂载源会创建目录，那会让 artex 读到 EISDIR 直接退出。
+ensure_jwt_key() {
+	# 本地/裸机运行时没有 /app；那种情况 key 就在可执行文件旁，由 artex 自己创建。
+	[ -d /app ] || return 0
+	keyfile=/app/jwt.key
+	persist=/app/data/jwt.key
+	mkdir -p /app/data 2>/dev/null || true
+	if [ -d "$keyfile" ]; then
+		# 之前误挂成目录：清掉（空目录才删，避免误删真实数据）
+		rmdir "$keyfile" 2>/dev/null || { echo "[xfsrc] /app/jwt.key 是目录且非空，请手工处理" >&2; return 1; }
+	fi
+	if [ -s "$keyfile" ]; then
+		# 容器内的 key 存在 → 反向同步回数据卷，保证重建后仍是同一把
+		if [ ! -s "$persist" ] || ! cmp -s "$keyfile" "$persist"; then
+			cp -f "$keyfile" "$persist" 2>/dev/null || true
+		fi
+		return 0
+	fi
+	if [ -s "$persist" ]; then
+		cp -f "$persist" "$keyfile"
+	else
+		umask 077
+		head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$keyfile"
+		cp -f "$keyfile" "$persist" 2>/dev/null || true
+	fi
+	chmod 600 "$keyfile" "$persist" 2>/dev/null || true
+}
+
+
+
 BIN=./artex
 [ -x "$BIN" ] || { echo "[artex] 找不到可执行文件 $BIN" >&2; exit 1; }
 

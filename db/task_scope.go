@@ -80,20 +80,44 @@ func (s *AssetStore) upsertTaskScopeResult(ts TaskScope) (bool, error) {
 INSERT INTO task_scope(task_id, kind, company_id, domain, net, value, source, reason)
 VALUES ($1,$2,$3,$4,$5::cidr,$6,$7,NULLIF($8,''))
 ON CONFLICT DO NOTHING`
-	var (
-		result sql.Result
-		err    error
-	)
-	if s.tx != nil {
-		result, err = s.tx.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
-	} else {
-		result, err = s.db.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
+	type execer interface {
+		Exec(query string, args ...any) (sql.Result, error)
 	}
+	var ex execer = s.db
+	if s.tx != nil {
+		ex = s.tx
+	}
+	result, err := ex.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
 	if err != nil {
 		return false, err
 	}
 	rows, err := result.RowsAffected()
-	return rows > 0, err
+	if err != nil {
+		return false, err
+	}
+	if rows > 0 {
+		return true, nil
+	}
+	// The row already exists (same task+kind+value, regardless of source). A
+	// trusted source must be able to PROMOTE an auto/agent row: otherwise an
+	// operator re-adding a discovered host to the authorized scope is silently
+	// ignored and the gate keeps blocking it.
+	promote := `
+UPDATE task_scope
+SET source=$1, reason=COALESCE(NULLIF($2,''), reason)
+WHERE task_id=$3 AND kind=$4
+  AND COALESCE(domain,'')=COALESCE($5::text,'')
+  AND COALESCE(net::text,'')=COALESCE($6::text,'')
+  AND COALESCE(company_id,0)=COALESCE($7::bigint,0)
+  AND COALESCE(value,'')=COALESCE($8::text,'')
+  AND (CASE source WHEN 'manual' THEN 3 WHEN 'goals' THEN 2 WHEN 'agent' THEN 1 ELSE 0 END)
+    < (CASE $1 WHEN 'manual' THEN 3 WHEN 'goals' THEN 2 WHEN 'agent' THEN 1 ELSE 0 END)`
+	res, err := ex.Exec(promote, src, ts.Reason, ts.TaskID, ts.Kind, domainVal, netVal, companyVal, valueVal)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func (s *AssetStore) upsertTaskScope(ts TaskScope) error {
@@ -641,4 +665,77 @@ ORDER BY t.id LIMIT $`+limPos+` OFFSET $`+offPos, pageArgs...)
 		out = append(out, a)
 	}
 	return out, total, rows.Err()
+}
+
+// PlatformScopeRule is one authorization entry, already normalised by a platform
+// parser. (db.ScopeRule is the company_scope row shape and carries an ID.)
+type PlatformScopeRule struct {
+	Kind     string // root_domain | subdomain | ip | cidr | icp | keyword
+	Value    string
+	Excluded bool
+	Note     string
+}
+
+// ReplacePlatformScope replaces every platform-sourced scope row for a task with
+// the supplied rules, in one transaction. Manual and goal-derived rows are left
+// alone: an import must never silently delete something the operator typed in.
+//
+// sourceRef records where the list came from (program handle + fetched-at) so an
+// audit can answer "which version of the policy authorised this run".
+func (s *AssetStore) ReplacePlatformScope(taskID int64, rules []PlatformScopeRule, sourceRef string) (added, removed int64, err error) {
+	if taskID <= 0 {
+		return 0, 0, fmt.Errorf("需要 task_id")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	res, err := tx.Exec(`DELETE FROM task_scope WHERE task_id=$1 AND source='platform'`, taskID)
+	if err != nil {
+		return 0, 0, err
+	}
+	removed, _ = res.RowsAffected()
+	for _, r := range rules {
+		var domain, netVal, value any
+		switch r.Kind {
+		case "root_domain", "subdomain":
+			domain = r.Value
+		case "ip":
+			if ip := net.ParseIP(r.Value); ip != nil {
+				if ip.To4() != nil {
+					netVal = ip.String() + "/32"
+				} else {
+					netVal = ip.String() + "/128"
+				}
+			} else {
+				return 0, 0, fmt.Errorf("非法 IP：%q", r.Value)
+			}
+		case "cidr":
+			if _, _, e := net.ParseCIDR(r.Value); e != nil {
+				return 0, 0, fmt.Errorf("非法 CIDR：%q", r.Value)
+			}
+			netVal = r.Value
+		case "icp", "keyword":
+			value = r.Value
+		default:
+			return 0, 0, fmt.Errorf("未知 scope 类型：%q", r.Kind)
+		}
+		if _, e := tx.Exec(`
+INSERT INTO task_scope(task_id, kind, domain, net, value, source, source_ref, excluded, reason)
+VALUES ($1,$2,$3,$4::cidr,$5,'platform',$6,$7,NULLIF($8,''))
+ON CONFLICT DO NOTHING`,
+			taskID, r.Kind, domain, netVal, value, sourceRef, r.Excluded, r.Note); e != nil {
+			return 0, 0, e
+		}
+		added++
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return added, removed, nil
 }

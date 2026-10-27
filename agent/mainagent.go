@@ -7,6 +7,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
+	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -33,7 +34,22 @@ type MainAgent struct {
 	nonStreamingFn  func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn    func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn     func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+
+	// hooks is the per-task Guard runner. The main agent is driven by the operator
+	// but reasons over tool output produced from attacker-controlled targets, and
+	// it holds Bash/WebFetch with ModeBypass — an unguarded main agent is a
+	// prompt-injection → arbitrary-command path. nil only in tests.
+	hooks harness.HookRunner
 }
+
+// SetHooks installs the per-task guard (authorization gate + intercept rules).
+// Passing nil disables gating and is only acceptable in tests.
+func (m *MainAgent) SetHooks(h harness.HookRunner) { m.hooks = h }
+
+// Hooks reports the guard attached to this main agent. A task-bound main agent
+// with nil hooks is unguarded: it holds Bash/WebFetch with ModeBypass, so callers
+// must treat nil as a wiring bug.
+func (m *MainAgent) Hooks() harness.HookRunner { return m.hooks }
 
 // SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
 // context-compression mechanism. nil/unset = off (built-in compaction). Read per
@@ -72,7 +88,9 @@ func (m *MainAgent) compactionWindow() int {
 
 // SetProxy points the main agent's WebFetch at the recording proxy plus the CA
 // cert it trusts to verify HTTPS through it (empty addr = direct).
-func (m *MainAgent) SetProxy(addr, caCert string) { m.proxyAddr, m.proxyCACert = addr, caCert }
+// SetProxy routes target traffic through the egress proxy. recording is accepted
+// for signature symmetry with Worker; this agent exposes no traffic tools.
+func (m *MainAgent) SetProxy(addr, caCert string, _ bool) { m.proxyAddr, m.proxyCACert = addr, caCert }
 
 // SetWebSearch selects the web_search backend for the main agent (off by default).
 func (m *MainAgent) SetWebSearch(o WebSearchOpts) { m.webSearch = o }
@@ -163,6 +181,9 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		Settlement:   wrapupSettlement("mainagent", nil),
 		NonStreaming: m.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    m.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+		// Same per-task guard as the worker/planner: this agent can read target
+		// content and then run Bash, so it needs the authorization gate too.
+		Hooks: m.hooks,
 	}
 	if m.tx != nil { // persist raw human↔AI conversation; one accumulating file per segment
 		opts.Transcript = m.tx

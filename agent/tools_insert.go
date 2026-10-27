@@ -418,7 +418,14 @@ func (t *ToolSet) addCompanyScope() actool.CoreTool {
 				return actool.Errorf("创建/获取公司失败: " + err.Error()), nil
 			}
 			lines := splitLines(a.Scope)
-			added, skipped, invalid, errMsgs := t.cs.AddScope(companyID, lines, a.Reason)
+			// A company's scope feeds every task that references the company, so a
+			// model-written rule must never be authoritative: record it as 'agent'
+			// (attribution/coverage) and leave authorization to the operator.
+			source := db.ScopeSourceAgent
+			if t.worker == "goals" {
+				source = db.ScopeSourceGoals
+			}
+			added, skipped, invalid, errMsgs := t.cs.AddScope(companyID, lines, a.Reason, source)
 			out := map[string]any{
 				"company_id": companyID,
 				"added":      added,
@@ -458,6 +465,15 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 			if t.taskID <= 0 {
 				return actool.Errorf("add_task_scope 需要任务上下文(当前无 task)"), nil
 			}
+			// Authorization is the operator's call, not the model's. Only the goal
+			// decomposer — reading the operator's own task description — may write a
+			// TRUSTED scope row ('goals'). Every model-facing role, including the
+			// human-interface main agent, writes 'agent': recorded for coverage, but
+			// never authoritative. Otherwise any agent that reads attacker-controlled
+			// target content could widen its own authorization boundary.
+			if t.worker != "goals" {
+				return actool.Errorf(fmt.Sprintf("add_task_scope 仅允许目标拆解登记可信范围；当前角色 %q 不能扩大授权边界。如确需扩大，请在任务页手动添加 scope，由操作员确认", t.worker)), nil
+			}
 			type scopeEntry struct {
 				Kind  string `json:"kind"`
 				Value string `json:"value"`
@@ -475,7 +491,19 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 			var added []map[string]any
 			errs := map[string]string{}
 			for i, e := range items {
-				ts, err := t.as.AddAgentScope(t.taskID, strings.TrimSpace(e.Kind), e.Value, a.Reason, "agent")
+				// Only what the operator actually wrote may become a TRUSTED
+				// ('goals') row. The decomposer reads the task description, which
+				// can carry text pasted from anywhere; a hostname it derived
+				// (base64-decoded, reformatted, inferred) is not operator intent.
+				// Those are rejected outright — the decomposer's own prompt already
+				// forbids inventing scope, and a silent downgrade would leave the
+				// agent believing it widened the boundary.
+				if !t.scopeStatedByOperator(e.Value) {
+					errs[strconv.Itoa(i)] = "该范围未在任务描述或目标中原样出现，不能作为可信授权范围登记：" + strings.TrimSpace(e.Value)
+					continue
+				}
+				source := "goals"
+				ts, err := t.as.AddAgentScope(t.taskID, strings.TrimSpace(e.Kind), e.Value, a.Reason, source)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
@@ -684,7 +712,8 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		// asset management (handlers guard nil store internally)
 		t.insertAssets(), t.addCompanyScope(), t.listAssets(),
 		t.addFinding(), t.recordFact(), t.recordIntelligence(),
-		t.addTaskScope(),
+		// add_task_scope 刻意不给主 Agent：它读得到目标内容，模型能借它自扩授权边界。
+		// 需要扩大范围时让操作员在任务页添加（source=manual）。
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
 	}
@@ -705,4 +734,26 @@ func (t *ToolSet) AllDomainTools() []actool.CoreTool {
 		}
 	}
 	return out
+}
+
+// scopeStatedByOperator reports whether value appears verbatim (case-insensitively)
+// in the operator-written task text. Used to keep derived hostnames out of the
+// trusted scope: only what the operator typed can authorize a target.
+func (t *ToolSet) scopeStatedByOperator(value string) bool {
+	v := strings.ToLower(strings.TrimSpace(value))
+	if v == "" {
+		return false
+	}
+	text := strings.ToLower(t.operatorText)
+	if strings.TrimSpace(text) == "" {
+		// No operator text was captured (e.g. a caller that builds a ToolSet by
+		// hand). Fail closed: nothing can be proven to be operator-stated.
+		return false
+	}
+	if strings.Contains(text, v) {
+		return true
+	}
+	// A bare host is often written with a scheme or trailing slash by the
+	// operator ("https://example.com/"), so accept the host inside a URL too.
+	return strings.Contains(text, "//"+v) || strings.Contains(text, v+"/")
 }

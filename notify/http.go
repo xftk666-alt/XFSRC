@@ -52,9 +52,21 @@ func isBlockedDialIP(ip net.IP) bool {
 	if v4 := ip.To4(); v4 != nil {
 		ip = v4
 	}
-	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		// 100.64.0.0/10 is carrier-grade NAT; Alibaba Cloud metadata lives at
+		// 100.100.100.200 inside it and was reachable.
+		return v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127
+	}
+	// AWS IMDS over IPv6 (fd00:ec2::254) is ULA, not link-local.
+	return ip.Equal(awsIPv6Metadata)
 }
+
+// awsIPv6Metadata is the AWS IMDS IPv6 endpoint.
+var awsIPv6Metadata = net.ParseIP("fd00:ec2::254")
 
 // blockInternalDial 是 http.Transport 拨号器的 Control 钩子，在**连接建立时**
 // 检查目标地址。
@@ -91,6 +103,12 @@ var notifyTransport = func() *http.Transport {
 	}
 	clone := t.Clone()
 	clone.DialContext = (&net.Dialer{Timeout: 10 * time.Second, Control: blockInternalDial}).DialContext
+	// Clone keeps Proxy: ProxyFromEnvironment, which makes DialContext see the
+	// PROXY address instead of the target. With HTTP_PROXY set, blockInternalDial
+	// vetted the proxy and the request URL (169.254.169.254, an internal host,
+	// anything) was forwarded unchecked — and URL-embedded credentials went to the
+	// proxy. Notifications are documented to connect directly, so drop it.
+	clone.Proxy = nil
 	return clone
 }()
 
@@ -114,7 +132,14 @@ var httpClient = &http.Client{
 		if len(via) > 0 && req.URL.Host != via[0].URL.Host {
 			return fmt.Errorf("拒绝跨主机重定向（%s → %s）", via[0].URL.Host, req.URL.Host)
 		}
-		return nil
+		// Same host is not enough: https://host → http://host downgrades the
+		// channel, and Go still copies Authorization/Cookie onto the new request.
+		if len(via) > 0 && via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+			return errors.New("拒绝 https → http 降级重定向")
+		}
+		// A same-host redirect can still land on an internal address if the name
+		// resolves differently, so re-run the save-time check for the new URL.
+		return validateHTTPURL(req.URL.String())
 	},
 }
 

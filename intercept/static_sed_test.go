@@ -80,7 +80,26 @@ func TestStaticSedRejectsOpaqueOrUnsafeLayouts(t *testing.T) {
 		}
 	}
 }
+// requireStandardSedTools skips the fixture on hosts where cat/sed resolve to
+// a non-standard binary (e.g. a coreutils shim on PATH). The production code
+// deliberately refuses anything outside /bin and /usr/bin for these two
+// commands, so the assertion below is only meaningful on a stock system.
+func requireStandardSedTools(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{"cat", "sed"} {
+		p, err := exec.LookPath(name)
+		if err != nil {
+			t.Skipf("%s not found: %v", name, err)
+		}
+		resolved, err := filepath.EvalSymlinks(p)
+		if err != nil || (resolved != "/bin/"+name && resolved != "/usr/bin/"+name) || !nativeInterpreterFile(resolved) {
+			t.Skipf("%s resolves to %q, not a standard native /bin or /usr/bin binary", name, resolved)
+		}
+	}
+}
+
 func TestStaticSedGeneratedInputAndBounds(t *testing.T) {
+	requireStandardSedTools(t)
 	dir := t.TempDir()
 	in := reviewCommandForTest(t, dir, "cat > old.sh <<'SH'\necho old\nSH\nsed 's/old/new/' old.sh > new.sh; bash new.sh")
 	if in.ScriptCaptureStatus != "complete" || in.Scripts[0].Content != "echo new\n" {

@@ -55,7 +55,18 @@ func matchOne(r AssetInterceptRule, domains, ips, urls []string) (string, bool) 
 			}
 		}
 	case "exact_ip":
+		// Compare parsed addresses, not text: `::FFFF:203.0.113.5` and
+		// `2001:0DB8::1` are the same hosts as their canonical forms, and a
+		// textual comparison let any equivalent spelling walk through a block rule.
+		want := net.ParseIP(p)
 		for _, ip := range ips {
+			got := net.ParseIP(strings.TrimSpace(ip))
+			if want != nil && got != nil {
+				if want.Equal(got) {
+					return ip, true
+				}
+				continue
+			}
 			if strings.TrimSpace(ip) == p {
 				return ip, true
 			}
@@ -67,15 +78,20 @@ func matchOne(r AssetInterceptRule, domains, ips, urls []string) (string, bool) 
 			}
 		}
 	case "fuzzy_domain":
-		lp := strings.ToLower(p)
+		// Label-boundary match, not substring: a substring rule made an allow rule
+		// `example.com` admit `example.com.evil.net` and `notexample.com`, turning
+		// a whitelist into a bypass. It now covers itself and its subdomains only.
+		lp := strings.Trim(strings.ToLower(strings.TrimSpace(p)), ".")
 		for _, d := range domains {
-			if d != "" && strings.Contains(strings.ToLower(d), lp) {
+			if domainWithin(strings.ToLower(strings.TrimSpace(d)), lp) {
 				return d, true
 			}
 		}
 	case "fuzzy_ip":
+		// Same reasoning as fuzzy_domain: match on octet boundaries so `10.` does
+		// not also match `110.1.2.3`.
 		for _, ip := range ips {
-			if ip != "" && strings.Contains(ip, p) {
+			if ip != "" && ipPrefixWithin(strings.TrimSpace(ip), p) {
 				return ip, true
 			}
 		}
@@ -98,6 +114,37 @@ func matchOne(r AssetInterceptRule, domains, ips, urls []string) (string, bool) 
 		}
 	}
 	return "", false
+}
+
+// domainWithin reports whether host is pattern or a subdomain of it. Both are
+// already lowercased and dot-trimmed. The dot is part of the comparison, so
+// `example.com` matches `a.example.com` but not `example.com.evil.net` and not
+// `notexample.com`.
+func domainWithin(host, pattern string) bool {
+	if host == "" || pattern == "" {
+		return false
+	}
+	if host == pattern {
+		return true
+	}
+	return strings.HasSuffix(host, "."+pattern)
+}
+
+// ipPrefixWithin reports whether ip starts with prefix on a separator boundary,
+// so `10.` matches `10.1.2.3` but not `110.1.2.3`.
+func ipPrefixWithin(ip, prefix string) bool {
+	prefix = strings.TrimSpace(prefix)
+	if ip == "" || prefix == "" || !strings.HasPrefix(ip, prefix) {
+		return false
+	}
+	rest := ip[len(prefix):]
+	if rest == "" {
+		return true
+	}
+	if prefix[len(prefix)-1] == '.' || prefix[len(prefix)-1] == ':' {
+		return true
+	}
+	return rest[0] == '.' || rest[0] == ':'
 }
 
 // MatchAssetInterceptRules 返回第一条命中给定 域名/IP/URL 候选串的启用规则，及命中的具体值。

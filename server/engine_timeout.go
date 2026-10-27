@@ -226,6 +226,13 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 	}
 }
 
+// finalRoundClock is the task clock attached to the terminal planner round. It
+// carries no DeadlineUnix on purpose: this round only runs after the deadline has
+// already passed, and clampMaxDuration floors a past deadline to 1s, which made
+// the harness interrupt the goal judgment almost immediately and report a
+// completed task as a timeout.
+func finalRoundClock() agent.TaskClock { return agent.TaskClock{Final: true} }
+
 // runFinalPlannerRound drives exactly ONE terminal planner round with the
 // task-timeout planner words (final goal judgment; no new intents). Waits for the
 // LLM to be ready (bounded by ctx) so a completable task isn't mis-judged timeout.
@@ -247,7 +254,12 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
 		planner, _ = e.snapshotFor(t)
 	}
 	// 独立 ctx(不挂 execCancel,避免 pause/硬 cancel 打断这最后一轮),带 Final 注入任务超时词。
-	fctx := e.clockCtx(ctx, t, true)
+	//
+	// 这一轮只在 deadline 已过之后才跑(settleTask 在 remaining<=0 时才走到这里),
+	// 所以不能再把过期的 DeadlineUnix 传下去:clampMaxDuration 会把它压到 1s,
+	// harness 随即以 ReasonTimeout 打断终局判定,于是「其实已完成」的任务被判成超时。
+	// Final 轮本来就不受任务墙钟约束(它自己就是收尾),只保留 Final 标记。
+	fctx := agent.WithTaskClock(ctx, finalRoundClock())
 	if !e.beginTaskOperation(t.ID) {
 		return false
 	}

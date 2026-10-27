@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
@@ -36,7 +37,7 @@ import (
 // Defaults to "dev" for local builds. Exposed to the frontend via GET /api/health.
 var BuildVersion = "dev"
 
-// Server exposes the ARTEX backend over a JSON HTTP API for the shadcn/ui
+// Server exposes the XFSRC backend over a JSON HTTP API for the shadcn/ui
 // frontend.
 type Server struct {
 	scheduleMu sync.Mutex
@@ -44,9 +45,17 @@ type Server struct {
 	engine     *Engine
 	ctx        context.Context
 
-	skillDir  string // root directory for skill subdirectories
-	jwtKey    []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
-	basicAuth basicAuthGate
+	skillDir   string // root directory for skill subdirectories
+	loginLimit *loginLimiter
+	jwtKey     []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+	// tokenVer is the JWT generation: bumping it revokes every issued token.
+	tokenVer atomic.Int64
+	// tokenVerUnknown is set when the generation could not be read at startup.
+	// Leaving tokenVer at its zero value instead would accept every token issued
+	// at generation 0 — resurrecting exactly the tokens a logout or password
+	// change had revoked — so verification fails closed while this is set.
+	tokenVerUnknown atomic.Bool
+	basicAuth       basicAuthGate
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -152,12 +161,16 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key,
+		loginLimit: newLoginLimiter(10, time.Minute), chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+	m.stopTasks = func() { s.engine.StopAll() }
+	s.loadTokenVersion()
+	s.ensureSetupToken(dataDir)
 	s.initSideQuestions()
 	if m.pg != nil {
 		if err := s.basicAuth.load(m.pg); err != nil {
@@ -490,7 +503,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	// chat agent serves MANY custom agents by key → it holds the GLOBAL opts
 	// (backend/key) and gates Enabled per-conversation-agent at Chat time. 对话始终用激活配置。
 	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
-	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert(), s.m.TrafficEnabled())
 	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
 	s.chatAgent.SetGuard(s.chatGuard())
 	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
@@ -652,7 +665,7 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	}
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
 	ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
-	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert(), s.m.TrafficEnabled())
 	ca.SetWebSearch(s.m.WebSearchOpts())
 	ca.SetGuard(s.chatGuard())
 	ca.SetNonStreaming(nonStreamingResolver(cfg))
@@ -697,6 +710,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/auth/init", s.authInit)
 	mux.HandleFunc("POST /api/auth/login", s.authLogin)
 	mux.HandleFunc("POST /api/auth/change-password", s.authChangePassword)
+	mux.HandleFunc("POST /api/auth/logout", s.authLogout)
 	mux.HandleFunc("GET /api/basic-auth/check", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusNoContent)
@@ -775,6 +789,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/workspace/upload", s.wsUpload)
 	mux.HandleFunc("GET /api/tasks/{id}/scope", s.taskScopeList)
 	mux.HandleFunc("POST /api/tasks/{id}/scope", s.taskScopeAdd)
+	mux.HandleFunc("POST /api/tasks/{id}/scope/import", s.taskScopeImport)
 	mux.HandleFunc("DELETE /api/tasks/{id}/scope/{sid}", s.taskScopeDelete)
 	mux.HandleFunc("GET /api/tasks/{id}/goals", s.listGoals)                       // 目标管理:列出本任务全部目标
 	mux.HandleFunc("POST /api/tasks/{id}/goals", s.addGoal)                        // 目标管理:人工新增目标(复活任务)
@@ -1022,7 +1037,7 @@ func (s *Server) Handler() http.Handler {
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (no JWT required; the optional Basic Auth gate wraps both). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
-	api := cors(s.requireAuth(mux))
+	api := cors(limitBody(s.requireAuth(mux)))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
@@ -1032,7 +1047,7 @@ func (s *Server) Handler() http.Handler {
 // --- handlers ---
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"ok": true, "service": "artex", "version": BuildVersion})
+	writeJSON(w, 200, map[string]any{"ok": true, "service": "xfsrc", "version": BuildVersion})
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
@@ -3441,6 +3456,8 @@ func (s *Server) settingsPayload() map[string]any {
 	}
 	return map[string]any{
 		"traffic_capture":           s.m.TrafficEnabled(),
+		"scope_gate_enabled":        s.m.pg.GetBool(settingScopeGateEnabled, true),
+		"scope_trusted_sources":     parseTrustedSources(s.m.pg),
 		"agent_traffic_binding":     s.m.pg.GetBool(settingAgentTrafficBinding, false),
 		"task_intelligence_enabled": s.m.pg.GetBool(db.SettingTaskIntelligence, false),
 		db.SettingCredentialAgent:   s.m.pg.GetBool(db.SettingCredentialAgent, false),
@@ -3514,12 +3531,15 @@ func (s *Server) pgDetectPython(w http.ResponseWriter, r *http.Request) {
 // off, agents get no proxy config, no traffic tools, and no proxy prompt content.
 func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		TrafficCapture      *bool `json:"traffic_capture"`
-		AgentTrafficBinding *bool `json:"agent_traffic_binding"`
-		TaskIntelligence    *bool `json:"task_intelligence_enabled"`
-		CredentialAgent     *bool `json:"credential_agent_enabled"`
-		CredentialTraffic   *bool `json:"credential_traffic_binding"`
-		LLMRecord           *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
+		TrafficCapture *bool `json:"traffic_capture"`
+		// Pre-request authorization gate. Defaults: enabled, sources=manual,goals.
+		ScopeGateEnabled    *bool   `json:"scope_gate_enabled"`
+		ScopeTrustedSources *string `json:"scope_trusted_sources"`
+		AgentTrafficBinding *bool   `json:"agent_traffic_binding"`
+		TaskIntelligence    *bool   `json:"task_intelligence_enabled"`
+		CredentialAgent     *bool   `json:"credential_agent_enabled"`
+		CredentialTraffic   *bool   `json:"credential_traffic_binding"`
+		LLMRecord           *bool   `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
 		// Web search. WebSearchEnabled/Backend toggle the tool + backend; BraveKey/TavilyKey
 		// are optional — omit (null) to leave a stored key untouched, send "" to clear.
 		WebSearchEnabled *bool         `json:"web_search_enabled"`
@@ -3599,6 +3619,30 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.m.pg.SetSetting(settingNotifyDigestMinutes, strconv.Itoa(*req.NotifyDigestMins)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.ScopeGateEnabled != nil {
+		if err := s.m.pg.SetBool(settingScopeGateEnabled, *req.ScopeGateEnabled); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.ScopeTrustedSources != nil {
+		raw := strings.TrimSpace(*req.ScopeTrustedSources)
+		if raw == "" {
+			raw = defaultScopeTrustedSources
+		}
+		for _, part := range strings.Split(raw, ",") {
+			switch strings.TrimSpace(part) {
+			case "manual", "goals", "agent", "auto":
+			default:
+				writeErr(w, 400, "scope_trusted_sources 仅支持 manual/goals/agent/auto")
+				return
+			}
+		}
+		if err := s.m.pg.SetSetting(settingScopeTrustedSources, raw); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}

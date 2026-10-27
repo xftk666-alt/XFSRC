@@ -8,6 +8,8 @@ import (
 	"iter"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -263,10 +265,12 @@ func TestRetestStopsFailuresAndNoVerdict(t *testing.T) {
 
 func TestRetestFixedUpdatesFindingThroughConversation(t *testing.T) {
 	s, fid := newRetestServer(t)
+	packDir := buildRetestPack(t, s, "fixed")
 	var calls atomic.Int32
 	setRetestProvider(s, retestProvider{complete: func(context.Context, llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
 		if calls.Add(1) == 1 {
-			return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockToolUse, ID: "fixed-result", Name: "record_finding_retest_result", Input: json.RawMessage(`{"verdict":"fixed","summary":"修复生效","evidence":"原触发条件失效，正常对照仍可用。"}`)}}}, "tool_use", llm.Usage{}, nil
+			input := `{"verdict":"fixed","summary":"修复生效","evidence":"原触发条件失效，正常对照仍可用。","pack_dir":"` + packDir + `"}`
+			return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockToolUse, ID: "fixed-result", Name: "record_finding_retest_result", Input: json.RawMessage(input)}}}, "tool_use", llm.Usage{}, nil
 		}
 		return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("结论已保存")}}, "end_turn", llm.Usage{}, nil
 	}})
@@ -327,4 +331,69 @@ func TestRetestValidationSeedingAndScope(t *testing.T) {
 		t.Fatal("seed overwrote prompt", prompt, err)
 	}
 	_, _ = s.m.pg.SavePrompt(a.ID, agent.RetesterDefaultPrompt, "restore", "test")
+}
+
+// The retest tool must refuse a conclusion that the gates did not issue: an
+// agent that calls it directly (skipping retest_strict) would otherwise be able
+// to claim "reproduced" — or "fixed", which closes the finding — with no
+// evidence at all. This is the server-side half of that boundary.
+func TestRetestToolRejectsUnsealedVerdict(t *testing.T) {
+	s, fid := newRetestServer(t)
+	packDir := buildRetestPack(t, s, "reproduced")
+
+	if _, _, _, err := s.m.pg.CreateFindingRetest(t.Context(), fid, "sealed fixture"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.m.pg.ListFindingRetests(fid)
+	if err != nil || len(rows) != 1 || rows[0].ConversationID == nil {
+		t.Fatalf("retest fixture: %+v err=%v", rows, err)
+	}
+	ctx := intercept.WithConvID(t.Context(), *rows[0].ConversationID)
+	if _, err := s.m.pg.StartFindingRetest(t.Context(), rows[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	tool := s.findingRetestTools()[1]
+
+	// 1) No pack_dir at all.
+	res, err := tool.Call(ctx, json.RawMessage(`{"verdict":"reproduced","summary":"x","evidence":"y"}`), nil)
+	if err != nil || !res.IsError {
+		t.Fatalf("reproduced without pack_dir was accepted: %v %v", res, err)
+	}
+
+	// 2) Hand-written verdict.json (no HMAC).
+	forged := t.TempDir()
+	if err := os.WriteFile(filepath.Join(forged, "verdict.json"),
+		[]byte(`{"kind":"verdict","payload":{"ok":true,"verdict":"reproduced","gate_ok":true,"fingerprint":"x"},"hmac_sha256":"00"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err = tool.Call(ctx, json.RawMessage(`{"verdict":"reproduced","summary":"x","evidence":"y","pack_dir":"`+forged+`"}`), nil)
+	if err != nil || !res.IsError {
+		t.Fatalf("hand-written verdict.json was accepted: %v %v", res, err)
+	}
+
+	// 3) A genuine pack whose evidence was altered after signing.
+	tampered := buildRetestPack(t, s, "reproduced")
+	body := filepath.Join(tampered, "cases", "attack-read-b", "response.body")
+	f, err := os.OpenFile(body, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("\nTAMPERED\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	res, err = tool.Call(ctx, json.RawMessage(`{"verdict":"reproduced","summary":"x","evidence":"y","pack_dir":"`+tampered+`"}`), nil)
+	if err != nil || !res.IsError {
+		t.Fatalf("tampered evidence was accepted: %v %v", res, err)
+	}
+
+	// 4) The genuine pack is accepted, and the verdict must match what it signed.
+	res, err = tool.Call(ctx, json.RawMessage(`{"verdict":"reproduced","summary":"x","evidence":"y","pack_dir":"`+packDir+`"}`), nil)
+	if err != nil || res.IsError {
+		t.Fatalf("genuine sealed pack was rejected: %v %v", res, err)
+	}
+	res, err = tool.Call(ctx, json.RawMessage(`{"verdict":"fixed","summary":"x","evidence":"y","pack_dir":"`+packDir+`"}`), nil)
+	if err != nil || !res.IsError {
+		t.Fatalf("verdict mismatching the signed one was accepted: %v %v", res, err)
+	}
 }

@@ -41,6 +41,7 @@ type ScopeRule struct {
 	Value     string `json:"value,omitempty"`
 	Raw       string `json:"raw"`
 	Reason    string `json:"reason,omitempty"`
+	Source    string `json:"source"`
 }
 
 // CompanyStore operates on the companies + company_scope tables.
@@ -118,9 +119,10 @@ RETURNING id, (xmax = 0)`, name, nkey, logoVal).Scan(&id, &created)
 // The company, its valid initial scope rules, and derived asset attribution are
 // committed atomically. Invalid inputs retain the legacy partial-validation
 // contract and are reported without preventing valid rules from being stored.
-func (s *CompanyStore) CreateCompanyWithScope(name, logo string, inputs []ScopeInput, reason string) (
+func (s *CompanyStore) CreateCompanyWithScope(name, logo string, inputs []ScopeInput, reason, source string) (
 	id int64, added, skipped, invalid int, validationErrors []string, err error,
 ) {
+	source = NormalizeScopeSource(source)
 	if err := ValidateCompanyScopeInputBounds(inputs); err != nil {
 		return 0, 0, 0, 0, nil, err
 	}
@@ -153,7 +155,7 @@ RETURNING id`, name, nkey, logoVal).Scan(&id); err != nil {
 		return 0, 0, 0, invalid, validationErrors, err
 	}
 
-	added, skipped, needsAttribution, err := insertScopeRulesTx(tx, id, rules, reason)
+	added, skipped, needsAttribution, err := insertScopeRulesTx(tx, id, rules, reason, source)
 	if err != nil {
 		return 0, 0, 0, invalid, validationErrors, err
 	}
@@ -297,7 +299,8 @@ ORDER BY c.name`)
 func (s *CompanyStore) GetScope(companyID int64) ([]ScopeRule, error) {
 	rows, err := s.db.Query(`
 SELECT id, company_id, kind,
-       COALESCE(domain,''), COALESCE(net::text,''), COALESCE(value,''), raw, COALESCE(reason,'')
+       COALESCE(domain,''), COALESCE(net::text,''), COALESCE(value,''), raw, COALESCE(reason,''),
+       COALESCE(source,'manual')
 FROM company_scope
 WHERE company_id = $1
 ORDER BY id`, companyID)
@@ -308,7 +311,7 @@ ORDER BY id`, companyID)
 	out := make([]ScopeRule, 0)
 	for rows.Next() {
 		var r ScopeRule
-		if err := rows.Scan(&r.ID, &r.CompanyID, &r.Kind, &r.Domain, &r.Net, &r.Value, &r.Raw, &r.Reason); err != nil {
+		if err := rows.Scan(&r.ID, &r.CompanyID, &r.Kind, &r.Domain, &r.Net, &r.Value, &r.Raw, &r.Reason, &r.Source); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -316,20 +319,47 @@ ORDER BY id`, companyID)
 	return out, rows.Err()
 }
 
+// ScopeSource values a company_scope row can carry. Only 'manual' (operator) and
+// 'goals' (operator-authored task description) may authorize a request; rows
+// written by a model-driven tool ('agent') or an automated import ('auto') are
+// recorded for coverage/attribution but never widen the authorization boundary.
+// The same source vocabulary is used by task_scope (see db/scope_check.go).
+const (
+	ScopeSourceManual = "manual"
+	ScopeSourceGoals  = "goals"
+	ScopeSourceAgent  = "agent"
+	ScopeSourceAuto   = "auto"
+)
+
+// NormalizeScopeSource maps an unknown/empty source to the least-privileged
+// value so a caller that forgets to pass one cannot accidentally grant trust.
+func NormalizeScopeSource(source string) string {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case ScopeSourceManual:
+		return ScopeSourceManual
+	case ScopeSourceGoals:
+		return ScopeSourceGoals
+	case ScopeSourceAuto:
+		return ScopeSourceAuto
+	default:
+		return ScopeSourceAgent
+	}
+}
+
 // AddScope parses and inserts scope lines for a company, then reattributes assets.
 // Returns counts of added, skipped, and invalid lines.
-func (s *CompanyStore) AddScope(companyID int64, lines []string, reason string) (added, skipped, invalid int, errors []string) {
+func (s *CompanyStore) AddScope(companyID int64, lines []string, reason, source string) (added, skipped, invalid int, errors []string) {
 	inputs := make([]ScopeInput, 0, len(lines))
 	for _, line := range lines {
 		inputs = append(inputs, ScopeInput{Value: line})
 	}
-	return s.AddScopeInputs(companyID, inputs, reason)
+	return s.AddScopeInputs(companyID, inputs, reason, source)
 }
 
 // AddScopeInputs inserts structured scope rules. Empty kinds use the automatic
 // CIDR/IP/ICP/domain/keyword classification used by AddScope.
-func (s *CompanyStore) AddScopeInputs(companyID int64, inputs []ScopeInput, reason string) (added, skipped, invalid int, errors []string) {
-	added, skipped, invalid, validationErrors, err := s.AddScopeInputsChecked(companyID, inputs, reason)
+func (s *CompanyStore) AddScopeInputs(companyID int64, inputs []ScopeInput, reason, source string) (added, skipped, invalid int, errors []string) {
+	added, skipped, invalid, validationErrors, err := s.AddScopeInputsChecked(companyID, inputs, reason, source)
 	if err != nil {
 		validationErrors = append(validationErrors, err.Error())
 	}
@@ -338,9 +368,10 @@ func (s *CompanyStore) AddScopeInputs(companyID int64, inputs []ScopeInput, reas
 
 // AddScopeInputsChecked inserts structured scope rules while keeping input
 // validation separate from storage and transaction errors.
-func (s *CompanyStore) AddScopeInputsChecked(companyID int64, inputs []ScopeInput, reason string) (
+func (s *CompanyStore) AddScopeInputsChecked(companyID int64, inputs []ScopeInput, reason, source string) (
 	added, skipped, invalid int, validationErrors []string, err error,
 ) {
+	source = NormalizeScopeSource(source)
 	if err := ValidateCompanyScopeInputBounds(inputs); err != nil {
 		return 0, 0, 0, nil, err
 	}
@@ -365,7 +396,7 @@ func (s *CompanyStore) AddScopeInputsChecked(companyID int64, inputs []ScopeInpu
 		}
 		return 0, 0, invalid, errors, nil
 	}
-	added, skipped, needsAttribution, err := insertScopeRulesTx(tx, companyID, rules, reason)
+	added, skipped, needsAttribution, err := insertScopeRulesTx(tx, companyID, rules, reason, source)
 	if err != nil {
 		return 0, 0, invalid, errors, err
 	}
@@ -428,11 +459,11 @@ func lockCompanyScopeMutation(tx *sql.Tx) error {
 	return err
 }
 
-func insertScopeRulesTx(tx *sql.Tx, companyID int64, rules []ParsedScope, reason string) (
+func insertScopeRulesTx(tx *sql.Tx, companyID int64, rules []ParsedScope, reason, source string) (
 	added, skipped int, needsAttribution bool, err error,
 ) {
 	for _, rule := range rules {
-		inserted, insertErr := insertScopeRuleTx(tx, companyID, rule, reason)
+		inserted, insertErr := insertScopeRuleTx(tx, companyID, rule, reason, source)
 		if insertErr != nil {
 			return 0, 0, false, insertErr
 		}
@@ -448,27 +479,28 @@ func insertScopeRulesTx(tx *sql.Tx, companyID int64, rules []ParsedScope, reason
 
 // insertScopeRuleTx inserts a scope rule. inserted=false means a duplicate was
 // ignored by ON CONFLICT, not an error.
-func insertScopeRuleTx(tx *sql.Tx, companyID int64, rule ParsedScope, reason string) (inserted bool, err error) {
+func insertScopeRuleTx(tx *sql.Tx, companyID int64, rule ParsedScope, reason, source string) (inserted bool, err error) {
+	source = NormalizeScopeSource(source)
 	var res interface{ RowsAffected() (int64, error) }
 	switch rule.Kind {
 	case "domain":
 		res, err = tx.Exec(`
-INSERT INTO company_scope(company_id, kind, domain, raw, reason)
-VALUES ($1, 'domain', $2, $3, $4)
+INSERT INTO company_scope(company_id, kind, domain, raw, reason, source)
+VALUES ($1, 'domain', $2, $3, $4, $5)
 ON CONFLICT ON CONSTRAINT uq_sv2_domain DO NOTHING`,
-			companyID, rule.Domain, rule.Raw, reason)
+			companyID, rule.Domain, rule.Raw, reason, source)
 	case "ip", "cidr":
 		res, err = tx.Exec(`
-INSERT INTO company_scope(company_id, kind, net, raw, reason)
-VALUES ($1, $2, $3::cidr, $4, $5)
+INSERT INTO company_scope(company_id, kind, net, raw, reason, source)
+VALUES ($1, $2, $3::cidr, $4, $5, $6)
 ON CONFLICT ON CONSTRAINT uq_sv2_net DO NOTHING`,
-			companyID, rule.Kind, rule.Net, rule.Raw, reason)
+			companyID, rule.Kind, rule.Net, rule.Raw, reason, source)
 	case "icp", "keyword":
 		res, err = tx.Exec(`
-INSERT INTO company_scope(company_id, kind, value, raw, reason)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO company_scope(company_id, kind, value, raw, reason, source)
+VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (company_id, kind, value) WHERE kind IN ('icp','keyword') DO NOTHING`,
-			companyID, rule.Kind, rule.Value, rule.Raw, reason)
+			companyID, rule.Kind, rule.Value, rule.Raw, reason, source)
 	default:
 		return false, fmt.Errorf("unsupported company scope kind %q", rule.Kind)
 	}
@@ -642,17 +674,17 @@ LIMIT $1`, malformedIPAssetsSampled)
 }
 
 // UpdateScope replaces all scope rules for a company and reattributes.
-func (s *CompanyStore) UpdateScope(companyID int64, lines []string, reason string) (added, invalid int, errs []string) {
+func (s *CompanyStore) UpdateScope(companyID int64, lines []string, reason, source string) (added, invalid int, errs []string) {
 	inputs := make([]ScopeInput, 0, len(lines))
 	for _, line := range lines {
 		inputs = append(inputs, ScopeInput{Value: line})
 	}
-	return s.UpdateScopeInputs(companyID, inputs, reason)
+	return s.UpdateScopeInputs(companyID, inputs, reason, source)
 }
 
 // UpdateScopeInputs replaces all rules with a structured set.
-func (s *CompanyStore) UpdateScopeInputs(companyID int64, inputs []ScopeInput, reason string) (added, invalid int, errs []string) {
-	added, invalid, validationErrors, err := s.UpdateScopeInputsChecked(companyID, inputs, reason)
+func (s *CompanyStore) UpdateScopeInputs(companyID int64, inputs []ScopeInput, reason, source string) (added, invalid int, errs []string) {
+	added, invalid, validationErrors, err := s.UpdateScopeInputsChecked(companyID, inputs, reason, source)
 	if err != nil {
 		validationErrors = append(validationErrors, err.Error())
 	}
@@ -661,7 +693,7 @@ func (s *CompanyStore) UpdateScopeInputs(companyID int64, inputs []ScopeInput, r
 
 // UpdateScopeInputsChecked replaces all rules while separating validation
 // feedback from storage and transaction failures.
-func (s *CompanyStore) UpdateScopeInputsChecked(companyID int64, inputs []ScopeInput, reason string) (
+func (s *CompanyStore) UpdateScopeInputsChecked(companyID int64, inputs []ScopeInput, reason, source string) (
 	added, invalid int, validationErrors []string, err error,
 ) {
 	if err := ValidateCompanyScopeInputBounds(inputs); err != nil {
@@ -690,7 +722,7 @@ func (s *CompanyStore) UpdateScopeInputsChecked(companyID int64, inputs []ScopeI
 	if _, err := tx.Exec(`DELETE FROM company_scope WHERE company_id = $1`, companyID); err != nil {
 		return 0, invalid, errs, err
 	}
-	added, _, _, err = insertScopeRulesTx(tx, companyID, rules, reason)
+	added, _, _, err = insertScopeRulesTx(tx, companyID, rules, reason, source)
 	if err != nil {
 		return 0, invalid, errs, err
 	}

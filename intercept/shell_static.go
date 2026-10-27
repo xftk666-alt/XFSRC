@@ -173,6 +173,20 @@ func forLoopBindings(loop *syntax.ForClause, bindings map[string][]string, write
 	return next
 }
 
+// trustedWrapper returns the wrapper name for a command that really is the
+// system binary, and ok=false for anything else.
+func trustedWrapper(name string) (string, bool) {
+	if !strings.Contains(name, "/") {
+		return name, true // resolved through PATH, as the shell would
+	}
+	base := filepath.Base(name)
+	switch filepath.Dir(name) {
+	case "/bin", "/usr/bin", "/sbin", "/usr/sbin", "/usr/local/bin":
+		return base, true
+	}
+	return "", false
+}
+
 // Unwrap only options whose argument layout is known. Treat unsupported layouts
 // as opaque instead of mistaking an option's value for the executed command.
 func unwrapScriptCall(args []*syntax.Word) ([]*syntax.Word, string, bool) {
@@ -181,7 +195,15 @@ func unwrapScriptCall(args []*syntax.Word) ([]*syntax.Word, string, bool) {
 		if !ok {
 			return args, "", false
 		}
-		wrapper := filepath.Base(name)
+		// Only an unqualified name or a system path may be unwrapped. Matching on
+		// filepath.Base alone meant `./env`, `/tmp/sudo` or `foo/command` — a file
+		// the agent itself can write — were treated as the trusted coreutils
+		// wrapper, so the analyzer reported the *following* command as the one
+		// that runs while the shell actually executed the planted file.
+		wrapper, ok := trustedWrapper(name)
+		if !ok {
+			return args, name, true
+		}
 		switch wrapper {
 		case "env", "sudo", "exec", "timeout", "nohup", "command", "builtin", "time":
 		default:
@@ -439,6 +461,13 @@ func staticScriptPreparation(stmt *syntax.Stmt) bool {
 	if stmt.Background {
 		return false
 	}
+	// `! cd /tmp` has no guaranteed success path, and `cd /tmp >"$(id)"` runs a
+	// command substitution. Both were accepted, so the analyzer believed the
+	// working directory had changed while the shell either did not change it or
+	// executed something else first.
+	if stmt.Negated || len(stmt.Redirs) > 0 {
+		return false
+	}
 	if binary, ok := stmt.Cmd.(*syntax.BinaryCmd); ok {
 		return binary.Op == syntax.AndStmt && staticScriptPreparation(binary.X) && staticScriptPreparation(binary.Y)
 	}
@@ -459,6 +488,11 @@ func staticScriptPreparation(stmt *syntax.Stmt) bool {
 			}
 		}
 		return true
+	}
+	// A call that also assigns (`X=$(id) cd /tmp`) evaluates the assignment first,
+	// which can run a command substitution.
+	if len(call.Assigns) > 0 {
+		return false
 	}
 	name, known := staticCommandName(call.Args[0])
 	if !known {
