@@ -77,39 +77,19 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 ---
 
-## 部署自己的在线 Demo（随正式 Release 自动更新）
+## Demo 说明
 
-Demo 只运行 `web/` 前端，构建时启用 `NEXT_PUBLIC_MOCK=1`，不需要 Go、PostgreSQL 或模型密钥。界面使用模拟数据，不执行真实扫描。
+README 顶部链接是上游提供的 Mock Demo，不代表本 fork 的发布产物。本 fork 的
+`.github/workflows/release.yml` 只构建五个平台程序包、生成 `SHA256SUMS` 并发布到
+本仓库的 GitHub Releases，不自动部署 Demo，也不发布 Docker Hub 镜像。
 
-发布链路：正式版本的程序包、`SHA256SUMS` 和 Docker 镜像全部成功发布 → `release.yml` 的 `demo` job 调用 `demo.yml` → 检出该版本标签的提交 → 构建 Mock 前端 → 部署至 Vercel 的固定生产域名。普通 main 推送、仅创建标签、失败的发布、草稿和预发布版本都不会更新 Demo。新版本功能的演示数据仍需由维护者同步维护 `web/src/lib/mock/`。
+如需本地查看 Mock 前端：
 
-### 首次配置 Vercel
-
-1. 在自己的 Vercel 账号创建空项目，设置名称（例如 `artex-demo-ruoji6`）。保持 **Git 未连接**，避免每次提交都自动部署。`web/vercel.json` 也禁用了 Git 自动部署。
-2. 在 **Settings → Build and Deployment** 中选择 **Next.js**、Node.js **22.x**，安装命令可覆盖为 `npm ci`，构建命令为 `npm run build`，Output Directory 保持默认。**Root Directory 留空**：此工作流从检出的 `web/` 目录调用 Vercel CLI，不能再填一层 `web`。
-3. 在项目的 **Environment Variables** 中添加 `NEXT_PUBLIC_MOCK=1`，至少应用于 **Production**。不要设置 `NEXT_EXPORT=1`，也不要填写数据库连接或模型密钥。
-4. 在项目 **Settings → General** 复制 **Project ID**；在团队 **Settings → General** 复制 **Team ID**（对应 `VERCEL_ORG_ID`）。确认 **Domains** 中有准备使用的生产域名。
-5. 在 Vercel **Account Settings → Tokens** 创建部署 Token，范围选择项目所在团队，并设置适当有效期。将其直接保存到 GitHub 仓库 **Settings → Secrets and variables → Actions → Secrets**，名称为 `VERCEL_TOKEN`。令牌不要写入仓库、README 或聊天；到期后更新这个 Secret。
-
-在同一 GitHub 设置页的 **Variables** 中添加：
-
-| 变量 | 值 |
-| --- | --- |
-| `VERCEL_ORG_ID` | Vercel Team ID |
-| `VERCEL_PROJECT_ID` | Vercel Project ID |
-| `DEMO_URL` | 固定公开生产网址，含 `https://`，例如 `https://artex-demo-ruoji6.vercel.app` |
-
-### 首次部署与重试
-
-将配置合并到默认分支后，打开 **Actions → deploy-demo → Run workflow**，分支选 `main`，tag 留空或填写当前最新正式版（例如 `v0.3.21`）。工作流只接受已发布且包含五个平台程序包和校验文件的最新正式版，也能部署尚未包含此工作流的历史正式版。无需重新发 Release 或移动已有标签。
-
-工作流会将这个专用 Demo 项目的框架设为 Next.js、Node 设为 22.x、根目录设为空、安装命令设为 `npm ci`、构建命令设为 `npm run build`，并确保 Production 环境的 `NEXT_PUBLIC_MOCK=1`，随后绑定 `DEMO_URL` 指定的域名。请使用独立项目；后续部署会继续维护这些配置。
-
-成功后访问生产域名，并检查 `/demo-version.json` 中的 `tag`、`commit` 和 `mock: true`。确认可访问后，将 README 顶部和截图区域的旧 Demo 链接一起改为自己的生产域名。
-
-此后按正常流程发布更高版本即可自动更新 Demo。若 Demo 部署失败，已发布的程序包和镜像仍然有效，旧 Demo 通常继续提供服务；修复设置后单独重跑 `deploy-demo`，不必重新发布整个 Release。两个版本同时发布时，部署串行执行，并在构建前、上线前检查 latest，避免已过期的构建覆盖新版。
-
-这里采用发布流程直接调用部署 job，是因为使用 `GITHUB_TOKEN` 创建的 Release 不会继续触发另一个 `release: published` 工作流。`demo.yml` 也监听网页手工发布的 Release，经过同样的正式版、完整发布包和 latest 检查后部署；手工重试则运行 `deploy-demo`。
+```bash
+cd XFSRC/web
+NEXT_PUBLIC_MOCK=1 npm ci
+NEXT_PUBLIC_MOCK=1 npm run dev
+```
 
 ---
 
@@ -121,7 +101,7 @@ Demo 只运行 `web/` 前端，构建时启用 `NEXT_PUBLIC_MOCK=1`，不需要 
 
 ```bash
 git clone https://github.com/xftk666-alt/XFSRC.git
-cd ARTEX
+cd XFSRC
 ./install.sh
 ```
 
@@ -136,7 +116,7 @@ cd ARTEX
 
 ```bash
 git clone https://github.com/xftk666-alt/XFSRC.git
-cd ARTEX
+cd XFSRC
 cp .env.example .env          # 填 POSTGRES_PASSWORD、可选 ANTHROPIC_API_KEY
 docker compose up -d --build  # 本地构建本 fork 镜像 + postgres
 # → http://localhost:8787
@@ -156,7 +136,7 @@ docker compose up -d --build  # 本地构建本 fork 镜像 + postgres
 
 ### 方式三：下载预编译二进制（Releases）
 
-到本仓库的 [Releases](https://github.com/RuoJi6/ARTEX/releases) 下载对应平台的 zip，解压后得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/` + `config.example.json`。Linux ARM64（包括 ARM64 Kali）选择 `linux-arm64`，x86_64 选择 `linux-amd64`：
+到本仓库的 [Releases](https://github.com/xftk666-alt/XFSRC/releases) 下载对应平台的 zip，解压后得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/` + `config.example.json`。Linux ARM64（包括 ARM64 Kali）选择 `linux-arm64`，x86_64 选择 `linux-amd64`：
 
 ```bash
 cp config.example.json config.json   # 填好 database 连接
@@ -184,7 +164,7 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 
 ```bash
 ./build.sh --release
-# 产物：dist/artex-0.3.3-*.zip
+# 产物：dist/artex-<version>-*.zip
 ```
 
 UPX 自解压二进制可能与部分 Linux 内核、虚拟化环境或安全策略不兼容，因此默认不启用。可用 `ARTEX_TARGETS` 自定义目标；确认目标运行环境兼容时，可显式传入 `--upx` 进一步缩小二进制：
@@ -204,7 +184,7 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 
 在 **系统配置** 页（侧边栏「系统配置」→ `/system/settings`）的**版本与更新**卡片里，可以直接检查并安装新版本，无需登录服务器。
 
-本仓库构建的程序固定从 `RuoJi6/ARTEX` 的最新正式 GitHub Release 检查更新，跳过草稿和预发布版本。旧版官方程序仍指向原作者仓库，因此首次切换必须手动安装本仓库构建的程序；以后发布更高的三段式版本即可通过页面升级。仅推送 main 或 Git 标签但未发布 Release，不会产生可在线安装的新版本。
+本 fork 构建的程序固定从 `xftk666-alt/XFSRC` 的最新正式 GitHub Release 检查更新，跳过草稿和预发布版本。版本格式为 `v<上游版本>-fix<N>`，例如本次同步上游 `0.3.24` 后的首个本地版本是 `v0.3.24-fix1`。仅推送分支或 Git 标签但未发布 Release，不会产生可在线安装的新版本。
 
 点「更新」后：下载当前平台的发布包 → 比对 Release 的 `SHA256SUMS` → 用 `-h` 冒烟测试新二进制 → 暂存为 `artex.new` → 程序退出，由 `start.sh` / `start.bat` 重新拉起并完成换装。页面会自动等到新版本上线后刷新。
 
@@ -218,81 +198,76 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 
 ### 维护者：通过 GitHub Actions 发布在线更新
 
-发布工作流为 `.github/workflows/release.yml`。推送正式标签会触发构建，也可在 Actions → release → Run workflow 中输入已存在的标签重新执行失败的发布。标签必须是 `v主版本.次版本.修订号`，例如下例的 `v0.3.17`；后续版本必须高于用户正在运行的版本。
+发布工作流为 `.github/workflows/release.yml`。推送 `v*` 标签即触发构建，也可在 Actions → release → Run workflow 里填一个已存在的标签重跑失败的发布。
+
+**标签格式必须是 `v<上游版本>-fix<N>`**，例如 `v0.3.24-fix1`；上游升到 `0.3.25` 后重新从 `v0.3.25-fix1` 起算。`fix<N>` 在同一上游版本内单调递增，`selfupdate` 靠它判断「有新版」。
+
+**标签必须打在 `local` 分支历史里的提交上**：`prepare` job 会校验标签提交是否为 `origin/local` 的祖先，不是就直接拒绝发布。
+
+推荐用脚本（会先检查 `CHANGELOG.md` 有 `## v<版本>` 章节）：
 
 ```bash
-git push origin main
-git tag v0.3.17
-git push origin v0.3.17
+cd XFSRC
+./scripts/release.sh 0.3.24-fix1
 ```
 
-工作流固定标签对应的提交，用 Node.js 22 导出前端，按照 `go.mod` 指定的 Go 版本编译内嵌前端的五个平台程序，并生成 ZIP 与 `SHA256SUMS`。AMD64 和 ARM64 镜像分别在 GitHub 原生 runner 上构建，连接临时 PostgreSQL 验证程序启动、版本和内嵌前端；两种架构都通过后发布多架构镜像的版本标签与 `latest`。镜像发布成功后上传完整 ZIP 和校验文件，最后公开 Release。已公开的同版本不允许覆盖，应发布新标签。
-
-维护者需在本仓库 Settings → Secrets and variables → Actions 中配置变量 `ARTEX_DOCKER_IMAGE`（Docker Hub 用户名/镜像名）和 Secrets `DOCKERHUB_USERNAME`、`DOCKERHUB_TOKEN`（有镜像推送权限）。程序包通过 GitHub 自带 `GITHUB_TOKEN` 上传，镜像通过上述凭据推送到 Docker Hub。凭据只供工作流登录使用，不写入源码或镜像。镜像地址同时记录在 `.env.example` 和 Compose 默认值中。
-
-### 已有 Docker 部署迁移到本仓库镜像
-
-在原部署目录中备份 `.env`、Compose 文件、`data/` 和 PostgreSQL 数据，保留原数据库卷和 skills 挂载。将 `.env` 的 `ARTEX_IMAGE` 设置为本仓库镜像地址、`ARTEX_TAG` 设置为目标版本；如果旧 Compose 仍写死原作者的镜像，可创建下列覆盖文件（已有覆盖文件时应合并 image 配置）：
-
-```yaml
-# docker-compose.override.yml
-services:
-  artex:
-    image: ${ARTEX_IMAGE}:${ARTEX_TAG:-latest}
-```
-
-然后只更新应用容器：
+手动等价步骤：
 
 ```bash
-docker compose build app
-docker compose up -d --no-deps app
+cd XFSRC
+git checkout local
+git tag -a v0.3.24-fix1 -m "v0.3.24-fix1"
+git push origin local
+git push origin v0.3.24-fix1
+```
+
+工作流分四段：`prepare` 校验标签格式并锁定提交 → `frontend` 用 Node.js 22 做一次静态导出 → `test` 起 PostgreSQL 16 跑 `go vet` 和 `go test -p 1` → `binaries` 并行交叉编译五个平台（linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64），生成 ZIP 与 `SHA256SUMS`，最后创建并公开 Release。发布说明直接从 `CHANGELOG.md` 的 `## v<版本>` 一节截取，所以那一节必须自包含。
+
+本 fork 的流水线**不构建也不推送 Docker Hub 镜像**，不需要 `DOCKERHUB_*` 之类的凭据；程序包用仓库自带的 `GITHUB_TOKEN` 上传即可。
+
+### Docker 部署（本 fork 只本地构建）
+
+本 fork 不发布公共镜像。`docker-compose.yml` 直接用仓库里的 `Dockerfile` 构建 `${XFSRC_IMAGE:-xfsrc}:${XFSRC_TAG:-latest}`，不会回退到上游 `ruoji6/artex`（那会把授权闸、工作区隔离、限流等加固全部换掉）。
+
+构建前需要 `dist/<arch>/artex`（`build.sh` 产物或 Release 里解出的二进制）：
+
+```bash
+cd XFSRC
+cp .env.example .env            # 填 POSTGRES_PASSWORD
+# 放好 dist/amd64/artex 后
+docker compose up -d --build
 curl --fail http://127.0.0.1:8787/api/health
-docker compose logs --tail=50 artex
+docker compose logs --tail=50 app
 ```
 
-继续使用原部署目录和 Compose 项目名称，确保 `./data`、`./skills` 和 PostgreSQL 数据卷仍指向原数据。迁移后程序从 `RuoJi6/ARTEX` 检查在线更新；后续可用页面更新程序或上述命令更新整个镜像。
-
-首次迁移已有 Docker 部署时，将已校验的新 ARM64 ZIP 解压到宿主机，备份原程序，然后只替换已有容器中的 `/app/artex`。例如现有容器名为 `artex-artex-1`：
-
-```bash
-# 在下载目录运行；先按 SHA256SUMS 核对下载的 ZIP，再解压。
-sha256sum --ignore-missing --check SHA256SUMS
-unzip artex-0.3.17-linux-arm64.zip
-sudo docker stop artex-artex-1
-sudo docker cp artex-artex-1:/app/artex ./artex-before-migration
-sudo docker cp ./artex-0.3.17-linux-arm64/artex artex-artex-1:/app/artex
-sudo docker start artex-artex-1
-curl --fail http://127.0.0.1:8787/api/health
-```
-
-这会保留现有数据库、data 和 skills 挂载。登录系统配置页检查更新源与版本。容器内替换的程序仍属于容器可写层，删除或重建容器会丢失替换结果；需要重建时应使用包含本仓库程序的镜像。程序回滚不回退数据库迁移，升级前请备份数据库和 data。
+容器名为 `xfsrc-app` / `xfsrc-db`，数据卷 `pgdata`，`./data` 与 `./skills` 以绑定挂载持久化。
 
 ### 方式二：一键更新脚本
 
 ```bash
-cd ARTEX
+cd XFSRC
 ./update.sh
 ```
 
 脚本先可选 `git pull` 拉取最新代码，再让你选 **① Docker 更新** 或 **② 本地编译更新**（与 `install.sh` 对应）：
 
-- **① Docker**：可指定目标镜像 tag（回车沿用 `.env` 的 `ARTEX_TAG`，缺省 `latest`）→ `docker compose pull` → `docker compose up -d`（换新镜像重启即自动迁移）。
+- **① Docker**：可指定目标版本 tag（回车沿用 `.env` 的 `XFSRC_TAG`，缺省 `latest`）→ 重新构建 `app` 服务 → 重启即自动迁移 schema。
 - **② 本地**：重建前端静态产物 → 重新编译 `./artex`（完成后重启进程生效）。
 
 ### 方式三：Docker Compose（手动）
 
 ```bash
-cd ARTEX
+cd XFSRC
 git pull                       # 更新 compose / 脚本（可选）
-# 指定版本：在 .env 设 ARTEX_TAG=v0.3.17；不设则用 latest
-docker compose pull artex
-docker compose up -d artex     # 换新镜像重启 → 自动迁移 schema
+# 指定版本：在 .env 设 XFSRC_TAG=v0.3.24-fix1；不设则用 latest
+docker compose build app
+docker compose up -d app       # 换新镜像重启 → 自动迁移 schema
 docker image prune -f          # 清理旧镜像（可选）
 ```
 
 ### 方式四：预编译二进制（Releases）
 
-到 [Releases](https://github.com/RuoJi6/ARTEX/releases) 下载新版本 zip，停掉旧进程后覆盖 `artex` 与 `skills/`（保留你的 `config.json` 与 `data/`），重启即可：
+到 [Releases](https://github.com/xftk666-alt/XFSRC/releases) 下载新版本 zip，停掉旧进程后覆盖 `artex` 与 `skills/`（保留你的 `config.json` 与 `data/`），重启即可：
 
 ```bash
 cp -r <解压目录>/skills ./ && cp <解压目录>/artex ./

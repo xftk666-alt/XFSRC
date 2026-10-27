@@ -22,7 +22,7 @@
 
 ### 验证
 - `go build ./...`、`go vet ./...` 通过。
-- `go test ./...` 在 PostgreSQL 16 上全绿（16 个包，含 `server` 与 `db` 集成测试）。
+- 在 PostgreSQL 16 已启动且设置 `ARTEX_PG_DSN` 的环境中，`go test ./... -count=1` 全部通过（16 个包，含 `server` 与 `db` 集成测试）。未提供 PostgreSQL 或 `ARTEX_PG_DSN` 时，数据库测试会在初始化阶段失败；这属于测试环境前置条件，不是可跳过的测试。
 
 ## v0.3.23-fix6 — 出站闸门补全、数组转义、平台 scope 导入
 
